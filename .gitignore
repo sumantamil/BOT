@@ -1,0 +1,66 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (NEVER COMMIT)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+trading_bot.log
+
+# Cache & Temp
+__pycache__/
+*.cache
+*.tmp
+*.temp
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trade Journals & Data
+journals/
+*.json
+data/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Screenshots & Debug
+screenshots/
+test_screenshot.png
+search_results.png
+zerodha_search.png
+debug_*.png
+_dhan_token_debug/
+
+# Node/npm (if using frontend tools)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Build outputs
+dist/
+build/
+*.egg-info/
