@@ -1,0 +1,37 @@
+# NIFTY Options Trading Bot - Dependencies
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# Zerodha Kite API
+kiteconnect>=5.0.1
+
+# Dhan API (free alternative to Kite Connect — no monthly fees)
+dhanhq>=2.0.0
+
+# Browser Automation
+playwright>=1.41.0
+
+# Market Data & Analysis
+yfinance>=0.2.36
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Technical Analysis
+ta>=0.11.0
+
+# NSE Data (TLS fingerprint impersonation to bypass Akamai bot protection)
+curl_cffi>=0.7.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Optional: For TOTP auto-login
+pyotp>=2.9.0
+
+# Logging
+loguru>=0.7.2
