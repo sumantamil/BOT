@@ -96,6 +96,10 @@ class VWAPStrategy:
         Returns:
             VWAPSignal if a deviation+confirmation setup is detected, else None.
         """
+        # Respect 'vwap off' command — mirrors the same guard in ORBStrategy
+        if not self._cfg.enabled:
+            return None
+
         self._ensure_daily_reset()
 
         now = datetime.now()

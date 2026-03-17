@@ -82,6 +82,9 @@ class TradingConfig(BaseSettings):
     trailing_stop_percentage: float = Field(default=10.0, description="Trailing stop loss percentage (distance from highest price)")
     trailing_stop_amount: float = Field(default=500.0, description="Trailing stop loss amount in INR (alternative to percentage)")
     use_trailing_stop_amount: bool = Field(default=False, description="Use amount-based trailing stop instead of percentage")
+    # Trailing stop only activates once the position is this far into profit.
+    # Prevents premature arming on tiny ticks; fixed SL guards until threshold is reached.
+    trailing_stop_activation_pct: float = Field(default=10.0, description="Min profit %% before trailing stop arms (e.g. 10 = trail only after +10%%)")
     
     # Trading hours (IST)
     market_open_hour: int = 9
@@ -323,7 +326,8 @@ TRADING_AUTO_TRADE_ENABLED=false
 
 # Trailing Stop Loss
 TRADING_USE_TRAILING_STOP_LOSS=true
-TRADING_TRAILING_STOP_PERCENTAGE=10
+TRADING_TRAILING_STOP_PERCENTAGE=10           # trail distance: 10% below peak
+TRADING_TRAILING_STOP_ACTIVATION_PCT=10       # arm only after +10% profit
 TRADING_USE_TRAILING_STOP_AMOUNT=false
 TRADING_TRAILING_STOP_AMOUNT=500
 

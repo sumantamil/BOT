@@ -29,7 +29,7 @@ from bot.market_regime import regime_detector
 from bot.theta_clock import theta_clock
 from bot.multi_timeframe import mtf_engine
 from bot.trade_journal import trade_journal
-from bot.index_config import IndexConfig, NIFTY, get_index, list_indices
+from bot.index_config import IndexConfig, NIFTY, BANKNIFTY, SENSEX, get_index, list_indices
 from bot.orb_strategy import ORBStrategy, ORBSignal
 from bot.vwap_strategy import VWAPStrategy, VWAPSignal
 from bot.gap_detector import gap_detector, GapType
@@ -102,17 +102,19 @@ class TradingBot:
         self._cached_current_pnl: float = 0.0
         self._pnl_last_updated: Optional[datetime] = None
 
-        # ORB one-trade-per-day guard at engine level.
-        # Uses a date (not bool) so it auto-resets on a new calendar day
-        # and survives ORB index-switch resets and bot restarts.
-        self._orb_triggered_date: Optional[date] = None
-        # Same guard for VWAP — prevents re-entry on restarts (1 VWAP trade per day max)
-        self._vwap_triggered_date: Optional[date] = None
+        # Per-index one-trade-per-day guards.
+        # Using dicts keyed by index name so NIFTY/BANKNIFTY/SENSEX get independent guards.
+        # Date values auto-reset on a new calendar day; bool values reset in the daily-reset block.
+        self._index_orb_triggered: Dict[str, Optional[date]] = {}
+        self._index_vwap_triggered: Dict[str, Optional[date]] = {}
+        self._index_gap_traded: Dict[str, bool] = {}
 
-        # Regime cache — re-fetch at most once per 30 min (daily data, expensive)
-        self._cached_regime = None
-        self._last_regime_time: Optional[datetime] = None
+        # Regime cache — per-index, re-fetch at most once per 30 min (daily data, expensive)
+        self._index_regime_cache: Dict[str, object] = {}
+        self._index_regime_time: Dict[str, Optional[datetime]] = {}
         self._regime_cache_seconds: int = 30 * 60  # 30 minutes
+        # Convenience pointer updated each loop iteration (used by _check_vwap_signal)
+        self._cached_regime = None
         
         # Watch feature - continuous strike monitoring
         self._watch_task: Optional[asyncio.Task] = None
@@ -129,7 +131,29 @@ class TradingBot:
 
         # Gap detector (runs once per day at market open)
         self._gap_detector = gap_detector
-        self._gap_traded_today: bool = False   # prevents duplicate gap trades
+
+        # Per-index strategy instances — all three indices scanned in every cycle
+        self._index_analyzers: Dict[str, TrendAnalyzer] = {
+            "NIFTY":      self.analyzer,
+            "BANKNIFTY":  TrendAnalyzer(index_config=BANKNIFTY),
+            "SENSEX":     TrendAnalyzer(index_config=SENSEX),
+        }
+        self._index_orbs: Dict[str, ORBStrategy] = {
+            "NIFTY":      self.orb,
+            "BANKNIFTY":  ORBStrategy(index_config=BANKNIFTY),
+            "SENSEX":     ORBStrategy(index_config=SENSEX),
+        }
+        self._index_vwaps: Dict[str, VWAPStrategy] = {
+            "NIFTY":      self.vwap_strat,
+            "BANKNIFTY":  VWAPStrategy(index_config=BANKNIFTY),
+            "SENSEX":     VWAPStrategy(index_config=SENSEX),
+        }
+        # Per-index last signal cache (used to restore context after loop)
+        self._index_last_signal: Dict[str, Optional[TrendSignal]] = {}
+        # Per-index last analysis timestamp (for accurate status display)
+        self._index_last_analysis_time: Dict[str, Optional[datetime]] = {}
+        # User's manually-selected index (survives analysis-loop context swaps)
+        self._user_selected_index: IndexConfig = NIFTY
         
     def register_message_callback(self, callback: Callable):
         """Register callback for bot messages (to send to chat)"""
@@ -278,16 +302,34 @@ class TradingBot:
             # ORB, one from VWAP), so only block VWAP when both slots are already
             # consumed.  ORB always fires first (morning), so it is always blocked
             # once any trade is found; VWAP is only blocked when 2+ trades exist.
+            #
+            # Key the flags on the actual recovered symbols' index — not on
+            # _active_index (which defaults to NIFTY and would wrongly block/unblock
+            # the wrong index if the bot restarted after a BANKNIFTY trade).
             total_today = closed_trades_today + recovered
             if total_today > 0:
-                self._orb_triggered_date = datetime.now().date()
+                # Collect distinct indices represented in recovered positions
+                _recovered_indices: set = set()
+                for _t in self.order_manager._positions.values():
+                    if _t.status == "OPEN":
+                        for _idx_name in ["BANKNIFTY", "SENSEX", "NIFTY"]:
+                            if _t.symbol.upper().startswith(_idx_name):
+                                _recovered_indices.add(_idx_name)
+                                break
+                # If we can't parse the index (old format), fall back to user's selection
+                if not _recovered_indices:
+                    _recovered_indices.add(self._active_index.name)
+
+                for _idx_name in _recovered_indices:
+                    self._index_orb_triggered[_idx_name] = datetime.now().date()
                 if hasattr(self, 'orb') and self.orb:
                     self.orb._signal_fired = True
                     from bot.orb_strategy import ORBState
                     self.orb._state = ORBState.TRIGGERED
                 if total_today >= 2:
                     # Both trade slots used — block VWAP re-entry too
-                    self._vwap_triggered_date = datetime.now().date()
+                    for _idx_name in _recovered_indices:
+                        self._index_vwap_triggered[_idx_name] = datetime.now().date()
                     logger.info(f"ORB + VWAP both marked TRIGGERED on recovery ({total_today} trades today — both slots used)")
                 else:
                     # Only 1 trade so far — ORB slot used, VWAP slot still available
@@ -364,10 +406,14 @@ class TradingBot:
         await self._broadcast_message("Position monitoring stopped", "system")
     
     async def _analysis_loop(self):
-        """Main analysis loop - runs periodically with regime-aware strategy selection."""
+        """Main analysis loop - runs periodically with regime-aware strategy selection.
+        
+        Each cycle scans ALL three indices (NIFTY, BANKNIFTY, SENSEX) for signals.
+        After every cycle the active context is restored to the user-selected index.
+        """
         interval = settings.trend.analysis_interval_seconds
 
-        logger.info(f"Starting analysis loop (interval: {interval}s)")
+        logger.info(f"Starting analysis loop (interval: {interval}s, scanning NIFTY + BANKNIFTY + SENSEX)")
         _last_loop_date = None
 
         while True:
@@ -375,95 +421,132 @@ class TradingBot:
                 # Reset daily flags at the start of each new trading day
                 today = datetime.now().date()
                 if _last_loop_date != today:
-                    self._gap_traded_today = False
-                    self.order_manager._reset_daily_stats_if_needed()
+                    self._index_gap_traded = {}   # reset all per-index gap flags each new day
+                    if self.order_manager:
+                        self.order_manager._reset_daily_stats_if_needed()
                     _last_loop_date = today
 
-                # ── Step 1: Detect market regime (cached — re-fetches at most every 30 min) ──
                 now_ts = datetime.now()
-                cache_stale = (
-                    self._cached_regime is None
-                    or self._last_regime_time is None
-                    or (now_ts - self._last_regime_time).total_seconds() >= self._regime_cache_seconds
-                )
-                if cache_stale:
-                    fresh = regime_detector.analyze()
-                    # Always update the timestamp so a failing yfinance fetch doesn't
-                    # cause a retry-storm (one attempt per 30 min, not every 60 s).
-                    self._last_regime_time = now_ts
-                    if fresh is not None:
-                        self._cached_regime = fresh
-                regime_result = self._cached_regime
-                regime_value = regime_result.regime.value if regime_result else None
 
-                if cache_stale and regime_result:
-                    logger.info(
-                        f"Regime: {regime_value} | ADX={regime_result.adx:.1f} "
-                        f"| Hurst={regime_result.hurst:.3f} | Trade={regime_result.should_trade}"
-                    )
-
-                # ── Step 1b: Gap detection (once per day, near market open) ───
-                now = now_ts  # reuse timestamp already captured above
+                # Gap-open window flag (shared across all index iterations below)
                 is_near_open = (
-                    now.weekday() <= 4  # Mon–Fri
-                    and now.hour == 9
-                    and 15 <= now.minute <= 30
+                    now_ts.weekday() <= 4  # Mon–Fri
+                    and now_ts.hour == 9
+                    and 15 <= now_ts.minute <= 30
                 )
-                if is_near_open and settings.gap.enabled:
-                    await self._check_gap_signal()
 
-                # ── Step 2: Technical trend analysis (regime-aware EMA weight) ─
-                signal = self.analyzer.analyze(regime=regime_value)
+                # ── Scan all three indices ─────────────────────────────────────
+                for idx_cfg in [NIFTY, BANKNIFTY, SENSEX]:
+                    idx_name = idx_cfg.name
 
-                if signal:
-                    self._last_signal = signal
-                    self._last_analysis_time = datetime.now()
+                    # Temporarily swap context to this index so every strategy
+                    # method (which reads self._active_index etc.) uses the right one
+                    self._active_index    = idx_cfg
+                    self.analyzer         = self._index_analyzers[idx_name]
+                    self.orb              = self._index_orbs[idx_name]
+                    self.vwap_strat       = self._index_vwaps[idx_name]
+                    self.order_manager.set_active_index(idx_cfg)
+                    self.kite.set_active_index(idx_cfg)
+                    regime_detector.set_index(idx_cfg)
+                    mtf_engine.set_index(idx_cfg)
+                    self._gap_detector.set_index(idx_cfg)
 
-                    trade_journal.log_analysis(
-                        trend=signal.trend.value,
-                        strength=signal.strength,
-                        price=signal.current_price,
-                        rsi=signal.rsi,
+                    # Restore per-index last signal so ORB direction filter is correct
+                    self._last_signal = self._index_last_signal.get(idx_name)
+
+                    # ── Step 1: Regime (per-index cache, re-fetch every 30 min) ──
+                    last_regime_time = self._index_regime_time.get(idx_name)
+                    cache_stale = (
+                        idx_name not in self._index_regime_cache
+                        or last_regime_time is None
+                        or (now_ts - last_regime_time).total_seconds() >= self._regime_cache_seconds
                     )
+                    if cache_stale:
+                        fresh = regime_detector.analyze()
+                        self._index_regime_time[idx_name] = now_ts
+                        if fresh is not None:
+                            self._index_regime_cache[idx_name] = fresh
+                    regime_result = self._index_regime_cache.get(idx_name)
+                    regime_value  = regime_result.regime.value if regime_result else None
+                    # Keep convenience pointer for _check_vwap_signal
+                    self._cached_regime = regime_result
 
-                    report = self.analyzer.format_analysis_report(signal)
-                    # Append regime context to the analysis report
-                    if regime_result:
-                        report += f"\n  Regime: {regime_value} | Trade Signal: {'YES' if regime_result.should_trade else 'NO'}"
-                    await self._broadcast_message(report, "analysis")
+                    if cache_stale and regime_result:
+                        logger.info(
+                            f"[{idx_name}] Regime: {regime_value} | ADX={regime_result.adx:.1f} "
+                            f"| Hurst={regime_result.hurst:.3f} | Trade={regime_result.should_trade}"
+                        )
 
-                    await self._evaluate_custom_instructions(signal)
+                    # ── Step 1b: Gap detection (once per day, near market open) ──
+                if is_near_open and settings.gap.enabled and self.order_manager:
 
-                # ── Step 3: Strategy selection based on regime ─────────────────
-                if self._auto_trade:
-                    is_ranging   = regime_value == "RANGING" if regime_value else False
-                    is_trending  = regime_value in ("TRENDING UP", "TRENDING DOWN") if regime_value else False
-                    should_trade = regime_result.should_trade if regime_result else True
+                    # ── Step 2: Technical trend analysis ─────────────────────────
+                    signal = self.analyzer.analyze(regime=regime_value)
 
-                    if is_ranging:
-                        # RANGING → VWAP Mean Reversion (skip regular trend-follow)
-                        await self._check_vwap_signal()
-                        # ORB still runs in ranging — opening breakouts can happen even on flat days
-                        await self._check_orb_signal()
-                        if signal and regime_result and not regime_result.should_trade:
-                            logger.info("Ranging market: skipping multi-indicator trend trade.")
-                    elif should_trade and signal and signal.trend != Trend.NEUTRAL:
-                        # TRENDING / VOLATILE with direction → multi-indicator trade + ORB
-                        await self._execute_auto_trade(signal)
-                        await self._check_orb_signal()
-                    else:
-                        # No clear regime or neutral trend → ORB only (safest)
-                        # Exception: if regime is STRONGLY TRENDING (ADX > 50) but 5m signal
-                        # is NEUTRAL (mixed short-term candles), also run VWAP. This catches
-                        # afternoon trades on strong-trend days where intraday indicators lag.
-                        # VWAP has its own 0.4% deviation + RSI guards so it won't over-trade.
-                        if is_trending and regime_result and regime_result.adx > 50:
-                            logger.info(
-                                f"Strong trend (ADX={regime_result.adx:.0f}) with neutral 5m signal "
-                                f"— running VWAP as secondary entry"
-                            )
+                    if signal:
+                        self._last_signal = signal
+                        self._index_last_signal[idx_name] = signal
+                        self._last_analysis_time = datetime.now()
+                        self._index_last_analysis_time[idx_name] = self._last_analysis_time
+
+                        trade_journal.log_analysis(
+                            trend=signal.trend.value,
+                            strength=signal.strength,
+                            price=signal.current_price,
+                            rsi=signal.rsi,
+                        )
+
+                        report = self.analyzer.format_analysis_report(signal)
+                        if regime_result:
+                            report += f"\n  Regime: {regime_value} | Trade Signal: {'YES' if regime_result.should_trade else 'NO'}"
+                        await self._broadcast_message(report, "analysis")
+
+                        # Custom rules fire ONLY for the user's selected index so
+                        # a rule "if RSI < 30 buy CE" targets NIFTY (or whichever
+                        # the user picked) — not whichever index happens to satisfy
+                        # the condition first across the three-index scan.
+                        if idx_name == self._user_selected_index.name:
+                            await self._evaluate_custom_instructions(signal)
+
+                    # ── Step 3: Strategy selection based on regime ────────────────
+                    if self._auto_trade:
+                        is_ranging  = regime_value == "RANGING" if regime_value else False
+                        is_trending = regime_value in ("TRENDING UP", "TRENDING DOWN") if regime_value else False
+                        should_trade = regime_result.should_trade if regime_result else True
+
+                        if is_ranging:
                             await self._check_vwap_signal()
-                        await self._check_orb_signal()
+                            await self._check_orb_signal()
+                            if signal and regime_result and not regime_result.should_trade:
+                                logger.info(f"[{idx_name}] Ranging market: skipping multi-indicator trend trade.")
+                        elif should_trade and signal and signal.trend != Trend.NEUTRAL:
+                            await self._execute_auto_trade(signal)
+                            await self._check_orb_signal()
+                        else:
+                            if is_trending and regime_result and regime_result.adx > 50:
+                                logger.info(
+                                    f"[{idx_name}] Strong trend (ADX={regime_result.adx:.0f}) with neutral 5m signal "
+                                    f"— running VWAP as secondary entry"
+                                )
+                                await self._check_vwap_signal()
+                            await self._check_orb_signal()
+
+                # ── Restore context to user's selected index after all scans ─────
+                _usr = self._user_selected_index
+                self._active_index  = _usr
+                self.analyzer       = self._index_analyzers[_usr.name]
+                self.orb            = self._index_orbs[_usr.name]
+                self.vwap_strat     = self._index_vwaps[_usr.name]
+                self.order_manager.set_active_index(_usr)
+                self.kite.set_active_index(_usr)
+                regime_detector.set_index(_usr)
+                mtf_engine.set_index(_usr)
+                self._gap_detector.set_index(_usr)
+                backtester.set_index(_usr)
+                theta_clock.set_index(_usr)
+                self._cached_regime         = self._index_regime_cache.get(_usr.name)
+                self._last_signal           = self._index_last_signal.get(_usr.name)
+                self._last_analysis_time    = self._index_last_analysis_time.get(_usr.name)
 
                 await asyncio.sleep(interval)
 
@@ -484,15 +567,19 @@ class TradingBot:
         check_interval = 15
         pnl_broadcast_count = 0
         _expiry_alert_sent_date: Optional[date] = None  # track so alert fires once per day
-        
+        # Snapshot of the user's index — stable reference immune to analysis-loop swaps
+        _usr_idx = self._user_selected_index
+
         while True:
             try:
+                # Keep tracking the user's current selection (may change via 'index' command)
+                _usr_idx = self._user_selected_index
                 now = datetime.now()
 
                 # ── Expiry day alert: warn 45 min before close if today is expiry ─────
                 if now.weekday() <= 4:  # Mon–Fri only
                     today_date = now.date()
-                    active_expiry_weekday = self._active_index.expiry_weekday  # e.g. 0=Mon,3=Thu,4=Fri
+                    active_expiry_weekday = _usr_idx.expiry_weekday  # use stable user-index ref
                     is_expiry_day = (today_date.weekday() == active_expiry_weekday)
                     market_close = now.replace(
                         hour=settings.trading.market_close_hour,
@@ -513,7 +600,7 @@ class TradingBot:
                             if t.status == "OPEN"
                         ])
                         msg = (
-                            f"⚠️ EXPIRY DAY ALERT ({self._active_index.display_name}) — "
+                            f"⚠️ EXPIRY DAY ALERT ({_usr_idx.display_name}) — "
                             f"45 minutes to market close. "
                             f"{open_count} bot position(s) open. "
                             f"Manually verify ALL positions — option contracts expire today!"
@@ -592,7 +679,10 @@ class TradingBot:
                     continue
                 
                 # Get current market prices
-                signal = self.analyzer.analyze()
+                # Use a direct reference to the user's selected index analyzer to avoid
+                # being affected by the analysis loop swapping self.analyzer mid-iteration.
+                _safe_analyzer = self._index_analyzers.get(_usr_idx.name, self.analyzer)
+                signal = _safe_analyzer.analyze()
                 if not signal:
                     await asyncio.sleep(check_interval)
                     continue
@@ -1040,7 +1130,7 @@ class TradingBot:
         For a strong gap → place a trade immediately in the gap direction.
         For a moderate gap → log and alert; ORB will confirm later.
         """
-        if self._gap_traded_today:
+        if self._index_gap_traded.get(self._active_index.name):
             return
 
         try:
@@ -1090,15 +1180,25 @@ class TradingBot:
             opt = OptionType.CE if gap.trade_direction == "CE" else OptionType.PE
             qty = int(self._active_index.lot_size * cfg.gap.quantity_multiplier)
 
-            result = await self.order_manager.manual_order(
-                option_type=opt.value,   # "CE" or "PE"
-                strike=atm_strike,
-                order_type="BUY",
-                quantity=qty,
-            )
+            # Temporarily apply gap-specific SL/target — gap trades are more volatile
+            # and have their own wider thresholds configured in GapConfig.
+            _orig_sl     = cfg.trading.stop_loss_percentage
+            _orig_target = cfg.trading.target_percentage
+            cfg.trading.stop_loss_percentage = cfg.gap.stop_loss_pct
+            cfg.trading.target_percentage    = cfg.gap.target_pct
+            try:
+                result = await self.order_manager.manual_order(
+                    option_type=opt.value,   # "CE" or "PE"
+                    strike=atm_strike,
+                    order_type="BUY",
+                    quantity=qty,
+                )
+            finally:
+                cfg.trading.stop_loss_percentage = _orig_sl
+                cfg.trading.target_percentage    = _orig_target
 
             if result.success:
-                self._gap_traded_today = True
+                self._index_gap_traded[self._active_index.name] = True
                 msg = (
                     f"🚀 **Gap Trade Executed**\n"
                     f"  Gap: {gap.gap_type.value} ({gap.gap_pct:+.2f}%)\n"
@@ -1118,7 +1218,7 @@ class TradingBot:
     async def _check_orb_signal(self):
         """Check ORB strategy and execute trade if a breakout is detected."""
         # Engine-level one-trade-per-day guard: survives ORB resets and index switches
-        if self._orb_triggered_date == datetime.now().date():
+        if self._index_orb_triggered.get(self._active_index.name) == datetime.now().date():
             return
         try:
             orb_signal = self.orb.analyze()
@@ -1244,7 +1344,7 @@ class TradingBot:
             )
 
             if order_ok:
-                self._orb_triggered_date = datetime.now().date()  # block further ORB trades today
+                self._index_orb_triggered[self._active_index.name] = datetime.now().date()
 
         except Exception as e:
             logger.error(f"ORB signal check error: {e}")
@@ -1252,7 +1352,7 @@ class TradingBot:
     async def _check_vwap_signal(self):
         """Check VWAP mean-reversion strategy and execute if a signal fires."""
         # Engine-level one-trade-per-day guard: survives VWAP resets and bot restarts
-        if self._vwap_triggered_date == datetime.now().date():
+        if self._index_vwap_triggered.get(self._active_index.name) == datetime.now().date():
             return
         try:
             vwap_signal = self.vwap_strat.analyze()
@@ -1299,7 +1399,7 @@ class TradingBot:
             )
 
             if order_ok:
-                self._vwap_triggered_date = datetime.now().date()  # block further VWAP trades today
+                self._index_vwap_triggered[self._active_index.name] = datetime.now().date()
                 tg_msg = (
                     f"VWAP REVERSION {vwap_signal.direction}\n"
                     f"Entry: {vwap_signal.current_price:.2f}\n"
@@ -2303,8 +2403,8 @@ The bot will continuously update you with:
     def _handle_gap_command(self) -> str:
         """Handle 'gap' command — show today's gap analysis (forces a fresh fetch)."""
         try:
-            # Clear cache so we get a fresh read
-            self._gap_detector._today_analysis = None
+            # Clear cache for the active index so we get a fresh read
+            self._gap_detector._cached_by_index.pop(self._active_index.name, None)
             analysis = self._gap_detector.analyze()
             if not analysis:
                 return "Gap analysis unavailable — market may not be open yet or data fetch failed."
@@ -2335,10 +2435,12 @@ The bot will continuously update you with:
             return f"Already analyzing {idx.display_name}."
 
         self._active_index = idx
-        self.analyzer.set_index(idx)
+        self._user_selected_index = idx   # survives analysis-loop context swaps
+        # Switch to the pre-created per-index instances (keeps each index's state intact)
+        self.analyzer   = self._index_analyzers[idx.name]
+        self.orb        = self._index_orbs[idx.name]
+        self.vwap_strat = self._index_vwaps[idx.name]
         self.order_manager.set_active_index(idx)
-        self.orb.set_index(idx)
-        self.vwap_strat.set_index(idx)
         self.kite.set_active_index(idx)  # propagate to broker so place_order uses correct index
 
         # Update advanced modules with the new index
@@ -2346,8 +2448,10 @@ The bot will continuously update you with:
         regime_detector.set_index(idx)
         mtf_engine.set_index(idx)
         theta_clock.set_index(idx)
+        self._gap_detector.set_index(idx)
 
-        self._last_signal = None
+        self._last_signal = self._index_last_signal.get(idx.name)
+        self._cached_regime = self._index_regime_cache.get(idx.name)
         self._last_analysis_time = None
 
         msg = (

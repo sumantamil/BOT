@@ -35,6 +35,7 @@ class TradeRecord:
     highest_price: float = 0.0   # tracks peak for trailing-stop
     tier1_exited: bool = False   # True after tier-1 partial exit fires
     gtt_id: Optional[int] = None  # Kite GTT stop-loss order ID (exchange-level safety net)
+    lot_size: int = 1               # index lot size at entry — used for partial-exit calc
 
 
 @dataclass
@@ -299,7 +300,8 @@ class OrderManager:
                 quantity=quantity,
                 price=option_ltp,   # option premium price, not index price
                 timestamp=datetime.now(),
-                status="OPEN"
+                status="OPEN",
+                lot_size=self._active_index.lot_size,
             )
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
@@ -395,7 +397,8 @@ class OrderManager:
                 quantity=quantity,
                 price=0,
                 timestamp=datetime.now(),
-                status="OPEN"
+                status="OPEN",
+                lot_size=self._active_index.lot_size,
             )
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
@@ -596,18 +599,21 @@ class OrderManager:
 
             pnl_pct = (current - entry) / entry * 100
 
-            # Lot size for the active index — partial exits must be a multiple of it
-            lot_size = max(1, self._active_index.lot_size)
+            # Use the lot size recorded at trade entry — immune to active-index mid-swap.
+            lot_size = max(1, trade.lot_size)
 
             if not trade.tier1_exited and pnl_pct >= self.config.take_profit_tier_1_percent:
                 raw = trade.quantity * self.config.take_profit_tier_1_quantity_percent / 100
-                qty = max(lot_size, int(raw // lot_size) * lot_size)
+                lots = int(raw // lot_size)  # how many whole lots to exit
+                # If raw rounds down to 0 lots (single-lot position), exit exactly 1 lot
+                qty = max(lot_size, lots * lot_size)
                 qty = min(qty, trade.quantity)  # never exceed remaining position
                 actions.append((trade_id, qty, "TIER1"))
 
             elif trade.tier1_exited and pnl_pct >= self.config.take_profit_tier_2_percent:
                 raw = trade.quantity * self.config.take_profit_tier_2_quantity_percent / 100
-                qty = max(lot_size, int(raw // lot_size) * lot_size)
+                lots = int(raw // lot_size)
+                qty = max(lot_size, lots * lot_size)
                 qty = min(qty, trade.quantity)  # never exceed remaining position
                 actions.append((trade_id, qty, "TIER2"))
 
@@ -656,10 +662,15 @@ class OrderManager:
 
             pnl_pct = ((current - entry) / entry) * 100
 
-            # ── Trailing stop-loss (only activates once trade moves into profit) ──
-            # Trails ₹500 below the peak — protects locked profits but lets
-            # a losing trade continue running until fixed SL or max-loss fires.
-            if self.config.use_trailing_stop_loss and trade.highest_price > entry:
+            # ── Trailing stop-loss ─────────────────────────────────────────────
+            # Arms only after the position reaches `trailing_stop_activation_pct`
+            # profit.  Before that the fixed SL is the only guard, so a normal
+            # intraday fluctuation never mis-fires the trail on a tiny tick up.
+            # Once armed, the trail follows the peak and exits on any pullback
+            # beyond `trailing_stop_percentage` — capturing the maximum run.
+            _activation_pct = getattr(self.config, 'trailing_stop_activation_pct', 10.0)
+            _trail_armed = trade.highest_price >= entry * (1 + _activation_pct / 100)
+            if self.config.use_trailing_stop_loss and _trail_armed:
                 if self.config.use_trailing_stop_amount:
                     # ₹ amount is total-P&L basis → convert to per-unit
                     # e.g. ₹500 trail on 50 lots = ₹10/unit trail distance

@@ -5,7 +5,7 @@ Uses mocked dhanhq client so no real orders are placed.
 """
 import asyncio
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from unittest.mock import MagicMock, AsyncMock, patch
 
 sys.path.insert(0, '.')
@@ -22,6 +22,15 @@ def check(label, cond, detail=""):
 
 
 # ── build a DhanBroker with a mocked dhanhq client ───────────────────────────
+def _nifty_next_expiry() -> date:
+    """Return the next NIFTY expiry date (next Tuesday from today).
+    Mirrors DhanBroker._next_expiry_date so the test instrument-map key always matches.
+    """
+    today = date.today()
+    days_ahead = (1 - today.weekday()) % 7 or 7  # 1 = Tuesday
+    return today + timedelta(days=days_ahead)
+
+
 def make_broker():
     from browser.dhan import DhanBroker
     from bot.index_config import NIFTY
@@ -57,10 +66,11 @@ def make_broker():
     b._browser      = None
     b._page         = None
 
-    # Instrument lookup cache
+    # Instrument lookup cache — uses the real next-expiry date so the key always matches
+    _expiry = _nifty_next_expiry()
     b._instrument_map = {
-        "NIFTY|24500|CE|2026-03-17": "57847",
-        "NIFTY|24500|PE|2026-03-17": "57848",
+        f"NIFTY|24500|CE|{_expiry.isoformat()}": "57847",
+        f"NIFTY|24500|PE|{_expiry.isoformat()}": "57848",
     }
     b._instruments_loaded_date = date.today()
     # Security ID cache (matches what place_order populates after a real trade)
@@ -106,7 +116,7 @@ async def test_gtt_place():
     print("\n── TEST 2: GTT / Forever Order (Stop-Loss) ──")
     b, mock_client = make_broker()
 
-    mock_client.place_forever_order.return_value = {
+    mock_client.place_forever.return_value = {
         "status": "success",
         "data": {"orderId": "GTT001"}
     }
@@ -119,17 +129,17 @@ async def test_gtt_place():
         quantity=65,
     )
 
-    check("Forever Order placed",        mock_client.place_forever_order.called)
+    check("Forever Order placed",        mock_client.place_forever.called)
     check("gtt_id returned",             gtt_id == 1, f"gtt_id={gtt_id}")
-    kw = mock_client.place_forever_order.call_args[1]
+    kw = mock_client.place_forever.call_args[1]
     expected_trigger = round(100.0 * (1 - 15/100), 1)   # 85.0
     expected_limit   = round(expected_trigger * 0.98, 1) # 83.3
-    check(f"trigger_price = ₹{expected_trigger}",
-          kw.get("trigger_price") == expected_trigger, f"got={kw.get('trigger_price')}")
-    check(f"limit_price = ₹{expected_limit}",
+    check(f"trigger_Price = ₹{expected_trigger}",
+          kw.get("trigger_Price") == expected_trigger, f"got={kw.get('trigger_Price')}")
+    check(f"limit price = ₹{expected_limit}",
           kw.get("price") == expected_limit,  f"got={kw.get('price')}")
     check("transaction_type SELL",       kw.get("transaction_type") == "SELL")
-    check("product_type INTRADAY",       kw.get("product_type") == "INTRADAY")
+    check("product_type CNC",            kw.get("product_type") == "CNC")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,13 +149,13 @@ async def test_gtt_cancel():
     print("\n── TEST 3: Cancel Forever Order ──")
     b, mock_client = make_broker()
 
-    mock_client.cancel_forever_order.return_value = {"status": "success", "data": {}}
+    mock_client.cancel_forever.return_value = {"status": "success", "data": {}}
 
     ok = await b.cancel_gtt(gtt_id=999)
 
-    check("cancel_forever_order called",  mock_client.cancel_forever_order.called)
+    check("cancel_forever called",  mock_client.cancel_forever.called)
     check("returns True on success",      ok is True, f"ok={ok}")
-    call_args = mock_client.cancel_forever_order.call_args
+    call_args = mock_client.cancel_forever.call_args
     check("correct order_id passed",      call_args[1].get("order_id") == "999")
 
 
@@ -196,10 +206,13 @@ def test_stop_loss_logic():
     om.config  = MagicMock(
         stop_loss_percentage=15.0,
         target_percentage=30.0,
+        max_loss_per_trade=5000.0,
         use_trailing_stop_loss=True,
         trailing_stop_percentage=12.0,
+        trailing_stop_activation_pct=10.0,
         use_trailing_stop_amount=False,
         trailing_stop_amount=500,
+        time_stop_minutes=0,     # disable time-stop so it doesn't interfere
     )
     om._positions  = {}
     om._trade_history = []
@@ -304,8 +317,10 @@ async def test_amo_order():
 
     import unittest.mock as um
 
+    # Use Monday March 23 as the fake date so _next_expiry_date returns Tuesday March 24,
+    # which matches the dynamic instrument-map key in make_broker().
     # ── Simulate 18:30 (inside AMO evening window) ──
-    fake_evening = datetime(2026, 3, 16, 18, 30)   # Monday evening
+    fake_evening = datetime(2026, 3, 23, 18, 30)   # Monday evening
     with um.patch("browser.dhan.datetime") as mock_dt:
         mock_dt.now.return_value = fake_evening
         mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
@@ -313,7 +328,7 @@ async def test_amo_order():
     check("18:30 → AMO window detected", is_amo, f"is_amo={is_amo}")
 
     # ── Simulate 08:00 (inside AMO morning window) ──
-    fake_morning = datetime(2026, 3, 16, 8, 0)   # Monday morning
+    fake_morning = datetime(2026, 3, 23, 8, 0)   # Monday morning
     with um.patch("browser.dhan.datetime") as mock_dt:
         mock_dt.now.return_value = fake_morning
         mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
@@ -321,7 +336,7 @@ async def test_amo_order():
     check("08:00 → AMO window detected", is_amo, f"is_amo={is_amo}")
 
     # ── Simulate 10:30 (market hours, NOT AMO) ──
-    fake_market = datetime(2026, 3, 16, 10, 30)
+    fake_market = datetime(2026, 3, 23, 10, 30)
     with um.patch("browser.dhan.datetime") as mock_dt:
         mock_dt.now.return_value = fake_market
         mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)

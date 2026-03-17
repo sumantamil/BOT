@@ -67,7 +67,8 @@ class GapDetector:
 
     def __init__(self, index_config: IndexConfig = None):
         self._index = index_config or NIFTY
-        self._today_analysis: Optional[GapAnalysis] = None
+        # Per-index cache so NIFTY/BANKNIFTY/SENSEX each get their own gap analysis
+        self._cached_by_index: dict = {}   # {index_name: GapAnalysis}
         self._last_date: Optional[date] = None
 
     def set_index(self, idx: IndexConfig):
@@ -83,8 +84,12 @@ class GapDetector:
         Returns cached result if already computed today.
         """
         today = date.today()
-        if self._last_date == today and self._today_analysis:
-            return self._today_analysis
+        # Reset per-index cache on a new calendar day
+        if self._last_date != today:
+            self._cached_by_index = {}
+            self._last_date = today
+        if self._index.name in self._cached_by_index:
+            return self._cached_by_index[self._index.name]
 
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
@@ -168,8 +173,7 @@ class GapDetector:
             timestamp=datetime.now(),
         )
 
-        self._today_analysis = analysis
-        self._last_date = today
+        self._cached_by_index[self._index.name] = analysis
         logger.info(
             f"Gap detected: {gap_type.value} | {gap_pct:+.2f}% | "
             f"prev={prev_close:.1f} open={open_price:.1f}"
@@ -204,11 +208,11 @@ class GapDetector:
         return "\n".join(lines)
 
     def is_strong_gap(self) -> bool:
-        a = self._today_analysis
+        a = self._cached_by_index.get(self._index.name)
         return a is not None and a.gap_type in (GapType.STRONG_UP, GapType.STRONG_DOWN)
 
     def should_trade_immediately(self) -> bool:
-        a = self._today_analysis
+        a = self._cached_by_index.get(self._index.name)
         return (
             a is not None
             and a.trade_direction != "SKIP"
