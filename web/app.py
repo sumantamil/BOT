@@ -8,6 +8,7 @@ Provides:
 """
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, HTTPException, Query
@@ -139,20 +140,25 @@ async def get_status():
     try:
         # Get positions and P&L
         kite_data = await bot.kite.get_kite_positions()
-        if kite_data["day"]:
+        # Only count day positions where net quantity != 0 (excludes closed round-trips)
+        open_day = [p for p in kite_data.get("day", []) if (p.get("quantity") or 0) != 0]
+        if kite_data.get("day"):
             daily_pnl = kite_data["total_pnl"]
-            open_positions = len(kite_data["day"])
+            open_positions = len(open_day)
         else:
             # Broker reports no day trades (new day or no trades yet) — reset to 0
             daily_pnl = 0.0
-            if kite_data["net"]:
-                open_positions = len(kite_data["net"])
-        # Current P&L = sum of unrealized P&L on open (net qty != 0) positions
-        current_pnl = sum(
-            float(p.get("unrealised", 0) or 0)
-            for p in kite_data.get("net", [])
-            if (p.get("quantity") or 0) != 0
-        )
+            net_open = [p for p in kite_data.get("net", []) if (p.get("quantity") or 0) != 0]
+            open_positions = len(net_open)
+        # Current P&L = unrealised on positions still open (qty != 0)
+        # Check both day and net lists
+        current_pnl = sum(float(p.get("unrealised", 0) or 0) for p in open_day)
+        if not open_day:
+            current_pnl = sum(
+                float(p.get("unrealised", 0) or 0)
+                for p in kite_data.get("net", [])
+                if (p.get("quantity") or 0) != 0
+            )
         
         # Get funds/balance
         funds = await bot.kite.get_fund_limits()
@@ -173,6 +179,54 @@ async def get_status():
         "broker": settings.broker.capitalize(),
         "connections": manager.get_connection_count()
     }
+
+
+@app.get("/api/pnl")
+async def get_pnl():
+    """Fast P&L endpoint with 5-second broker cache.
+    Called every 2 seconds by dashboard — fetches from broker but throttled
+    so it never fires more than once every 5 seconds."""
+    if not bot:
+        raise HTTPException(status_code=503, detail="Bot not initialized")
+
+    now = datetime.now()
+    cache = getattr(app.state, "pnl_cache", None)
+    cache_time = getattr(app.state, "pnl_cache_time", None)
+
+    # Return cached value if fresher than 5 seconds
+    if cache and cache_time and (now - cache_time).total_seconds() < 5:
+        return cache
+
+    # Refresh from broker
+    daily_pnl   = 0.0
+    current_pnl = 0.0
+    try:
+        kite_data = await bot.kite.get_kite_positions()
+        if kite_data.get("day"):
+            daily_pnl = float(kite_data.get("total_pnl") or 0)
+        # current unrealised: only positions still holding (qty != 0)
+        open_day = [p for p in kite_data.get("day", []) if (p.get("quantity") or 0) != 0]
+        current_pnl = sum(float(p.get("unrealised", 0) or 0) for p in open_day)
+        if not open_day:
+            current_pnl = sum(
+                float(p.get("unrealised", 0) or 0)
+                for p in kite_data.get("net", [])
+                if (p.get("quantity") or 0) != 0
+            )
+    except Exception as e:
+        logger.warning(f"get_pnl: broker fetch failed: {e}")
+        # Fall back to engine cache on broker error
+        daily_pnl   = float(getattr(bot, "_cached_daily_pnl",   0.0))
+        current_pnl = float(getattr(bot, "_cached_current_pnl", 0.0))
+
+    result = {
+        "daily_pnl":    round(daily_pnl,   2),
+        "current_pnl":  round(current_pnl, 2),
+        "last_updated": now.isoformat(),
+    }
+    app.state.pnl_cache      = result
+    app.state.pnl_cache_time = now
+    return result
 
 
 @app.post("/api/login")
@@ -337,7 +391,15 @@ async def compare_indices():
     """Compare NIFTY, BANKNIFTY, and SENSEX to find best trading opportunity"""
     if not bot:
         raise HTTPException(status_code=503, detail="Bot not initialized")
-    
+
+    # Cache for 60 seconds — this endpoint fetches yfinance 3× per call;
+    # with multiple browser tabs polling every 60s, cache prevents a data-fetch storm.
+    from datetime import datetime as _dt
+    cache      = getattr(app.state, "compare_cache",      None)
+    cache_time = getattr(app.state, "compare_cache_time", None)
+    if cache and cache_time and (_dt.now() - cache_time).total_seconds() < 60:
+        return cache
+
     from bot.trend_analyzer import TrendAnalyzer
     
     indices_data = []
@@ -397,12 +459,16 @@ async def compare_indices():
     else:
         best = max(indices_data, key=lambda x: x["strength"])
         best_recommendation = f"Best: {best['name']} ({best['strength']:.1f}% - {best['trend']})"
-    
-    return {
+
+    result = {
         "indices": indices_data,
         "best_opportunity": best_recommendation,
         "best_index": best["symbol"]
     }
+    # Save to cache
+    app.state.compare_cache      = result
+    app.state.compare_cache_time = _dt.now()
+    return result
 
 
 @app.get("/api/ledger")
@@ -435,23 +501,86 @@ async def get_ledger(days: int = 30):
                 with open(os.path.join(journal_dir, fname)) as f:
                     entries = _json.load(f)
                 for e in entries:
-                    if e.get("event_type") == "TRADE":
-                        d = e.get("details", {})
-                        records.append({
-                            "date": day_str,
-                            "time": e.get("timestamp", "")[:19].replace("T", " "),
-                            "action": d.get("action", ""),
-                            "symbol": f"{d.get('strike','')}{e.get('direction','')}",
-                            "strike": d.get("strike", 0),
-                            "option_type": e.get("direction", ""),
-                            "premium": d.get("premium", 0),
-                            "quantity": d.get("quantity", 0),
-                            "pnl": d.get("pnl", None),
-                            "status": d.get("status", "CLOSED"),
-                            "source": "journal",
-                        })
+                    if e.get("event_type") != "TRADE":
+                        continue
+                    d = e.get("details", {})
+                    action = d.get("action", "")
+                    # Only show SELL (close) rows in ledger — avoids double-counting
+                    if action not in ("SELL", "BUY"):
+                        continue
+                    # Symbol: prefer explicit 'symbol' field over direction
+                    sym = d.get("symbol", "") or d.get("customSymbol", "")
+                    if not sym:
+                        direction = e.get("direction", "")
+                        sym = direction if direction not in ("CLOSE", "N/A", "") else "—"
+                    # Price: prefer 'price' over legacy 'premium'
+                    price = float(d.get("price") or d.get("premium") or d.get("tradedPrice") or 0)
+                    # P&L: prefer net_pnl → gross_pnl → pnl, only on SELL rows
+                    pnl_val = None
+                    if action == "SELL":
+                        pnl_val = d.get("net_pnl") or d.get("gross_pnl") or d.get("pnl")
+                        if pnl_val is not None:
+                            pnl_val = float(pnl_val)
+                    # Option type from symbol
+                    opt = "CE" if "CE" in sym or "CALL" in sym else ("PE" if "PE" in sym or "PUT" in sym else "")
+                    records.append({
+                        "date": day_str,
+                        "time": e.get("timestamp", "")[:19].replace("T", " "),
+                        "action": action,
+                        "symbol": sym,
+                        "strike": float(d.get("strike") or d.get("drvStrikePrice") or 0),
+                        "option_type": opt,
+                        "premium": price,
+                        "quantity": int(d.get("quantity") or d.get("tradedQuantity") or 0),
+                        "pnl": pnl_val,
+                        "status": "CLOSED" if action == "SELL" else "OPEN",
+                        "source": "journal",
+                    })
             except Exception as ex:
                 logger.warning(f"Ledger: could not read {fname}: {ex}")
+
+    # ── 1b. Dhan ledger_report for net settled P&L per day (fills gaps) ──
+    from config import settings as _cfg
+    if bot and str(_cfg.broker).lower() == "dhan":
+        try:
+            from dhanhq import dhanhq as _dhan
+            _dc = _dhan(_cfg.dhan.client_id, _cfg.dhan.access_token)
+            from_dt = cutoff.isoformat()
+            to_dt   = date.today().isoformat()
+            lr = _dc.ledger_report(from_dt, to_dt)
+            for row in (lr.get("data") or []):
+                narration = row.get("narration", "")
+                vdate     = row.get("voucherdate", "")   # "Mar 16, 2026"
+                debit     = float(row.get("debit") or 0)
+                credit    = float(row.get("credit") or 0)
+                if narration != "Trades Executed":
+                    continue
+                # Convert "Mar 16, 2026" → "2026-03-16"
+                try:
+                    from datetime import datetime as _dt
+                    day_str = _dt.strptime(vdate, "%b %d, %Y").date().isoformat()
+                except Exception:
+                    continue
+                # Net P&L = credit - debit for that day's settled trades
+                net = round(credit - debit, 2)
+                # Only add if no journal already covers that day with P&L data
+                covered = any(r["date"] == day_str and r.get("pnl") is not None for r in records)
+                if not covered:
+                    records.append({
+                        "date": day_str,
+                        "time": day_str + " 15:30:00",
+                        "action": "SETTLE",
+                        "symbol": f"Dhan F&O Settlement ({row.get('vouchernumber','')})",
+                        "strike": 0,
+                        "option_type": "",
+                        "premium": 0,
+                        "quantity": 0,
+                        "pnl": net,
+                        "status": "CLOSED",
+                        "source": "dhan_ledger",
+                    })
+        except Exception as ex:
+            logger.warning(f"Ledger: Dhan ledger_report failed: {ex}")
 
     # ── 2. Today's live positions from Kite ───────────────────────────────
     today_str = date.today().isoformat()

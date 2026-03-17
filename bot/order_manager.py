@@ -137,7 +137,10 @@ class OrderManager:
             return False, f"Daily trade limit reached ({self.config.max_trades_per_day} trades)"
 
         # ── Minimum time between trades ──────────────────────────────────────
-        if self._last_trade_time:
+        # Skip cooldown when adding a hedge leg (already have >=1 open position);
+        # only enforce for fresh entries when all positions are flat.
+        active_positions = len([p for p in self._positions.values() if p.status == "OPEN"])
+        if self._last_trade_time and active_positions == 0:
             elapsed_min = (datetime.now() - self._last_trade_time).total_seconds() / 60
             if elapsed_min < self.config.min_time_between_trades_minutes:
                 return False, (
@@ -145,8 +148,7 @@ class OrderManager:
                     f"min {self.config.min_time_between_trades_minutes} min required)"
                 )
 
-        # ── Max concurrent positions ─────────────────────────────────────────
-        active_positions = len([p for p in self._positions.values() if p.status == "OPEN"])
+        # ── Max concurrent positions ───────────────────────────────────────────
         if active_positions >= self.config.max_positions:
             return False, f"Max positions reached ({self.config.max_positions})"
 
@@ -336,16 +338,36 @@ class OrderManager:
             self._daily_stats.total_trades += 1
             self._last_trade_time = datetime.now()
 
-            # Always fetch the actual fill/LTP price so SL/target checks work
-            # correctly regardless of whether GTT is enabled or disabled.
+            # Fetch the actual fill price from broker positions (average_price).
+            # Wait 2s for the order to settle in the broker's book before querying.
+            # This ensures the trailing-stop / SL calculations use the real fill price,
+            # not a stale LTP snapshot that may differ by 0.5–2 points.
+            await asyncio.sleep(2)
+            fill_price = 0.0
             try:
-                entry_price = await self.kite.get_instrument_price(trade.symbol) or 0.0
-                if entry_price > 0:
-                    trade.price = entry_price
-                    trade.highest_price = entry_price
-                    logger.info(f"manual_order: entry LTP set to ₹{entry_price:.2f} for {trade.symbol}")
+                pos_data = await self.kite.get_kite_positions()
+                for p in pos_data.get("day", []):
+                    sym = p.get("tradingsymbol", "")
+                    if (str(strike) in sym and opt_type.value in sym
+                            and (p.get("quantity") or 0) != 0):
+                        avg = float(p.get("average_price") or 0)
+                        if avg > 0:
+                            fill_price = avg
+                            break
             except Exception as e:
-                logger.warning(f"Could not fetch entry LTP for {trade.symbol}: {e}")
+                logger.debug(f"Broker fill fetch failed, falling back to LTP: {e}")
+
+            if fill_price == 0.0:
+                # fallback: use LTP if broker fill unavailable
+                try:
+                    fill_price = await self.kite.get_instrument_price(trade.symbol) or 0.0
+                except Exception:
+                    pass
+
+            if fill_price > 0:
+                trade.price = fill_price
+                trade.highest_price = fill_price
+                logger.info(f"manual_order: entry fill price = ₹{fill_price:.2f} for {trade.symbol}")
 
             # Place GTT exchange-level stop-loss (optional, survives bot restarts)
             if self.config.use_gtt and trade.price > 0:
@@ -561,7 +583,10 @@ class OrderManager:
             # a losing trade continue running until fixed SL or max-loss fires.
             if self.config.use_trailing_stop_loss and trade.highest_price > entry:
                 if self.config.use_trailing_stop_amount:
-                    trail_sl = trade.highest_price - self.config.trailing_stop_amount
+                    # ₹ amount is total-P&L basis → convert to per-unit
+                    # e.g. ₹500 trail on 50 lots = ₹10/unit trail distance
+                    qty = max(trade.quantity, 1)
+                    trail_sl = trade.highest_price - (self.config.trailing_stop_amount / qty)
                 else:
                     trail_sl = trade.highest_price * (
                         1 - self.config.trailing_stop_percentage / 100
@@ -575,6 +600,21 @@ class OrderManager:
                     )
                     actions_needed.append(trade_id)
                     continue  # skip fixed SL/target check
+
+            # ── Time-stop: exit if open > N minutes with no meaningful profit ──
+            time_stop_mins = getattr(self.config, 'time_stop_minutes', 45)
+            if time_stop_mins > 0:
+                age_min = (datetime.now() - trade.timestamp).total_seconds() / 60
+                # Trigger only if: old enough AND peak never exceeded entry by 2%
+                if age_min >= time_stop_mins and trade.highest_price < entry * 1.02:
+                    logger.info(
+                        f"TIME-STOP triggered for {trade.symbol}: "
+                        f"{age_min:.0f} min open, "
+                        f"peak={trade.highest_price:.2f}, entry={entry:.2f} "
+                        f"(never moved >2% into profit)"
+                    )
+                    actions_needed.append(trade_id)
+                    continue
 
             # ── Max loss per trade (absolute ₹ amount) ────────────────────────
             pnl_inr = (current - entry) * trade.quantity

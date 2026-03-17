@@ -76,6 +76,7 @@ _EXCHANGE_NSE_FNO = "NSE_FNO"
 _EXCHANGE_BSE_FO  = "BSE_FO"
 _PRODUCT_INTRADAY = "INTRADAY"
 _PRODUCT_CNC      = "CNC"        # used for AMO (queue at exchange overnight)
+_PRODUCT_MARGIN   = "MARGIN"     # required for BSE_FO (SENSEX/BANKEX options)
 _ORDER_MARKET     = "MARKET"
 _ORDER_LIMIT      = "LIMIT"
 
@@ -385,7 +386,14 @@ class DhanBroker:
 
         try:
             amo = self.is_amo_window()
-            product = _PRODUCT_CNC if amo else _PRODUCT_INTRADAY
+            # BSE_FO (SENSEX/BANKEX) only accepts MARGIN product type.
+            # NSE_FNO uses INTRADAY during market hours, CNC for AMO.
+            if exchange == _EXCHANGE_BSE_FO:
+                product = _PRODUCT_MARGIN
+            elif amo:
+                product = _PRODUCT_CNC
+            else:
+                product = _PRODUCT_INTRADAY
             tag = " [AMO]" if amo else ""
             logger.info(
                 f"Dhan{tag}: {order_type.value} {index.name} {strike} {option_type.value} "
@@ -737,15 +745,15 @@ class DhanBroker:
 
         try:
             resp = await asyncio.to_thread(
-                self._client.place_forever_order,
+                self._client.place_forever,
                 security_id=sec_id,
                 exchange_segment=dhan_exchange,
                 transaction_type="SELL",
                 quantity=quantity,
                 order_type=_ORDER_LIMIT,
-                product_type=_PRODUCT_INTRADAY,
+                product_type=_PRODUCT_CNC,   # Forever Orders only accept CNC, not INTRADAY
                 price=limit_price,
-                trigger_price=trigger_price,
+                trigger_Price=trigger_price,
             )
             if resp and resp.get("status") == "success":
                 oid = resp.get("data", {}).get("orderId")
@@ -767,7 +775,7 @@ class DhanBroker:
             return False
         try:
             resp = await asyncio.to_thread(
-                self._client.cancel_forever_order,
+                self._client.cancel_forever,
                 order_id=str(gtt_id),
             )
             if resp and resp.get("status") == "success":

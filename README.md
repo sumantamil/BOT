@@ -478,7 +478,12 @@ Runs every `TREND_ANALYSIS_INTERVAL_SECONDS`. Uses SMA(20/50), RSI(14), MACD, an
 Captures the high/low of the first 15 minutes (9:15–9:30 AM). Trades breakouts with volume confirmation. Entry window: 9:30–11:30 AM. Max 1 trade per day.
 
 ### 3. VWAP Mean Reversion
-Active on **RANGING** regime days. Enters when price deviates >0.4% from VWAP with RSI confirmation. Good for sideways, choppy markets.
+Active on **RANGING** regime days and on **strong TRENDING days (ADX > 50)** with neutral 5-minute signal. Enters when price deviates >0.4% from VWAP with RSI confirmation. Good for sideways, choppy markets and strong-trend mean-reversion entries.
+
+- On RANGING days: runs independently alongside ORB
+- On TRENDING days (ADX > 50): acts as a **secondary entry** when the 5-minute signal is neutral
+- Regime-direction alignment enforced: TRENDING DOWN only allows PE entry; TRENDING UP only allows CE entry
+- Max 1 VWAP trade per day (2nd slot of the 2-position limit)
 
 ### 4. Gap Up / Gap Down (new)
 Runs once daily at market open (9:15–9:30 AM). Detects opening gaps caused by overnight events (global markets, news, geopolitical/war events).
@@ -501,11 +506,16 @@ Type `gap` in the chat UI anytime to see today's gap analysis.
 
 ### Strategy Selection by Regime
 
-| Regime | Active Strategies |
-|---|---|
-| TRENDING UP/DOWN | Trend Following + ORB + Gap |
-| RANGING | VWAP Mean Reversion + ORB + Gap |
-| VOLATILE | ORB + Gap only (trend-follow paused) |
+The bot supports **2 simultaneous open positions** — one from ORB and one from VWAP, running independently. `TRADING_MAX_POSITIONS=2` controls this limit.
+
+| Regime | Active Strategies | Max Simultaneous Positions |
+|---|---|---|
+| TRENDING UP/DOWN (ADX ≤ 50) | Trend Following + ORB + Gap | 1 (ORB only) |
+| TRENDING UP/DOWN (ADX > 50) | Trend Following + ORB + **VWAP** + Gap | **2 (ORB + VWAP)** |
+| RANGING | VWAP Mean Reversion + ORB + Gap | **2 (ORB + VWAP)** |
+| VOLATILE | ORB + Gap only (trend-follow paused) | 1 (ORB only) |
+
+> **How 2 simultaneous trades work:** ORB fires in the morning (9:30–11:30 AM) and takes slot 1. VWAP fires later in the day when price deviates >0.4% from VWAP, taking slot 2. Both positions are monitored independently with their own GTT stop-loss orders.
 
 ---
 

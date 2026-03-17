@@ -69,7 +69,7 @@ class TradingConfig(BaseSettings):
     default_quantity: int = Field(default=50, description="Number of units per trade")
     
     # Maximum positions at any time
-    max_positions: int = Field(default=3, description="Maximum open positions")
+    max_positions: int = Field(default=2, description="Maximum open positions (supports 2 simultaneous: 1 ORB + 1 VWAP)")
     
     # Risk management
     max_loss_per_trade: float = Field(default=5000.0, description="Max loss per trade in INR")
@@ -121,6 +121,11 @@ class TradingConfig(BaseSettings):
     # Dhan AMO window: 17:00–23:59 and 00:00–09:08 on weekdays
     # Uses CNC product type so the order sits in queue and executes at open
     amo_enabled: bool = Field(default=True, description="Allow AMO orders during pre/post-market for gap strategies")
+
+    # Time-stop: exit positions that never move into profit
+    # After N minutes open, if peak has never exceeded entry by 2%, exit to free capital.
+    # Set 0 to disable.  Default: 45 minutes.
+    time_stop_minutes: int = Field(default=45, description="Exit if open > N min with peak ≤ entry+2% (0=disabled)")
 
     # Auto-trading settings
     auto_trade_enabled: bool = Field(default=False, description="Enable automatic trading")
@@ -223,7 +228,7 @@ class ORBConfig(BaseSettings):
     target_multiplier: float = Field(default=1.5, description="Target 1 = range_width x multiplier")
     target_multiplier_2: float = Field(default=2.0, description="Target 2 = range_width x multiplier_2")
     volume_confirmation: bool = Field(default=True, description="Require volume spike (1.2x avg) to confirm breakout")
-    breakout_buffer_pct: float = Field(default=0.05, description="% buffer above/below range boundary to confirm breakout")
+    breakout_buffer_pct: float = Field(default=0.15, description="% buffer above/below range boundary to confirm breakout")
 
     model_config = SettingsConfigDict(
         env_prefix="ORB_",

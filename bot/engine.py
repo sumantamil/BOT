@@ -11,7 +11,7 @@ Main orchestration module that coordinates:
 import asyncio
 import re
 from typing import Optional, Callable, List, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from enum import Enum
 from dataclasses import dataclass
 from loguru import logger
@@ -96,6 +96,18 @@ class TradingBot:
         
         # Cache for current prices (updated by position monitor)
         self._current_prices: Dict[str, float] = {}
+
+        # Cached P&L (updated every position-monitor cycle — no extra broker API calls)
+        self._cached_daily_pnl: float = 0.0
+        self._cached_current_pnl: float = 0.0
+        self._pnl_last_updated: Optional[datetime] = None
+
+        # ORB one-trade-per-day guard at engine level.
+        # Uses a date (not bool) so it auto-resets on a new calendar day
+        # and survives ORB index-switch resets and bot restarts.
+        self._orb_triggered_date: Optional[date] = None
+        # Same guard for VWAP — prevents re-entry on restarts (1 VWAP trade per day max)
+        self._vwap_triggered_date: Optional[date] = None
 
         # Regime cache — re-fetch at most once per 30 min (daily data, expensive)
         self._cached_regime = None
@@ -261,6 +273,26 @@ class TradingBot:
                 )
                 logger.info(f"Daily trade counter restored: {self.order_manager._daily_stats.total_trades} trades already done today")
 
+            # Mark strategies as already triggered based on how many trades have
+            # occurred today.  The bot supports 2 simultaneous positions (one from
+            # ORB, one from VWAP), so only block VWAP when both slots are already
+            # consumed.  ORB always fires first (morning), so it is always blocked
+            # once any trade is found; VWAP is only blocked when 2+ trades exist.
+            total_today = closed_trades_today + recovered
+            if total_today > 0:
+                self._orb_triggered_date = datetime.now().date()
+                if hasattr(self, 'orb') and self.orb:
+                    self.orb._signal_fired = True
+                    from bot.orb_strategy import ORBState
+                    self.orb._state = ORBState.TRIGGERED
+                if total_today >= 2:
+                    # Both trade slots used — block VWAP re-entry too
+                    self._vwap_triggered_date = datetime.now().date()
+                    logger.info(f"ORB + VWAP both marked TRIGGERED on recovery ({total_today} trades today — both slots used)")
+                else:
+                    # Only 1 trade so far — ORB slot used, VWAP slot still available
+                    logger.info(f"ORB marked TRIGGERED on recovery ({total_today} trade today). VWAP slot still OPEN for a 2nd position.")
+
             if recovered:
                 await self._broadcast_message(
                     f"♻️  Recovered {recovered} open position(s) from broker", "system"
@@ -421,6 +453,16 @@ class TradingBot:
                         await self._check_orb_signal()
                     else:
                         # No clear regime or neutral trend → ORB only (safest)
+                        # Exception: if regime is STRONGLY TRENDING (ADX > 50) but 5m signal
+                        # is NEUTRAL (mixed short-term candles), also run VWAP. This catches
+                        # afternoon trades on strong-trend days where intraday indicators lag.
+                        # VWAP has its own 0.4% deviation + RSI guards so it won't over-trade.
+                        if is_trending and regime_result and regime_result.adx > 50:
+                            logger.info(
+                                f"Strong trend (ADX={regime_result.adx:.0f}) with neutral 5m signal "
+                                f"— running VWAP as secondary entry"
+                            )
+                            await self._check_vwap_signal()
                         await self._check_orb_signal()
 
                 await asyncio.sleep(interval)
@@ -543,6 +585,16 @@ class TradingBot:
                 
                 # Cache prices for get_status()
                 self._current_prices = current_prices
+
+                # ── Update cached P&L from in-memory state (no broker API call) ──
+                if self.order_manager:
+                    self._cached_daily_pnl = self.order_manager._daily_pnl
+                    self._cached_current_pnl = sum(
+                        (current_prices.get(t.symbol, t.price) - t.price) * t.quantity
+                        for t in self.order_manager._positions.values()
+                        if t.status == "OPEN" and t.symbol in current_prices
+                    )
+                    self._pnl_last_updated = datetime.now()
 
                 # ── Profit-tier partial exits (run BEFORE full SL/target check) ──
                 tier_actions = self.order_manager.check_profit_tiers(current_prices)
@@ -753,6 +805,74 @@ class TradingBot:
             self._auto_trade = False
             await self._broadcast_message("Rule action: Auto-trading PAUSED", "system")
     
+    async def _execute_orb_direct(
+        self,
+        signal: TrendSignal,
+        option_type: str,
+        orb_signal,
+    ) -> bool:
+        """
+        Fast-path ORB execution: places the order immediately at ATM without
+        waiting for the full option-chain research cycle (which costs 10-15s).
+
+        ATM strike is calculated inline from the live spot price and the
+        active index's strike interval (50 for NIFTY, 100 for BANKNIFTY/SENSEX).
+        Research results are broadcast AFTER the fill for informational use.
+        """
+        if not self.order_manager:
+            await self._broadcast_message("Order manager not initialized", "error")
+            return False
+
+        interval = self._active_index.strike_interval
+        atm = int(round(signal.current_price / interval) * interval)
+
+        await self._broadcast_message(
+            f"ORB ENTRY: BUY {option_type} @ {atm} "
+            f"(spot {signal.current_price:.2f}, direction={orb_signal.direction}, "
+            f"strength={orb_signal.strength:.0f}%)",
+            "trade_signal"
+        )
+
+        result = await self.order_manager.manual_order(
+            option_type=option_type,
+            strike=atm,
+            order_type="BUY",
+            quantity=None,
+        )
+
+        if result.success:
+            await self._broadcast_message(
+                f"✅ ORB trade executed: {result.message}", "trade_success"
+            )
+            # Journal the entry
+            try:
+                entry_price = 0.0
+                for _t in self.order_manager._positions.values():
+                    if (_t.status == "OPEN"
+                            and _t.option_type.value == option_type
+                            and _t.strike == atm):
+                        entry_price = _t.price
+                        break
+                trade_journal.log_trade(
+                    "BUY", atm, option_type, entry_price,
+                    self.order_manager.get_active_quantity()
+                )
+            except Exception:
+                pass
+            await self._send_telegram_alert(
+                f"ORB BREAKOUT {orb_signal.direction}\n"
+                f"Entry: {orb_signal.breakout_price:.2f}  ATM: {atm}\n"
+                f"SL: {orb_signal.stop_loss:.2f}  T1: {orb_signal.target_1:.2f}\n"
+                f"Strength: {orb_signal.strength:.0f}%",
+                "trade_entry"
+            )
+            return True
+        else:
+            await self._broadcast_message(
+                f"❌ ORB order failed: {result.message}", "trade_error"
+            )
+            return False
+
     async def _execute_option_with_research(
         self,
         signal: TrendSignal,
@@ -962,10 +1082,61 @@ class TradingBot:
 
     async def _check_orb_signal(self):
         """Check ORB strategy and execute trade if a breakout is detected."""
+        # Engine-level one-trade-per-day guard: survives ORB resets and index switches
+        if self._orb_triggered_date == datetime.now().date():
+            return
         try:
             orb_signal = self.orb.analyze()
             if not orb_signal:
                 return
+
+            # ── Guard 1: Minimum strength threshold ───────────────────────────
+            if orb_signal.strength < 75:
+                logger.info(
+                    f"ORB: Skipping — strength {orb_signal.strength:.0f}% < 75% threshold"
+                )
+                await self._broadcast_message(
+                    f"ORB: Signal skipped — strength {orb_signal.strength:.0f}% below 75% minimum",
+                    "alert"
+                )
+                return
+
+            # ── Guard 2: Trend-direction filter ───────────────────────────────
+            if not self._last_signal:
+                # Fetch trend so we have a direction to validate against
+                _tsig = self.analyzer.analyze()
+                if _tsig:
+                    self._last_signal = _tsig
+
+            if self._last_signal:
+                _trend = self._last_signal.trend.value   # "BULLISH" | "BEARISH" | "NEUTRAL"
+
+                if orb_signal.direction == "LONG" and _trend == "BEARISH":
+                    logger.info("ORB: Skipping LONG — overall trend is BEARISH (counter-trend)")
+                    await self._broadcast_message(
+                        "ORB: LONG signal skipped — market trend is BEARISH", "alert"
+                    )
+                    return
+
+                if orb_signal.direction == "SHORT" and _trend == "BULLISH":
+                    logger.info("ORB: Skipping SHORT — overall trend is BULLISH (counter-trend)")
+                    await self._broadcast_message(
+                        "ORB: SHORT signal skipped — market trend is BULLISH", "alert"
+                    )
+                    return
+
+                # ── Guard 3: Higher bar on NEUTRAL days ───────────────────────
+                if _trend == "NEUTRAL" and orb_signal.strength < 80:
+                    logger.info(
+                        f"ORB: Skipping — NEUTRAL trend requires ≥80% strength "
+                        f"(got {orb_signal.strength:.0f}%)"
+                    )
+                    await self._broadcast_message(
+                        f"ORB: Signal skipped — NEUTRAL market needs ≥80% strength "
+                        f"(got {orb_signal.strength:.0f}%)",
+                        "alert"
+                    )
+                    return
 
             # Broadcast the breakout notification
             await self._broadcast_message(self._format_orb_signal(orb_signal), "analysis")
@@ -982,34 +1153,94 @@ class TradingBot:
 
             option_type = "CE" if orb_signal.direction == "LONG" else "PE"
 
-            order_ok = await self._execute_option_with_research(
+            # ── Guard 4: RSI overbought/oversold filter ──────────────────────────
+            _rsi = self._last_signal.rsi if self._last_signal else 50
+            if option_type == "CE" and _rsi > 65:
+                logger.info(
+                    f"ORB: Skipping LONG — RSI {_rsi:.1f} is overbought (>65), chasing breakout"
+                )
+                await self._broadcast_message(
+                    f"ORB: CE signal skipped — RSI {_rsi:.1f} already overbought (>65)",
+                    "alert"
+                )
+                return
+            if option_type == "PE" and _rsi < 35:
+                logger.info(
+                    f"ORB: Skipping SHORT — RSI {_rsi:.1f} is oversold (<35), chasing breakdown"
+                )
+                await self._broadcast_message(
+                    f"ORB: PE signal skipped — RSI {_rsi:.1f} already oversold (<35)",
+                    "alert"
+                )
+                return
+
+            # ── Guard 5: 15m timeframe must agree with ORB direction ─────────────
+            try:
+                mtf_result = mtf_engine.analyze()
+                if mtf_result and mtf_result.signals.get("15m"):
+                    _15m = mtf_result.signals["15m"]
+                    if option_type == "CE" and _15m.trend == "BEARISH":
+                        logger.info(
+                            f"ORB: Skipping LONG — 15m trend is BEARISH — no MTF confluence"
+                        )
+                        await self._broadcast_message(
+                            "ORB: CE signal skipped — 15m chart is BEARISH (no confluence)",
+                            "alert"
+                        )
+                        return
+                    if option_type == "PE" and _15m.trend == "BULLISH":
+                        logger.info(
+                            f"ORB: Skipping SHORT — 15m trend is BULLISH — no MTF confluence"
+                        )
+                        await self._broadcast_message(
+                            "ORB: PE signal skipped — 15m chart is BULLISH (no confluence)",
+                            "alert"
+                        )
+                        return
+            except Exception as _mtf_err:
+                logger.warning(f"ORB: MTF check failed ({_mtf_err}), skipping MTF guard")
+
+            # Fast-path: place ORB trade directly at ATM — skip slow research
+            # Research adds 10-15s latency; by then the breakout candle may reverse.
+            order_ok = await self._execute_orb_direct(
                 signal=self._last_signal,
                 option_type=option_type,
-                requested_strike="ATM",
-                quantity=None,
-                source="ORB"
+                orb_signal=orb_signal,
             )
 
             if order_ok:
-                tg_msg = (
-                    f"ORB BREAKOUT {orb_signal.direction}\n"
-                    f"Entry: {orb_signal.breakout_price:.2f}\n"
-                    f"SL: {orb_signal.stop_loss:.2f}  "
-                    f"T1: {orb_signal.target_1:.2f}  "
-                    f"T2: {orb_signal.target_2:.2f}\n"
-                    f"Strength: {orb_signal.strength:.0f}%"
-                )
-                await self._send_telegram_alert(tg_msg, "trade_entry")
+                self._orb_triggered_date = datetime.now().date()  # block further ORB trades today
 
         except Exception as e:
             logger.error(f"ORB signal check error: {e}")
 
     async def _check_vwap_signal(self):
         """Check VWAP mean-reversion strategy and execute if a signal fires."""
+        # Engine-level one-trade-per-day guard: survives VWAP resets and bot restarts
+        if self._vwap_triggered_date == datetime.now().date():
+            return
         try:
             vwap_signal = self.vwap_strat.analyze()
             if not vwap_signal:
                 return
+
+            # ── Regime-direction alignment guard ─────────────────────────────
+            # On strong TRENDING DOWN days: block LONG (CE) entries — only allow PE.
+            # On strong TRENDING UP days: block SHORT (PE) entries — only allow CE.
+            # This prevents buying CE into a confirmed downtrend via VWAP reversion.
+            cached_regime = getattr(self, "_cached_regime", None)
+            if cached_regime:
+                regime_val = cached_regime.regime.value
+                if regime_val == "TRENDING DOWN" and vwap_signal.direction == "LONG":
+                    logger.info(
+                        "VWAP: Skipping LONG (CE) — regime is TRENDING DOWN (counter-trend)"
+                    )
+                    return
+                if regime_val == "TRENDING UP" and vwap_signal.direction == "SHORT":
+                    logger.info(
+                        "VWAP: Skipping SHORT (PE) — regime is TRENDING UP (counter-trend)"
+                    )
+                    return
 
             await self._broadcast_message(self._format_vwap_signal(vwap_signal), "analysis")
 
@@ -1033,6 +1264,7 @@ class TradingBot:
             )
 
             if order_ok:
+                self._vwap_triggered_date = datetime.now().date()  # block further VWAP trades today
                 tg_msg = (
                     f"VWAP REVERSION {vwap_signal.direction}\n"
                     f"Entry: {vwap_signal.current_price:.2f}\n"

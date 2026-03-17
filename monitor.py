@@ -1,85 +1,163 @@
-"""Live position monitor — runs until 15:30 market close."""
-import sys, asyncio, datetime
-sys.path.insert(0, 'c:/Users/sundlnu/Sundhar/nifty-trading-bot')
-from dotenv import load_dotenv
-load_dotenv('c:/Users/sundlnu/Sundhar/nifty-trading-bot/.env')
+"""
+Watchdog Monitor — monitors the trading bot and auto-restarts on crash/stall.
+
+Runs alongside main.py. Checks every 60 seconds:
+  • Bot process alive? (HTTP /api/status)
+  • Last analysis not stale (> 6 min without analysis → loop dead)
+  • Auto-restarts if down, with rate limit of 3 restarts/hour
+
+Usage:
+  .venv\\Scripts\\python.exe monitor.py
+"""
+import sys, os, time, json, subprocess, logging, urllib.request, urllib.error
+from datetime import datetime, time as _time
 
 
-async def monitor():
-    from browser.dhan import DhanBroker
-    from bot.index_config import NIFTY
-    kite = DhanBroker()
-    kite.set_active_index(NIFTY)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("watchdog.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("watchdog")
 
-    market_close = datetime.datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
-    print(f"=== Live Monitor started. Market closes at {market_close.strftime('%H:%M')} ===\n")
+BOT_URL   = "http://127.0.0.1:8000"
+BOT_CMD   = [sys.executable, "main.py"]
+CHECK_SEC = 60          # health-check interval seconds
+STALE_SEC = 360         # analysis stale threshold (6 min)
+MAX_RESTARTS_PER_HOUR = 3
+
+_restart_times: list = []
+_bot_proc = None
+
+
+def _is_market_hours() -> bool:
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return _time(9, 0) <= t <= _time(15, 35)
+
+
+def _fetch_status():
+    """Return parsed /api/status dict or None on error."""
+    try:
+        with urllib.request.urlopen(f"{BOT_URL}/api/status", timeout=5) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _fetch_start() -> bool:
+    """POST /api/start to restart the analysis loop inside a running bot."""
+    try:
+        req = urllib.request.Request(
+            f"{BOT_URL}/api/start", method="POST",
+            headers={"Content-Type": "application/json"},
+            data=b"{}",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except Exception:
+        return False
+
+
+def _can_restart() -> bool:
+    global _restart_times
+    now = time.time()
+    _restart_times = [t for t in _restart_times if t > now - 3600]
+    return len(_restart_times) < MAX_RESTARTS_PER_HOUR
+
+
+def _kill_bot():
+    """Kill any python process holding port 8000."""
+    try:
+        subprocess.run(
+            ["powershell", "-Command",
+             "Get-Process python* -ErrorAction SilentlyContinue | Stop-Process -Force"],
+            timeout=10, check=False, capture_output=True,
+        )
+        time.sleep(3)
+    except Exception as e:
+        log.warning("Kill attempt failed: %s", e)
+
+
+def _start_bot():
+    global _restart_times
+    log.info("Starting bot: %s", " ".join(BOT_CMD))
+    proc = subprocess.Popen(
+        BOT_CMD,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _restart_times.append(time.time())
+    return proc
+
+
+def main():
+    global _bot_proc
+    log.info("Watchdog started — monitoring bot at %s", BOT_URL)
+    log.info("Market hours: 09:00-15:35 IST (Mon-Fri)")
+    consecutive_failures = 0
 
     while True:
-        now = datetime.datetime.now()
-        if now >= market_close:
-            print(f"\n[{now.strftime('%H:%M:%S')}] Market closed. Printing final summary...")
-            break
+        time.sleep(CHECK_SEC)
+        in_market = _is_market_hours()
+        status = _fetch_status()
 
-        try:
-            raw = await kite.get_kite_positions()
-            day_pos = raw.get('day', []) if isinstance(raw, dict) else []
-            open_pos = [p for p in day_pos if (p.get('quantity', 0) or 0) != 0]
-            closed_pos = [p for p in day_pos if (p.get('quantity', 0) or 0) == 0 and (p.get('buy_quantity', 0) or 0) > 0]
-            total_pnl = sum(float(p.get('pnl', 0) or 0) for p in day_pos)
-        except Exception as e:
-            print(f"[{now.strftime('%H:%M:%S')}] API error: {e}")
-            await asyncio.sleep(30)
+        if status is None:
+            consecutive_failures += 1
+            log.warning("Bot unreachable (%d consecutive failures)", consecutive_failures)
+            if consecutive_failures >= 2 and in_market:
+                if _can_restart():
+                    log.error("Bot DOWN — restarting (restarts this hour: %d/%d)",
+                              len(_restart_times), MAX_RESTARTS_PER_HOUR)
+                    _kill_bot()
+                    _bot_proc = _start_bot()
+                    time.sleep(15)
+                else:
+                    log.critical(
+                        "Bot DOWN but restart limit reached (%d/hour). Manual action needed.",
+                        MAX_RESTARTS_PER_HOUR,
+                    )
             continue
 
-        ts = now.strftime('%H:%M:%S')
-        if open_pos:
-            for p in open_pos:
-                sym  = p.get('tradingsymbol', '?')
-                qty  = p.get('quantity', 0)
-                avg  = float(p.get('average_price', 0) or 0)
-                ltp  = float(p.get('last_price', 0) or 0)
-                unr  = float(p.get('unrealised', 0) or 0)
-                pct  = ((ltp - avg) / avg * 100) if avg > 0 else 0
-                sl   = avg * 0.85
-                t1   = avg * 1.15
-                t2   = avg * 1.30
-                flag = ''
-                if   ltp >= t2: flag = '  *** T2 HIT (+30%) ***'
-                elif ltp >= t1: flag = '  *** T1 HIT (+15%) ***'
-                elif ltp <= sl: flag = '  *** SL HIT (-15%) ***'
-                print(
-                    f"[{ts}] OPEN  {sym} x{qty} | "
-                    f"Avg:Rs.{avg:.2f}  LTP:Rs.{ltp:.2f}  {pct:+.1f}% | "
-                    f"Unreal:Rs.{unr:+.0f} | DayPnL:Rs.{total_pnl:+.0f}{flag}"
-                )
-        else:
-            closed_syms = ', '.join(p.get('tradingsymbol', '?') for p in closed_pos) or 'none'
-            print(f"[{ts}] NO OPEN POSITIONS  |  Closed today: {closed_syms}  |  DayPnL:Rs.{total_pnl:+.0f}")
+        consecutive_failures = 0
+        state         = status.get("state", "")
+        last_analysis = status.get("last_analysis")
+        open_pos      = status.get("open_positions", 0)
+        daily_pnl     = status.get("daily_pnl", 0)
+        auto_trade    = status.get("auto_trade_enabled", False)
 
-        await asyncio.sleep(30)
+        log.info(
+            "OK | state=%s | positions=%d | daily_pnl=RS%.2f | auto=%s | last=%s",
+            state, open_pos, daily_pnl, auto_trade, last_analysis or "never",
+        )
 
-    # Final summary
-    print()
-    try:
-        raw = await kite.get_kite_positions()
-        day_pos = raw.get('day', []) if isinstance(raw, dict) else []
-        print("=" * 50)
-        print("  FINAL DAY SUMMARY")
-        print("=" * 50)
-        for p in day_pos:
-            if (p.get('buy_quantity', 0) or 0) > 0:
-                sym   = p.get('tradingsymbol', '?')
-                buy_q = p.get('buy_quantity', 0)
-                sell_q = p.get('sell_quantity', 0)
-                avg   = float(p.get('average_price', 0) or 0)
-                pnl   = float(p.get('pnl', 0) or 0)
-                net_q = p.get('quantity', 0)
-                status = 'OPEN' if (net_q or 0) != 0 else 'CLOSED'
-                print(f"  [{status}] {sym}: buy={buy_q} sell={sell_q} avg=Rs.{avg:.2f} PnL=Rs.{pnl:+.2f}")
-        total = sum(float(p.get('pnl', 0) or 0) for p in day_pos)
-        print(f"\n  TOTAL DAY PnL: Rs.{total:+.2f}")
-    except Exception as e:
-        print(f"Final summary failed: {e}")
+        # Check: analysis loop stale?
+        if state == "RUNNING" and last_analysis and in_market:
+            try:
+                last_dt = datetime.fromisoformat(last_analysis)
+                age_sec = (datetime.now() - last_dt).total_seconds()
+                if age_sec > STALE_SEC:
+                    log.warning("Analysis stale (%.0f s > %d s) — nudging /api/start",
+                                age_sec, STALE_SEC)
+                    ok = _fetch_start()
+                    log.info("/api/start nudge: %s", "OK" if ok else "FAILED")
+            except (ValueError, TypeError):
+                pass
+
+        # Check: bot in bad state during market hours?
+        if state not in ("RUNNING", "ANALYZING") and in_market:
+            log.warning("Bot state is '%s' during market hours — restarting", state)
+            if _can_restart():
+                _kill_bot()
+                _bot_proc = _start_bot()
+                time.sleep(15)
 
 
-asyncio.run(monitor())
+if __name__ == "__main__":
+    main()

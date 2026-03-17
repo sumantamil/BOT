@@ -75,6 +75,7 @@ class ORBStrategy:
         self._range_avg_volume: float = 0.0
         self._state: ORBState = ORBState.WAITING
         self._signal_fired: bool = False
+        self._breakout_count: int = 0   # consecutive closes that confirm the breakout
 
     # ─────────────────────────────────────────────
     # Public interface
@@ -83,9 +84,20 @@ class ORBStrategy:
     def set_index(self, index_config: IndexConfig):
         """Switch to a different index and reset daily state."""
         if self._index.name == index_config.name:
-            return  # already on this index — skip unnecessary reset
+            return  # already on this index -- skip unnecessary reset
         self._index = index_config
+        # Preserve _signal_fired and _today: the 'one ORB trade per calendar day'
+        # limit must survive index switches (and browser 'index sensex' commands).
+        # Only reset range prices/volume so the new index builds a fresh range.
+        fired  = self._signal_fired
+        today  = self._today
+        bcount = self._breakout_count
         self._reset_daily()
+        self._signal_fired  = fired   # restore after _reset_daily cleared it
+        self._today         = today   # keep the same date so daily guard stays active
+        self._breakout_count = bcount # preserve mid-candle confirmation count
+        if fired:
+            self._state = ORBState.TRIGGERED  # keep in triggered state
 
     def analyze(self) -> Optional[ORBSignal]:
         """
@@ -224,6 +236,7 @@ class ORBStrategy:
         self._range_avg_volume = 0.0
         self._state = ORBState.WAITING
         self._signal_fired = False
+        self._breakout_count = 0
         logger.debug(f"ORB: Daily reset [{self._index.display_name}] for {self._today}")
 
     def _fetch_intraday(self) -> pd.DataFrame:
@@ -289,6 +302,27 @@ class ORBStrategy:
         volume = float(latest.get("Volume", 0))
         cfg    = self._cfg
 
+        # ── Stale data guard ──────────────────────────────────────────────────
+        # yfinance 5m data can lag up to 5-10 min.  If the last candle is older
+        # than 8 minutes the breakout may have already reversed — skip this cycle.
+        try:
+            from zoneinfo import ZoneInfo
+            _ist = ZoneInfo("Asia/Kolkata")
+            _last_ts = data.index[-1]
+            if hasattr(_last_ts, "tz_convert"):
+                _last_ts = _last_ts.tz_convert(_ist)
+            elif hasattr(_last_ts, "replace"):
+                _last_ts = _last_ts.replace(tzinfo=_ist)
+            _candle_age_min = (datetime.now(_ist) - _last_ts).total_seconds() / 60
+            if _candle_age_min > 8:
+                logger.debug(
+                    f"ORB: Data stale ({_candle_age_min:.1f} min old) — "
+                    f"skipping breakout check until fresh candle arrives"
+                )
+                return None
+        except Exception:
+            pass  # TZ check failed — proceed with available data
+
         # Volume confirmation: current candle must be ≥ 1.2× avg opening range volume
         volume_ok = True
         if cfg.volume_confirmation and self._range_avg_volume > 0:
@@ -302,6 +336,17 @@ class ORBStrategy:
         short_break = price < short_trigger
 
         if not long_break and not short_break:
+            self._breakout_count = 0   # price retreated — reset counter
+            return None
+
+        # Require 2 consecutive closes beyond trigger before firing
+        self._breakout_count += 1
+        if self._breakout_count < 2:
+            direction_hint = "LONG" if long_break else "SHORT"
+            logger.debug(
+                f"ORB: {direction_hint} close #{self._breakout_count}/2 "
+                f"@ {price:.2f} — waiting for confirmation candle"
+            )
             return None
 
         direction = "LONG" if long_break else "SHORT"

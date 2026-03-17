@@ -600,6 +600,40 @@
             box-shadow: 0 12px 32px rgba(255, 68, 102, 0.2);
         }
 
+        /* Live P&L refresh indicator */
+        .live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: var(--accent-green);
+            background: rgba(0,255,136,0.1);
+            border: 1px solid rgba(0,255,136,0.25);
+            border-radius: 4px;
+            padding: 1px 5px;
+            margin-left: 4px;
+            vertical-align: middle;
+            user-select: none;
+        }
+        .live-badge .live-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            animation: pulse-dot 1.4s ease-in-out infinite;
+        }
+        .live-badge.stale {
+            color: var(--text-secondary);
+            background: rgba(255,255,255,0.05);
+            border-color: rgba(255,255,255,0.1);
+        }
+        .live-badge.stale .live-dot {
+            background: var(--text-secondary);
+            animation: none;
+        }
+
         /* Compact card variant for market data */
         .stat-card.compact {
             flex-direction: row;
@@ -1337,13 +1371,24 @@
                         <div class="stat-card"><span class="stat-label">W / L</span><span class="stat-value" id="ledger_wl">—</span></div>
                     </div>
                     <!-- Filters -->
-                    <div style="display:flex;gap:8px;padding:10px 16px;flex-shrink:0;align-items:center;border-bottom:1px solid var(--border-color);">
-                        <select id="ledgerDays" onchange="loadLedger()" style="padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-family:inherit;">
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px 16px;flex-shrink:0;align-items:center;border-bottom:1px solid var(--border-color);">
+                        <select id="ledgerDays" onchange="onLedgerDaysChange()" style="padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-family:inherit;">
+                            <option value="today">Today</option>
+                            <option value="yesterday">Yesterday</option>
                             <option value="7">Last 7 days</option>
                             <option value="14">Last 14 days</option>
                             <option value="30" selected>Last 30 days</option>
                             <option value="90">Last 90 days</option>
+                            <option value="custom">Custom range…</option>
                         </select>
+                        <!-- Custom date range (hidden until 'Custom range' selected) -->
+                        <div id="ledgerDateRange" style="display:none;align-items:center;gap:6px;">
+                            <label style="font-size:11px;color:var(--text-secondary);">From</label>
+                            <input type="date" id="ledgerFrom" onchange="renderLedgerTable()" style="padding:5px 8px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-family:inherit;">
+                            <label style="font-size:11px;color:var(--text-secondary);">To</label>
+                            <input type="date" id="ledgerTo" onchange="renderLedgerTable()" style="padding:5px 8px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-family:inherit;">
+                            <button onclick="clearLedgerDateFilter()" title="Clear date filter" style="padding:5px 8px;font-size:11px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-secondary);cursor:pointer;">✕ Clear</button>
+                        </div>
                         <select id="ledgerStatus" onchange="renderLedgerTable()" style="padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-family:inherit;">
                             <option value="ALL">All Status</option>
                             <option value="OPEN">Open</option>
@@ -1426,14 +1471,14 @@
                         <div class="stat-card featured" id="pnlCard">
                             <div class="stat-card-header">
                                 <span class="stat-icon" style="background: linear-gradient(135deg, var(--accent-green), var(--accent-cyan)); color: white;">💰</span>
-                                <span class="stat-label">Daily P&L</span>
+                                <span class="stat-label">Daily P&L <span class="live-badge" id="dailyPnlBadge"><span class="live-dot"></span>LIVE</span></span>
                             </div>
                             <span class="stat-value" id="dailyPnL">₹0.00</span>
                         </div>
                         <div class="stat-card compact" id="currentPnlCard">
                             <div class="stat-card-header">
                                 <span class="stat-icon">📈</span>
-                                <span class="stat-label">Current P&L</span>
+                                <span class="stat-label">Current P&L <span class="live-badge" id="currentPnlBadge"><span class="live-dot"></span>LIVE</span></span>
                             </div>
                             <span class="stat-value" id="currentPnL">₹0.00</span>
                         </div>
@@ -1442,7 +1487,7 @@
                                 <span class="stat-icon">📋</span>
                                 <span class="stat-label">Trades Today</span>
                             </div>
-                            <span class="stat-value" id="openPositions">0</span>
+                            <span class="stat-value" id="tradesTodayCount">0</span>
                         </div>
                     </div>
 
@@ -1531,27 +1576,100 @@
             if (!isConsole && _ledgerRecords.length === 0) loadLedger();
         }
 
+        async function fetchPnL() {
+            try {
+                const res  = await fetch('/api/pnl');
+                const data = await res.json();
+
+                const daily   = data.daily_pnl   ?? 0;
+                const current = data.current_pnl ?? 0;
+
+                // Daily P&L
+                const dpEl = document.getElementById('dailyPnL');
+                dpEl.textContent = (daily >= 0 ? '₹' : '-₹') + Math.abs(daily).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
+                dpEl.className   = 'stat-value ' + (daily >= 0 ? 'positive' : 'negative');
+                const pnlCard    = document.getElementById('pnlCard');
+                if (pnlCard) {
+                    pnlCard.classList.remove('pnl-positive','pnl-negative');
+                    if (daily > 0) pnlCard.classList.add('pnl-positive');
+                    else if (daily < 0) pnlCard.classList.add('pnl-negative');
+                }
+
+                // Current (unrealized) P&L
+                const cpEl      = document.getElementById('currentPnL');
+                cpEl.textContent = (current >= 0 ? '₹' : '-₹') + Math.abs(current).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
+                cpEl.className   = 'stat-value ' + (current >= 0 ? 'positive' : 'negative');
+                const cCard      = document.getElementById('currentPnlCard');
+                if (cCard) {
+                    cCard.classList.remove('pnl-positive','pnl-negative');
+                    if (current > 0) cCard.classList.add('pnl-positive');
+                    else if (current < 0) cCard.classList.add('pnl-negative');
+                }
+
+                // Live badges — go stale if last_updated > 60s ago
+                const stale = !data.last_updated ||
+                    (Date.now() - new Date(data.last_updated).getTime()) > 60000;
+                ['dailyPnlBadge','currentPnlBadge'].forEach(id => {
+                    const b = document.getElementById(id);
+                    if (b) b.classList.toggle('stale', stale);
+                });
+            } catch (e) {
+                // Mark badges stale on error
+                ['dailyPnlBadge','currentPnlBadge'].forEach(id => {
+                    const b = document.getElementById(id);
+                    if (b) b.classList.add('stale');
+                });
+            }
+        }
+
+        function onLedgerDaysChange() {
+            const val = document.getElementById('ledgerDays').value;
+            const rangeDiv = document.getElementById('ledgerDateRange');
+            const fmt = d => d.toISOString().slice(0,10);
+            if (val === 'today') {
+                rangeDiv.style.display = 'none';
+                const t = fmt(new Date());
+                document.getElementById('ledgerFrom').value = t;
+                document.getElementById('ledgerTo').value   = t;
+                loadLedger();
+            } else if (val === 'yesterday') {
+                rangeDiv.style.display = 'none';
+                const y = new Date(); y.setDate(y.getDate() - 1);
+                const yStr = fmt(y);
+                document.getElementById('ledgerFrom').value = yStr;
+                document.getElementById('ledgerTo').value   = yStr;
+                loadLedger();
+            } else if (val === 'custom') {
+                rangeDiv.style.display = 'flex';
+                // Default from = 30 days ago, to = today
+                const today = new Date();
+                const from  = new Date(); from.setDate(today.getDate() - 30);
+                if (!document.getElementById('ledgerFrom').value) document.getElementById('ledgerFrom').value = fmt(from);
+                if (!document.getElementById('ledgerTo').value)   document.getElementById('ledgerTo').value   = fmt(today);
+                renderLedgerTable();
+            } else {
+                rangeDiv.style.display = 'none';
+                document.getElementById('ledgerFrom').value = '';
+                document.getElementById('ledgerTo').value   = '';
+                loadLedger();
+            }
+        }
+
+        function clearLedgerDateFilter() {
+            document.getElementById('ledgerFrom').value = '';
+            document.getElementById('ledgerTo').value   = '';
+            document.getElementById('ledgerDays').value = '30';
+            document.getElementById('ledgerDateRange').style.display = 'none';
+            loadLedger();
+        }
+
         async function loadLedger() {
-            const days = document.getElementById('ledgerDays').value || 30;
+            const daysVal = document.getElementById('ledgerDays').value;
+            const days = (daysVal === 'custom' || daysVal === 'today' || daysVal === 'yesterday') ? 90 : (parseInt(daysVal) || 30);
             try {
                 const res = await fetch(`/api/ledger?days=${days}`);
                 const data = await res.json();
                 _ledgerRecords = data.records || [];
-                const s = data.summary || {};
-
-                // Update summary bar
-                const pnl = s.total_pnl || 0;
-                const pnlEl = document.getElementById('ledger_total_pnl');
-                pnlEl.textContent = (pnl >= 0 ? '₹' : '-₹') + Math.abs(pnl).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
-                pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
-
-                const wr = document.getElementById('ledger_win_rate');
-                wr.textContent = (s.win_rate_pct || 0) + '%';
-                wr.className = 'stat-value ' + ((s.win_rate_pct || 0) >= 50 ? 'positive' : 'negative');
-
-                document.getElementById('ledger_total_trades').textContent = s.total_trades || 0;
-                document.getElementById('ledger_wl').textContent = `${s.wins || 0} / ${s.losses || 0}`;
-
                 renderLedgerTable();
             } catch(e) {
                 document.getElementById('ledgerBody').innerHTML =
@@ -1562,12 +1680,34 @@
         function renderLedgerTable() {
             const statusFilter = document.getElementById('ledgerStatus').value;
             const typeFilter   = document.getElementById('ledgerType').value;
+            const daysVal      = document.getElementById('ledgerDays').value;
+            const fromVal      = document.getElementById('ledgerFrom').value;   // 'YYYY-MM-DD' or ''
+            const toVal        = document.getElementById('ledgerTo').value;
 
             let rows = _ledgerRecords.filter(r => {
                 if (statusFilter !== 'ALL' && r.status !== statusFilter) return false;
                 if (typeFilter   !== 'ALL' && r.option_type !== typeFilter)  return false;
+                // Date range filter (only active in custom mode or if both fields filled)
+                if (fromVal && r.date < fromVal) return false;
+                if (toVal   && r.date > toVal)   return false;
                 return true;
             });
+
+            // ── Recalculate summary from filtered rows ──
+            const closed = rows.filter(r => r.status === 'CLOSED' && r.pnl != null);
+            const wins   = closed.filter(r => r.pnl > 0);
+            const losses = closed.filter(r => r.pnl < 0);
+            const totalPnl  = rows.reduce((s, r) => s + (r.pnl || 0), 0);
+            const winRate   = closed.length ? Math.round(wins.length / closed.length * 1000) / 10 : 0;
+
+            const pnlEl = document.getElementById('ledger_total_pnl');
+            pnlEl.textContent = (totalPnl >= 0 ? '₹' : '-₹') + Math.abs(totalPnl).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
+            pnlEl.className = 'stat-value ' + (totalPnl >= 0 ? 'positive' : 'negative');
+            const wr = document.getElementById('ledger_win_rate');
+            wr.textContent = winRate + '%';
+            wr.className = 'stat-value ' + (winRate >= 50 ? 'positive' : 'negative');
+            document.getElementById('ledger_total_trades').textContent = rows.length;
+            document.getElementById('ledger_wl').textContent = `${wins.length} / ${losses.length}`;
 
             if (rows.length === 0) {
                 document.getElementById('ledgerBody').innerHTML =
@@ -1583,13 +1723,12 @@
                 const typeBadge = r.option_type
                     ? `<span class="ldg-badge ${r.option_type === 'CE' ? 'ldg-ce' : 'ldg-pe'}">${r.option_type}</span>` : '—';
                 const statusBadge = `<span class="ldg-badge ${r.status === 'OPEN' ? 'ldg-open' : 'ldg-closed'}">${r.status}</span>`;
-                const dateShort = (r.date || '').slice(5);   // MM-DD
-                const sym = r.symbol || '—';
+                const sym    = r.symbol || '—';
                 const action = r.action || '—';
                 const premium = r.premium ? `₹${Number(r.premium).toFixed(1)}` : '—';
                 const qty = r.quantity || '—';
                 return `<tr class="ldg-row">
-                    <td class="ldg-td">${dateShort}</td>
+                    <td class="ldg-td">${r.date || '—'}</td>
                     <td class="ldg-td" style="font-weight:600;">${sym}</td>
                     <td class="ldg-td" style="color:${action==='BUY'?'var(--accent-green)':'var(--accent-red)'};font-weight:600;">${action}</td>
                     <td class="ldg-td">${typeBadge}</td>
@@ -1603,15 +1742,29 @@
 
         function exportLedgerCSV() {
             if (!_ledgerRecords.length) { loadLedger(); return; }
+            // Export only currently-filtered rows
+            const statusFilter = document.getElementById('ledgerStatus').value;
+            const typeFilter   = document.getElementById('ledgerType').value;
+            const fromVal      = document.getElementById('ledgerFrom').value;
+            const toVal        = document.getElementById('ledgerTo').value;
+            const rows = _ledgerRecords.filter(r => {
+                if (statusFilter !== 'ALL' && r.status !== statusFilter) return false;
+                if (typeFilter   !== 'ALL' && r.option_type !== typeFilter) return false;
+                if (fromVal && r.date < fromVal) return false;
+                if (toVal   && r.date > toVal)   return false;
+                return true;
+            });
             const header = ['Date','Symbol','Action','Type','Premium','Qty','PnL','Status'];
-            const rows = _ledgerRecords.map(r =>
+            const csvRows = rows.map(r =>
                 [r.date, r.symbol, r.action, r.option_type, r.premium, r.quantity, r.pnl ?? '', r.status]
-                .map(v => `"${v}"`).join(',')
+                .map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')
             );
-            const csv = [header.join(','), ...rows].join('\n');
+            const fromStr = fromVal || 'all';
+            const toStr   = toVal   || new Date().toISOString().slice(0,10);
+            const csv = [header.join(','), ...csvRows].join('\n');
             const a = document.createElement('a');
             a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
-            a.download = `ledger_${new Date().toISOString().slice(0,10)}.csv`;
+            a.download = `ledger_${fromStr}_to_${toStr}.csv`;
             a.click();
         }
 
@@ -1959,8 +2112,7 @@
                 } else {
                     kiteStatus.innerHTML = `<span class="dot"></span><span>${escapeHtml(brokerName)}: Offline</span>`;
                 }
-                document.getElementById('openPositions').textContent = data.open_positions;
-                animateValueChange('openPositions', data.open_positions);
+                // open_positions is available in data but shown via the positions panel
 
                 // Sync auto-trade toggle
                 updateAutoTradeUI(data.auto_trade_enabled);
@@ -2082,6 +2234,8 @@
             try {
                 const response = await fetch('/api/trades');
                 const data = await response.json();
+                const countEl = document.getElementById('tradesTodayCount');
+                if (countEl) countEl.textContent = data.count || 0;
                 if (!data.trades || data.trades.length === 0) {
                     container.innerHTML = '<div style="color: var(--text-muted); font-size: 12px;">No trades today</div>';
                     return;
@@ -2125,10 +2279,12 @@
             updateMarketStatus();
             connectWebSocket();
             fetchStatus();  // initial load — don't wait for WS
+            fetchPnL();     // P&L initial load
             loadIndicesComparison();
             loadTrades();
             setInterval(updateMarketStatus, 60000);
             setInterval(fetchStatus, 30000);
+            setInterval(fetchPnL, 5000);   // refresh P&L every 5 seconds (broker API with 5s cache)
             setInterval(loadTrades, 30000);
             setInterval(loadIndicesComparison, 60000);
             

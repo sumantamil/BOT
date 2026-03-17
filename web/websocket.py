@@ -65,9 +65,10 @@ class ConnectionManager:
         if len(self._message_history) > self._max_history:
             self._message_history = self._message_history[-self._max_history:]
         
-        # Send to all connections
+        # Send to all connections (snapshot to avoid "set changed size" if a tab
+        # connects/disconnects mid-broadcast)
         disconnected = set()
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception as e:
@@ -102,6 +103,8 @@ class ChatHandler:
         self.manager = connection_manager
         self._bot = None  # Set by app.py
         self._command_history: list = []
+        # Dedup: track last time each command was processed (prevents multi-tab flooding)
+        self._last_cmd_time: dict = {}
     
     def set_bot(self, bot):
         """Set the trading bot instance"""
@@ -152,6 +155,19 @@ class ChatHandler:
     
     async def _process_command(self, command: str):
         """Process a command and send response"""
+        # Deduplicate: drop identical command if received within 2 seconds
+        # (prevents 3+ browser tabs all sending 'index sensex' simultaneously)
+        now_ts = datetime.now()
+        last = self._last_cmd_time.get(command)
+        if last and (now_ts - last).total_seconds() < 2.0:
+            logger.debug(f"Dedup: dropping duplicate '{command}' ({(now_ts-last).total_seconds():.1f}s ago)")
+            return
+        self._last_cmd_time[command] = now_ts
+        # Prune stale entries to avoid unbounded growth
+        stale = [k for k, v in self._last_cmd_time.items() if (now_ts - v).total_seconds() > 60]
+        for k in stale:
+            del self._last_cmd_time[k]
+
         # Add to history
         self._command_history.append({
             "command": command,
