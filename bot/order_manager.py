@@ -81,6 +81,15 @@ class OrderManager:
         self._consecutive_losses: int = 0
         self._trading_paused_until: Optional[datetime] = None
         self._last_trade_time: Optional[datetime] = None
+
+        # Per-strike loss counter: (option_type, strike) -> loss count today
+        # Prevents re-entering the same losing strike more than MAX_STRIKE_LOSSES times
+        self._strike_loss_count: Dict[tuple, int] = {}
+        MAX_STRIKE_LOSSES = 2  # configurable; stored as class-level default
+        self._max_strike_losses: int = MAX_STRIKE_LOSSES
+
+        # Net qty tracker for over-sell guard: (option_type, strike) -> net qty held
+        self._held_qty: Dict[tuple, int] = {}
     
     def set_active_index(self, index_config: IndexConfig):
         """Set the active trading index (NIFTY, BANKNIFTY, SENSEX)"""
@@ -106,6 +115,8 @@ class OrderManager:
             self._daily_pnl = 0.0
             self._consecutive_losses = 0
             self._trading_paused_until = None
+            self._strike_loss_count = {}
+            self._held_qty = {}
     
     def can_place_order(self) -> tuple[bool, str]:
         """
@@ -156,6 +167,38 @@ class OrderManager:
         if self._daily_pnl <= -self.config.max_daily_loss:
             return False, f"Daily loss limit reached (₹{self.config.max_daily_loss:,.0f})"
 
+        return True, "OK"
+
+    def can_enter_strike(self, option_type: str, strike: int) -> tuple[bool, str]:
+        """
+        Check if we're allowed to re-enter a specific strike today.
+        Blocks entry if we've already taken _max_strike_losses losses on it.
+        """
+        key = (option_type.upper(), strike)
+        losses = self._strike_loss_count.get(key, 0)
+        if losses >= self._max_strike_losses:
+            return False, (
+                f"⛔ {option_type.upper()} {strike}: already lost {losses}x today on this strike "
+                f"(max {self._max_strike_losses}). Choose a different strike."
+            )
+        return True, "OK"
+
+    def can_sell_qty(self, option_type: str, strike: int, qty: int) -> tuple[bool, str]:
+        """
+        Over-sell guard: ensure a SELL does not exceed the qty we hold for this strike.
+        """
+        key = (option_type.upper(), strike)
+        held = self._held_qty.get(key, 0)
+        if held <= 0:
+            return False, (
+                f"⛔ No open position in {option_type.upper()} {strike} to sell. "
+                f"Rejecting to prevent naked short."
+            )
+        if qty > held:
+            return False, (
+                f"⛔ Sell qty {qty} > held qty {held} for {option_type.upper()} {strike}. "
+                f"Capped at {held} to prevent naked short. Use qty {held}."
+            )
         return True, "OK"
     
     def _is_market_hours(self) -> bool:
@@ -221,6 +264,12 @@ class OrderManager:
             strike_interval = self._active_index.strike_interval
             strike = round(signal.current_price / strike_interval) * strike_interval
         
+        # Strike-loss guard: block re-entry if already lost on this strike today
+        can_enter, enter_reason = self.can_enter_strike(option_type.value, strike)
+        if not can_enter:
+            logger.warning(enter_reason)
+            return None
+        
         quantity = quantity or self.get_active_quantity()
         
         logger.info(f"Executing signal: {option_type.value} {strike} x {quantity}")
@@ -255,6 +304,9 @@ class OrderManager:
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
             self._last_trade_time = datetime.now()
+            # Track held qty for over-sell guard
+            _hkey = (option_type.value, strike)
+            self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + quantity
             logger.info(f"Trade recorded: {trade.trade_id} | option LTP=₹{option_ltp}")
 
             # Place GTT exchange-level stop-loss on the option premium (survives bot crash/restart)
@@ -312,6 +364,17 @@ class OrderManager:
                     message=reason,
                     timestamp=datetime.now()
                 )
+            # Strike-loss guard
+            ok, msg = self.can_enter_strike(option_type, strike)
+            if not ok:
+                return OrderResult(success=False, order_id=None, message=msg, timestamp=datetime.now())
+
+        if ord_type == OrderType.SELL:
+            # Over-sell guard
+            qty_check = quantity or self.get_active_quantity()
+            ok, msg = self.can_sell_qty(option_type, strike, qty_check)
+            if not ok:
+                return OrderResult(success=False, order_id=None, message=msg, timestamp=datetime.now())
         
         quantity = quantity or self.get_active_quantity()
         
@@ -337,8 +400,9 @@ class OrderManager:
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
             self._last_trade_time = datetime.now()
-
-            # Fetch the actual fill price from broker positions (average_price).
+            # Track held qty for over-sell guard
+            _hkey = (opt_type.value, strike)
+            self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + quantity
             # Wait 2s for the order to settle in the broker's book before querying.
             # This ensures the trailing-stop / SL calculations use the real fill price,
             # not a stale LTP snapshot that may differ by 0.5–2 points.
@@ -464,9 +528,17 @@ class OrderManager:
 
                 if qty_to_close == target.quantity:
                     # Full close — update win/loss streaks
+                    _hkey = (target.option_type.value if hasattr(target.option_type, 'value') else str(target.option_type), effective_strike)
                     if realized < 0:
                         self._daily_stats.losing_trades += 1
                         self._consecutive_losses += 1
+                        # Per-strike loss counter
+                        self._strike_loss_count[_hkey] = self._strike_loss_count.get(_hkey, 0) + 1
+                        if self._strike_loss_count[_hkey] >= self._max_strike_losses:
+                            logger.warning(
+                                f"Strike {_hkey[0]} {_hkey[1]} has lost "
+                                f"{self._strike_loss_count[_hkey]}x today — blocked from re-entry."
+                            )
                         if self._consecutive_losses >= self.config.max_consecutive_losses:
                             pause_until = datetime.now() + timedelta(
                                 minutes=self.config.pause_after_losses_minutes
@@ -480,6 +552,12 @@ class OrderManager:
                         self._daily_stats.winning_trades += 1
                         self._consecutive_losses = 0
                         self._trading_paused_until = None
+                    # Decrement held qty on full close
+                    self._held_qty[_hkey] = max(0, self._held_qty.get(_hkey, 0) - qty_to_close)
+                else:
+                    # Partial close — decrement held qty proportionally
+                    _hkey = (target.option_type.value if hasattr(target.option_type, 'value') else str(target.option_type), effective_strike)
+                    self._held_qty[_hkey] = max(0, self._held_qty.get(_hkey, 0) - qty_to_close)
 
             if qty_to_close == target.quantity:
                 # Full exit

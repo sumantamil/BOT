@@ -17,6 +17,7 @@ from datetime import datetime, date
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any
 from loguru import logger
+from collections import deque
 
 
 @dataclass
@@ -44,6 +45,12 @@ class TradeJournal:
         self._entries: List[JournalEntry] = []
         self._today = date.today().isoformat()
         self._load_today()
+        # Dedup: track last logged command text and its timestamp
+        self._last_cmd: Optional[str] = None
+        self._last_cmd_time: Optional[datetime] = None
+        # Track open trade lots for P&L calculation (FIFO)
+        # key = (direction, strike) -> deque of (premium, qty)
+        self._open_lots: Dict[tuple, deque] = {}
 
     def _filepath(self, day: str = None) -> str:
         day = day or self._today
@@ -92,11 +99,47 @@ class TradeJournal:
 
     def log_trade(self, action: str, strike: int, option_type: str, premium: float, quantity: int = 25):
         self._ensure_today()
+        key = (option_type.upper(), strike)
+        outcome = ""
+
+        if action.upper() == "BUY":
+            # FIFO queue: push entry lot
+            if key not in self._open_lots:
+                self._open_lots[key] = deque()
+            self._open_lots[key].append({"premium": premium, "qty": quantity})
+
+        elif action.upper() == "SELL" and premium > 0:
+            # Calculate P&L against FIFO open lots
+            qty_to_close = quantity
+            gross_pnl = 0.0
+            lots_closed = []
+            queue = self._open_lots.get(key, deque())
+            while qty_to_close > 0 and queue:
+                lot = queue[0]
+                close_qty = min(lot["qty"], qty_to_close)
+                gross_pnl += (premium - lot["premium"]) * close_qty
+                lots_closed.append({"buy_premium": lot["premium"], "qty": close_qty})
+                lot["qty"] -= close_qty
+                if lot["qty"] == 0:
+                    queue.popleft()
+                qty_to_close -= close_qty
+
+            if gross_pnl >= 0:
+                outcome = f"PROFIT — {option_type} {strike} closed. P&L = +Rs{gross_pnl:,.2f}"
+            else:
+                outcome = f"LOSS — {option_type} {strike} closed. P&L = Rs{gross_pnl:,.2f}"
+
+            if qty_to_close > 0:
+                # Sold more than held — flag as over-sell
+                outcome += f" ⚠️ OVER-SOLD {qty_to_close} extra lots (short position created!)"
+                logger.warning(f"Over-sell detected: {option_type} {strike} sold {qty_to_close} more than held")
+
         self._entries.append(JournalEntry(
             timestamp=datetime.now().isoformat(),
             event_type="TRADE",
             direction=option_type,
             details={"action": action, "strike": strike, "premium": premium, "quantity": quantity},
+            outcome=outcome,
         ))
         self._save()
 
@@ -112,8 +155,18 @@ class TradeJournal:
 
     def log_user_command(self, command: str, response_summary: str = ""):
         self._ensure_today()
+        now = datetime.now()
+        # Deduplicate: skip if the same command was logged within the last 2 seconds
+        if (
+            self._last_cmd == command
+            and self._last_cmd_time is not None
+            and (now - self._last_cmd_time).total_seconds() < 2.0
+        ):
+            return
+        self._last_cmd = command
+        self._last_cmd_time = now
         self._entries.append(JournalEntry(
-            timestamp=datetime.now().isoformat(),
+            timestamp=now.isoformat(),
             event_type="USER_CMD",
             direction="N/A",
             details={"command": command, "response": response_summary[:200]},

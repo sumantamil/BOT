@@ -483,10 +483,45 @@ class TradingBot:
         # Broadcast P&L every 10 checks (150 seconds) 
         check_interval = 15
         pnl_broadcast_count = 0
+        _expiry_alert_sent_date: Optional[date] = None  # track so alert fires once per day
         
         while True:
             try:
                 now = datetime.now()
+
+                # ── Expiry day alert: warn 45 min before close if today is expiry ─────
+                if now.weekday() <= 4:  # Mon–Fri only
+                    today_date = now.date()
+                    active_expiry_weekday = self._active_index.expiry_weekday  # e.g. 0=Mon,3=Thu,4=Fri
+                    is_expiry_day = (today_date.weekday() == active_expiry_weekday)
+                    market_close = now.replace(
+                        hour=settings.trading.market_close_hour,
+                        minute=settings.trading.market_close_minute,
+                        second=0, microsecond=0
+                    )
+                    alert_window_start = market_close - timedelta(minutes=45)
+                    alert_window_end   = market_close - timedelta(minutes=10)
+                    if (
+                        is_expiry_day
+                        and alert_window_start <= now <= alert_window_end
+                        and _expiry_alert_sent_date != today_date
+                    ):
+                        _expiry_alert_sent_date = today_date
+                        open_count = len([
+                            t for t in (self.order_manager._positions.values()
+                                        if self.order_manager else [])
+                            if t.status == "OPEN"
+                        ])
+                        msg = (
+                            f"⚠️ EXPIRY DAY ALERT ({self._active_index.display_name}) — "
+                            f"45 minutes to market close. "
+                            f"{open_count} bot position(s) open. "
+                            f"Manually verify ALL positions — option contracts expire today!"
+                        )
+                        await self._broadcast_message(msg, "warning")
+                        await self._send_telegram_alert(msg, "system")
+                        trade_journal.log_alert(msg)
+                        logger.warning(msg)
 
                 # ── Daily loss limit hit: close all open positions immediately ────────
                 if self.order_manager:

@@ -177,7 +177,9 @@ async def get_status():
         "available_margin": funds["available_margin"],
         "kite_logged_in": bot.kite.is_logged_in(),
         "broker": settings.broker.capitalize(),
-        "connections": manager.get_connection_count()
+        "connections": manager.get_connection_count(),
+        "rsi": round(status.last_signal.rsi, 1) if status.last_signal else None,
+        "strength": round(status.last_signal.strength, 0) if status.last_signal else None,
     }
 
 

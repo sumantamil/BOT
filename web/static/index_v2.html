@@ -233,11 +233,13 @@
         .main-layout {
             display: grid;
             grid-template-columns: 280px 1fr 300px;
+            grid-template-rows: 1fr;
             gap: 16px;
             padding: 16px;
             flex: 1;
             overflow: hidden;
             min-height: 0;
+            align-items: stretch;
         }
 
         /* ===== PANELS ===== */
@@ -250,6 +252,7 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            min-height: 0;
         }
 
         .panel-header {
@@ -1433,6 +1436,7 @@
                         Dashboard
                     </span>
                 </div>
+                <div style="flex: 1; overflow-y: auto; min-height: 0;">
                 <div class="stats-grid" style="padding: 16px 14px;">
                     
                     <!-- Market Data Section -->
@@ -1460,6 +1464,13 @@
                                 <span class="stat-label">RSI</span>
                             </div>
                             <span class="stat-value" id="currentRSI">—</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">🎯</span>
+                                <span class="stat-label">Strength</span>
+                            </div>
+                            <span class="stat-value neutral" id="currentStrength">—</span>
                         </div>
                     </div>
 
@@ -1536,6 +1547,7 @@
                 <button onclick="loadIndicesComparison()" style="width: calc(100% - 28px); margin: 8px 14px; padding: 11px 14px; border-radius: var(--radius-md); border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-secondary); font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; font-family: inherit;" onmouseover="this.style.borderColor='var(--accent-cyan)'; this.style.color='var(--accent-cyan)'; this.style.background='rgba(0, 212, 255, 0.1)'" onmouseout="this.style.borderColor='var(--border-color)'; this.style.color='var(--text-secondary)'; this.style.background='var(--bg-tertiary)'">
                     🔄 Refresh Comparison
                 </button>
+                </div><!-- end scroll wrapper -->
 
             </aside>
         </div>
@@ -2163,6 +2175,26 @@
                 // NOTE: auto_trade_enabled (server) controls order execution — it is SEPARATE
                 // from autoSwitchEnabled (UI-only preference for auto-switching the viewed index).
                 // Do NOT sync them — auto-switch defaults to Manual (false) and is toggled by the user.
+
+                // Update RSI and Strength from status API (keeps them current even without chat messages)
+                if (data.rsi != null) {
+                    const rsiVal = parseFloat(data.rsi);
+                    const rsiEl = document.getElementById('currentRSI');
+                    rsiEl.textContent = rsiVal.toFixed(1);
+                    if (rsiVal >= 70) rsiEl.className = 'stat-value positive';
+                    else if (rsiVal <= 30) rsiEl.className = 'stat-value negative';
+                    else rsiEl.className = 'stat-value neutral';
+                    animateValueChange('currentRSI', rsiVal.toFixed(1));
+                }
+                if (data.strength != null) {
+                    const strVal = parseFloat(data.strength);
+                    const strEl = document.getElementById('currentStrength');
+                    strEl.textContent = strVal.toFixed(0) + '%';
+                    if (strVal >= 65) strEl.className = 'stat-value positive';
+                    else if (strVal >= 50) strEl.className = 'stat-value neutral';
+                    else strEl.className = 'stat-value negative';
+                    animateValueChange('currentStrength', strVal.toFixed(0));
+                }
             } catch (error) {
                 console.error('Error fetching status:', error);
             }
@@ -2189,9 +2221,28 @@
             
             const rsiMatch = message.match(/RSI\(\d+\):\s*([\d.]+)/);
             if (rsiMatch) {
-                const rsi = parseFloat(rsiMatch[1]).toFixed(1);
-                document.getElementById('currentRSI').textContent = rsi;
+                const rsiVal = parseFloat(rsiMatch[1]);
+                const rsi = rsiVal.toFixed(1);
+                const rsiEl = document.getElementById('currentRSI');
+                rsiEl.textContent = rsi;
+                // Color: red >70 (overbought), green <30 (oversold), neutral otherwise
+                if (rsiVal >= 80) rsiEl.className = 'stat-value positive';
+                else if (rsiVal >= 70) rsiEl.className = 'stat-value positive';
+                else if (rsiVal <= 20) rsiEl.className = 'stat-value negative';
+                else if (rsiVal <= 30) rsiEl.className = 'stat-value negative';
+                else rsiEl.className = 'stat-value neutral';
                 animateValueChange('currentRSI', rsi);
+            }
+
+            const strengthMatch = message.match(/Strength:\s*([\d.]+)%?/i);
+            if (strengthMatch) {
+                const strVal = parseFloat(strengthMatch[1]);
+                const strEl = document.getElementById('currentStrength');
+                strEl.textContent = strVal.toFixed(0) + '%';
+                if (strVal >= 65) strEl.className = 'stat-value positive';
+                else if (strVal >= 50) strEl.className = 'stat-value neutral';
+                else strEl.className = 'stat-value negative';
+                animateValueChange('currentStrength', strVal.toFixed(0));
             }
         }
 

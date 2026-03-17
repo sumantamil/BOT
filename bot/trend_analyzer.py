@@ -326,6 +326,33 @@ class TrendAnalyzer:
         latest_volume = data['Volume'].iloc[-1] if 'Volume' in data.columns else 0
         volume_increase = latest_volume > (avg_volume * 1.2) if avg_volume > 0 else False
         
+        # --- RSI: tiered scoring (replaces the old binary 40-70 gate) ---
+        # Bullish RSI tiers:
+        #   55-70  → +1 (healthy momentum)
+        #   70-80  → +1.5 (strong trending RSI, treat as extra bullish)
+        #   >80    → +1 (overbought but still counts, just less reliable)
+        #   <40    → 0  (do NOT penalise — price bouncing up from low RSI is fine)
+        # The old 'rsi_healthy: 40<RSI<70' penalised RSI>70, causing NEUTRAL
+        # output during 87+ RSI rallies.  Fixed by splitting into tiers.
+        if latest_rsi > 80:
+            rsi_bullish_score = 1.0
+        elif latest_rsi > 70:
+            rsi_bullish_score = 1.5
+        elif latest_rsi > 55:
+            rsi_bullish_score = 1.0
+        else:
+            rsi_bullish_score = 0.0
+
+        # Bearish RSI tiers (mirrored)
+        if latest_rsi < 20:
+            rsi_bearish_score = 1.0
+        elif latest_rsi < 30:
+            rsi_bearish_score = 1.5
+        elif latest_rsi < 45:
+            rsi_bearish_score = 1.0
+        else:
+            rsi_bearish_score = 0.0
+
         # IMPROVED SIGNAL DETECTION WITH MOMENTUM CONFIRMATION
         signals = {
             'sma_bullish': latest_sma_short > latest_sma_long,
@@ -334,8 +361,7 @@ class TrendAnalyzer:
             'macd_bullish': latest_macd > latest_signal,
             'macd_histogram_positive': latest_histogram > 0,
             'macd_histogram_increasing': latest_histogram > prev_histogram,  # Momentum confirmation!
-            'rsi_recovery': (prev_rsi < 45) and (latest_rsi > prev_rsi),  # Reversal from low, not absolute oversold
-            'rsi_healthy': 40 < latest_rsi < 70,  # Avoid extreme RSI
+            'rsi_recovery': (prev_rsi < 45) and (latest_rsi > prev_rsi),  # Reversal from low
             'price_above_sma': current_price > latest_sma_short,
             'price_above_vwap': current_price > latest_vwap,
             'price_above_bb_mid': current_price > latest_bb_mid,
@@ -354,8 +380,7 @@ class TrendAnalyzer:
             'macd_bearish': latest_macd < latest_signal,
             'macd_histogram_negative': latest_histogram < 0,
             'macd_histogram_decreasing': latest_histogram < prev_histogram,
-            'rsi_recovery': (prev_rsi > 55) and (latest_rsi < prev_rsi),  # Recovery from high
-            'rsi_healthy': 30 < latest_rsi < 60,
+            'rsi_recovery': (prev_rsi > 55) and (latest_rsi < prev_rsi),  # Reversal from high
             'price_below_sma': current_price < latest_sma_short,
             'price_below_vwap': current_price < latest_vwap,
             'price_below_bb_mid': current_price < latest_bb_mid,
@@ -379,7 +404,7 @@ class TrendAnalyzer:
             signals['macd_histogram_positive'] * 1 +
             signals['macd_histogram_increasing'] * 2 +  # Momentum matters!
             signals['rsi_recovery'] * 2 +  # Reversal matters
-            signals['rsi_healthy'] * 1 +
+            rsi_bullish_score * 1.5 +  # Tiered RSI: rewards high RSI in uptrends
             signals['price_above_sma'] * 1 +
             signals['price_above_vwap'] * 1.5 +
             signals['price_above_bb_mid'] * 1 +
@@ -398,7 +423,7 @@ class TrendAnalyzer:
             bearish_signals_list['macd_histogram_negative'] * 1 +
             bearish_signals_list['macd_histogram_decreasing'] * 2 +
             bearish_signals_list['rsi_recovery'] * 2 +
-            bearish_signals_list['rsi_healthy'] * 1 +
+            rsi_bearish_score * 1.5 +  # Tiered RSI: rewards low RSI in downtrends
             bearish_signals_list['price_below_sma'] * 1 +
             bearish_signals_list['price_below_vwap'] * 1.5 +
             bearish_signals_list['price_below_bb_mid'] * 1 +
