@@ -108,6 +108,7 @@ class TradingBot:
         self._index_orb_triggered: Dict[str, Optional[date]] = {}
         self._index_vwap_triggered: Dict[str, Optional[date]] = {}
         self._index_gap_traded: Dict[str, bool] = {}
+        self._index_eod_triggered: Dict[str, Optional[date]] = {}
 
         # Regime cache — per-index, re-fetch at most once per 30 min (daily data, expensive)
         self._index_regime_cache: Dict[str, object] = {}
@@ -235,6 +236,7 @@ class TradingBot:
             self._state = BotState.RUNNING
             await self._broadcast_message("Bot initialized successfully!", "success")
             logger.info("Bot initialization complete")
+            await self._send_telegram_alert("✅ NIFTY Trading Bot started successfully!", "startup")
             
         except Exception as e:
             self._state = BotState.ERROR
@@ -275,6 +277,18 @@ class TradingBot:
                 trade_id = f"RECOVERED_{symbol}"
                 if trade_id in self.order_manager._positions:
                     continue  # already tracked
+                # Also skip if a live non-recovered position already tracks this symbol
+                # (e.g. a VWAP trade placed just before crash). Prevents duplicate tracking
+                # that causes perpetual LTP-unavailable loops after close_position.
+                # Normalise both sides by stripping dashes and spaces before comparing.
+                _sym_norm = symbol.upper().replace("-", "").replace(" ", "")
+                if any(
+                    t.symbol.upper().replace("-", "").replace(" ", "") == _sym_norm
+                    and t.status == "OPEN"
+                    for t in self.order_manager._positions.values()
+                ):
+                    logger.info(f"Position recovery: skipping {symbol} — already tracked under a different trade_id")
+                    continue
                 from bot.order_manager import TradeRecord
                 trade = TradeRecord(
                     trade_id=trade_id,
@@ -353,7 +367,13 @@ class TradingBot:
             logger.warning(f"Position recovery failed (non-fatal): {e}")
 
     async def login(self) -> bool:
-        """Login to Zerodha Kite"""
+        """Login — Dhan uses a permanent API key, no interactive login needed."""
+        if not hasattr(self.kite, 'login'):
+            await self._broadcast_message(
+                "Dhan broker authenticates via API key — no manual login required.", "system"
+            )
+            return True
+
         await self._broadcast_message("Please login to Zerodha Kite in the browser...", "system")
         
         success = await self.kite.login(wait_for_2fa=True)
@@ -486,7 +506,8 @@ class TradingBot:
                         )
 
                     # ── Step 1b: Gap detection (once per day, near market open) ──
-                if is_near_open and settings.gap.enabled and self.order_manager:
+                    if is_near_open and settings.gap.enabled and self.order_manager:
+                        await self._check_gap_signal()
 
                     # ── Step 2: Technical trend analysis ─────────────────────────
                     signal = self.analyzer.analyze(regime=regime_value)
@@ -528,7 +549,23 @@ class TradingBot:
                             if signal and regime_result and not regime_result.should_trade:
                                 logger.info(f"[{idx_name}] Ranging market: skipping multi-indicator trend trade.")
                         elif should_trade and signal and signal.trend != Trend.NEUTRAL:
-                            await self._execute_auto_trade(signal)
+                            # Per-index slot guard: if this index already fired both ORB and VWAP
+                            # today, skip _execute_auto_trade to prevent a 3rd unguarded entry.
+                            _orb_done  = self._index_orb_triggered.get(idx_name) == datetime.now().date()
+                            _vwap_done = self._index_vwap_triggered.get(idx_name) == datetime.now().date()
+                            if _orb_done and _vwap_done:
+                                logger.debug(
+                                    f"[{idx_name}] Auto-trade skipped — both ORB + VWAP slots already used today"
+                                )
+                            elif now_ts.hour >= 14:
+                                # No new trend-following auto-entries after 14:00 IST.
+                                # Late entries have thin liquidity, wide spreads, and
+                                # insufficient time before the 15:27 force-exit.
+                                logger.debug(
+                                    f"[{idx_name}] Auto-trade skipped — past 14:00 IST cutoff"
+                                )
+                            else:
+                                await self._execute_auto_trade(signal)
                             await self._check_orb_signal()
                         else:
                             if is_trending and regime_result and regime_result.adx > 50:
@@ -538,6 +575,9 @@ class TradingBot:
                                 )
                                 await self._check_vwap_signal()
                             await self._check_orb_signal()
+
+                    # ── Step 4: EOD closing momentum (14:30–15:00 IST) ──────────────
+                    await self._check_eod_signal()
 
                 # ── Restore context to user's selected index after all scans ─────
                 _usr = self._user_selected_index
@@ -687,13 +727,12 @@ class TradingBot:
                     continue
                 
                 # Get current market prices
-                # Use a direct reference to the user's selected index analyzer to avoid
-                # being affected by the analysis loop swapping self.analyzer mid-iteration.
-                _safe_analyzer = self._index_analyzers.get(_usr_idx.name, self.analyzer)
-                signal = _safe_analyzer.analyze()
-                if not signal:
-                    await asyncio.sleep(check_interval)
-                    continue
+                # Use the last signal cached by the main analysis loop — do NOT call
+                # analyze() here because it internally calls fetch_data() (yfinance),
+                # meaning we'd hammer the API every 15 s just for a status-display value.
+                # Also, gating position monitoring on analyze() succeeding means SL/time-stop
+                # checks silently skip whenever yfinance is slow or rate-limited.
+                signal = getattr(self, '_last_signal', None)
                 
                 # Get current prices for all positions
                 # Fetch actual option prices from Kite API
@@ -1044,7 +1083,8 @@ class TradingBot:
             spot_price=signal.current_price,
             trend=signal.trend.value,
             trend_strength=signal.strength,
-            rsi=signal.rsi
+            rsi=signal.rsi,
+            strike_interval=self._active_index.strike_interval,
         )
         
         # Step 2: Show research results
@@ -1118,6 +1158,26 @@ class TradingBot:
                 trade_journal.log_trade("BUY", final_strike, option_type, entry_price, quantity or self.order_manager.get_active_quantity())
             except Exception:
                 pass
+
+            # ── Mark the appropriate daily slot so this index can't fire again ──
+            if source in ("Auto", "Manual", "GAP", "Rule"):
+                _today = datetime.now().date()
+                _idx   = self._active_index.name
+                if source == "Auto":
+                    # Auto trend-trades consume BOTH slots so the analysis loop
+                    # cannot open a second same-session entry after SL hits and
+                    # the position closes — prevents double-loss whipsaw.
+                    self._index_orb_triggered[_idx] = _today
+                    self._index_vwap_triggered[_idx] = _today
+                    logger.info(f"Auto trade consumed both ORB + VWAP slots for {_idx} today")
+                else:
+                    if self._index_orb_triggered.get(_idx) != _today:
+                        self._index_orb_triggered[_idx] = _today
+                        logger.info(f"{source} trade marked ORB slot as used for {_idx} today")
+                    elif self._index_vwap_triggered.get(_idx) != _today:
+                        self._index_vwap_triggered[_idx] = _today
+                        logger.info(f"{source} trade marked VWAP slot as used for {_idx} today")
+
             # Send Telegram alert for trade entry
             tg_message = f"🚀 *Trade Entry - {source}*\n{option_type} @ {final_strike}\nQty: {quantity}\n{result.message}"
             await self._send_telegram_alert(tg_message, "trade_entry")
@@ -1207,6 +1267,13 @@ class TradingBot:
 
             if result.success:
                 self._index_gap_traded[self._active_index.name] = True
+                # Gap trade consumes the ORB slot — prevents ORB from firing
+                # a second entry on the same index later in the morning.
+                _idx = self._active_index.name
+                _today = datetime.now().date()
+                if self._index_orb_triggered.get(_idx) != _today:
+                    self._index_orb_triggered[_idx] = _today
+                    logger.info(f"GAP trade marked ORB slot as used for {_idx} today")
                 msg = (
                     f"🚀 **Gap Trade Executed**\n"
                     f"  Gap: {gap.gap_type.value} ({gap.gap_pct:+.2f}%)\n"
@@ -1269,13 +1336,19 @@ class TradingBot:
                     return
 
                 # ── Guard 3: Higher bar on NEUTRAL days ───────────────────────
-                if _trend == "NEUTRAL" and orb_signal.strength < 80:
+                # ORB base strength = 60 (always) + 20 (volume) + up to 20 (gap).
+                # On NEUTRAL 5m days allow any breakout with at least 65% strength
+                # (volume-confirmed OR a decisive gap ≥1% outside the range).
+                # The old 80% bar effectively required volume confirmation every time,
+                # but yfinance index volume is unreliable → most signals were silently
+                # blocked even with legitimate breakouts.
+                if _trend == "NEUTRAL" and orb_signal.strength < 65:
                     logger.info(
-                        f"ORB: Skipping — NEUTRAL trend requires ≥80% strength "
+                        f"ORB: Skipping — NEUTRAL trend requires ≥65% strength "
                         f"(got {orb_signal.strength:.0f}%)"
                     )
                     await self._broadcast_message(
-                        f"ORB: Signal skipped — NEUTRAL market needs ≥80% strength "
+                        f"ORB: Signal skipped — NEUTRAL market needs ≥65% strength "
                         f"(got {orb_signal.strength:.0f}%)",
                         "alert"
                     )
@@ -1296,23 +1369,25 @@ class TradingBot:
 
             option_type = "CE" if orb_signal.direction == "LONG" else "PE"
 
-            # ── Guard 4: RSI overbought/oversold filter ──────────────────────────
+            # ── Guard 4: RSI extreme-reversal filter (breakout-aware) ─────────
+            # For ORB BREAKOUT trades, high RSI = strong momentum = GOOD for CE.
+            # Only block if RSI is at a true blow-off extreme (>88 or <12).
             _rsi = self._last_signal.rsi if self._last_signal else 50
-            if option_type == "CE" and _rsi > 65:
+            if option_type == "CE" and _rsi > 88:
                 logger.info(
-                    f"ORB: Skipping LONG — RSI {_rsi:.1f} is overbought (>65), chasing breakout"
+                    f"ORB: Skipping LONG — RSI {_rsi:.1f} extreme blow-off (>88)"
                 )
                 await self._broadcast_message(
-                    f"ORB: CE signal skipped — RSI {_rsi:.1f} already overbought (>65)",
+                    f"ORB: CE signal skipped — RSI {_rsi:.1f} extreme blow-off (>88)",
                     "alert"
                 )
                 return
-            if option_type == "PE" and _rsi < 35:
+            if option_type == "PE" and _rsi < 12:
                 logger.info(
-                    f"ORB: Skipping SHORT — RSI {_rsi:.1f} is oversold (<35), chasing breakdown"
+                    f"ORB: Skipping SHORT — RSI {_rsi:.1f} extreme oversold (<12)"
                 )
                 await self._broadcast_message(
-                    f"ORB: PE signal skipped — RSI {_rsi:.1f} already oversold (<35)",
+                    f"ORB: PE signal skipped — RSI {_rsi:.1f} extreme oversold (<12)",
                     "alert"
                 )
                 return
@@ -1367,6 +1442,22 @@ class TradingBot:
             if not vwap_signal:
                 return
 
+            # ── Minimum confidence gate ───────────────────────────────────────
+            # With tightened thresholds the minimum achievable score is ~53%;
+            # require ≥60% so that at least one of: volume spike OR a meaningful
+            # RSI extreme must be present (not just barely crossing the threshold).
+            if vwap_signal.strength < 60:
+                logger.info(
+                    f"VWAP [{self._active_index.display_name}]: Skipping — "
+                    f"confidence {vwap_signal.strength:.0f}% below 60% minimum"
+                )
+                await self._broadcast_message(
+                    f"VWAP: Signal skipped — confidence {vwap_signal.strength:.0f}% "
+                    f"below 60% threshold (need volume spike or deep RSI extreme)",
+                    "alert"
+                )
+                return
+
             # ── Regime-direction alignment guard ─────────────────────────────
             # On strong TRENDING DOWN days: block LONG (CE) entries — only allow PE.
             # On strong TRENDING UP days: block SHORT (PE) entries — only allow CE.
@@ -1419,6 +1510,191 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"VWAP signal check error: {e}")
+
+    async def _check_eod_signal(self):
+        """
+        End-of-Day closing momentum: fires once between 14:30–15:00 IST.
+
+        After 2:30 PM institutional traders begin squaring off, which amplifies
+        the direction of the last completed 15-minute candle through the close.
+        A strong (non-doji) candle → buy CE or PE in that direction.
+        The position runs until the 15:27 IST force-exit auto-closes it.
+        """
+        if not self._auto_trade:
+            return
+
+        cfg = settings.eod
+        if not cfg.enabled:
+            return
+
+        _today = datetime.now().date()
+        _idx   = self._active_index.name
+
+        # Once-per-day per-index guard (date-based — auto-resets on a new calendar day)
+        if self._index_eod_triggered.get(_idx) == _today:
+            return
+
+        now = datetime.now()
+        entry_start = now.replace(hour=cfg.entry_start_hour, minute=cfg.entry_start_minute, second=0, microsecond=0)
+        entry_end   = now.replace(hour=cfg.entry_end_hour,   minute=cfg.entry_end_minute,   second=0, microsecond=0)
+        if not (entry_start <= now <= entry_end):
+            return
+
+        if not self.order_manager:
+            return
+
+        can_trade, reason = self.order_manager.can_place_order()
+        if not can_trade:
+            logger.debug(f"EOD [{self._active_index.display_name}]: blocked — {reason}")
+            return
+
+        # Both daily slots already consumed — no room for another trade
+        _orb_done  = self._index_orb_triggered.get(_idx) == _today
+        _vwap_done = self._index_vwap_triggered.get(_idx) == _today
+        if _orb_done and _vwap_done:
+            return
+
+        try:
+            import yfinance as yf
+            import pandas as pd
+            from zoneinfo import ZoneInfo
+            _ist = ZoneInfo("Asia/Kolkata")
+
+            ticker = yf.Ticker(self._active_index.yahoo_symbol)
+            data   = ticker.history(period="1d", interval="15m")
+
+            if data is None or data.empty or len(data) < 2:
+                logger.debug(f"EOD [{self._active_index.display_name}]: insufficient 15m data")
+                return
+
+            # Convert index to IST so we can identify the last COMPLETED candle
+            # precisely by timestamp, regardless of yfinance lag behaviour.
+            # A 15m candle stamped at T is complete only after T + 15 min.
+            # Using iloc[-2] is unreliable: when yfinance lags and omits the
+            # currently-forming candle, iloc[-2] returns an extra candle too old.
+            try:
+                if hasattr(data.index, "tz") and data.index.tz:
+                    data_ist = data.copy()
+                    data_ist.index = data_ist.index.tz_convert(_ist)
+                else:
+                    data_ist = data.copy()
+                    data_ist.index = data_ist.index.tz_localize(_ist)
+                now_ist = datetime.now(_ist)
+                completed = data_ist[
+                    data_ist.index + pd.Timedelta(minutes=15) <= pd.Timestamp(now_ist)
+                ]
+                if completed.empty:
+                    logger.debug(f"EOD [{self._active_index.display_name}]: no completed 15m candle yet")
+                    return
+                last = completed.iloc[-1]
+                candle_ts = completed.index[-1]
+                logger.debug(
+                    f"EOD [{self._active_index.display_name}]: reading completed candle "
+                    f"@ {candle_ts.strftime('%H:%M')} IST"
+                )
+            except Exception as _tz_err:
+                logger.warning(f"EOD: IST candle filter failed ({_tz_err}) — falling back to iloc[-2]")
+                last = data.iloc[-2]
+
+            candle_open  = float(last["Open"])
+            candle_close = float(last["Close"])
+            candle_high  = float(last["High"])
+            candle_low   = float(last["Low"])
+
+            candle_range = candle_high - candle_low
+            if candle_range < 1:
+                return  # degenerate candle (data issue)
+
+            body     = abs(candle_close - candle_open)
+            body_pct = body / candle_range
+
+            if body_pct < cfg.min_body_pct:
+                logger.info(
+                    f"EOD [{self._active_index.display_name}]: Skipping — "
+                    f"candle body {body_pct:.0%} < {cfg.min_body_pct:.0%} (doji/indecision)"
+                )
+                await self._broadcast_message(
+                    f"EOD: No signal — last 15m candle is indecision "
+                    f"({body_pct:.0%} body, need ≥{cfg.min_body_pct:.0%}). Waiting for next candle.",
+                    "alert"
+                )
+                # Don't mark triggered — the next 15m candle may be decisive
+                return
+
+            is_bullish  = candle_close > candle_open
+            option_type = "CE" if is_bullish else "PE"
+            dir_label   = "BULLISH ↑" if is_bullish else "BEARISH ↓"
+
+            # Trend-direction alignment: skip if counter to the 5m overall trend
+            if self._last_signal:
+                trend = self._last_signal.trend.value
+                if option_type == "CE" and trend == "BEARISH":
+                    logger.info("EOD: CE skipped — overall 5m trend is BEARISH")
+                    await self._broadcast_message(
+                        "EOD: CE signal skipped — overall 5m trend is BEARISH", "alert"
+                    )
+                    self._index_eod_triggered[_idx] = _today  # don't retry
+                    return
+                if option_type == "PE" and trend == "BULLISH":
+                    logger.info("EOD: PE skipped — overall 5m trend is BULLISH")
+                    await self._broadcast_message(
+                        "EOD: PE signal skipped — overall 5m trend is BULLISH", "alert"
+                    )
+                    self._index_eod_triggered[_idx] = _today
+                    return
+
+            report = (
+                f"\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  EOD CLOSING MOMENTUM  —  {self._active_index.display_name}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"  Last 15m candle  : {dir_label}\n"
+                f"  Open → Close     : {candle_open:,.2f} → {candle_close:,.2f}\n"
+                f"  High / Low       : {candle_high:,.2f} / {candle_low:,.2f}\n"
+                f"  Body strength    : {body_pct:.0%} of range\n"
+                f"  Signal           : BUY {option_type}\n"
+                f"  Exit             : 15:27 IST force-exit\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            await self._broadcast_message(report, "analysis")
+
+            if not self._last_signal:
+                signal = self.analyzer.analyze()
+                if not signal:
+                    return
+                self._last_signal = signal
+
+            # Mark triggered BEFORE placing to prevent double-fire on concurrent cycles
+            self._index_eod_triggered[_idx] = _today
+
+            order_ok = await self._execute_option_with_research(
+                signal=self._last_signal,
+                option_type=option_type,
+                requested_strike="ATM",
+                quantity=None,
+                source="EOD",
+            )
+
+            if order_ok:
+                # Consume the next available daily slot
+                if not _orb_done:
+                    self._index_orb_triggered[_idx] = _today
+                else:
+                    self._index_vwap_triggered[_idx] = _today
+                await self._send_telegram_alert(
+                    f"EOD Closing Momentum\n"
+                    f"Last 15m: {dir_label}  (body {body_pct:.0%})\n"
+                    f"Open→Close: {candle_open:,.0f}→{candle_close:,.0f}\n"
+                    f"BUY {option_type} ATM  —  {self._active_index.display_name}\n"
+                    f"Exit: 15:27 IST",
+                    "trade_entry",
+                )
+            else:
+                # Order failed — reset so the next cycle can retry
+                self._index_eod_triggered.pop(_idx, None)
+
+        except Exception as e:
+            logger.error(f"EOD signal check error: {e}")
 
     def _format_vwap_signal(self, sig: VWAPSignal) -> str:
         """Format a VWAPSignal for display in the chat console."""
@@ -1579,9 +1855,7 @@ class TradingBot:
                 return "Order manager not initialized"
             
             elif action == "screenshot":
-                await self.kite.get_screenshot()
-                return "Screenshot saved"
-            
+                return "Screenshot is not supported with the current broker (Dhan)"
             elif action == "rule" or action == "rules":
                 return await self._handle_rule_command(parts)
             
@@ -1933,7 +2207,8 @@ Examples:
             spot_price=signal.current_price,
             trend=signal.trend.value,
             trend_strength=signal.strength,
-            rsi=signal.rsi
+            rsi=signal.rsi,
+            strike_interval=self._active_index.strike_interval,
         )
         
         return self.research.format_option_analysis(analysis, signal.trend.value)

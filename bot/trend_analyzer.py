@@ -210,14 +210,20 @@ class TrendAnalyzer:
         elif atr_pct > 0.5:  # Low volatility (0.5-1%)
             return 65  # Conservative+
         else:  # Very low volatility (<0.5%) OR spot_price unavailable
-            # Fall back to absolute ATR value (NIFTY typically 20000–25000)
+            # Fall back to absolute ATR value.
+            # Indian F&O index typical 5m ATR ranges:
+            #   BANKNIFTY: 50-100 pts | SENSEX: 60-100 pts | NIFTY: 15-30 pts
+            # The old thresholds (>100→65, else→70) caused BANKNIFTY/SENSEX
+            # (ATR 60-80) to always return 70 — too restrictive for strong-trend days.
             if atr_value > 300:
                 return 50
             elif atr_value > 220:
                 return 55
             elif atr_value > 150:
                 return 60
-            elif atr_value > 100:
+            elif atr_value > 80:
+                return 63
+            elif atr_value > 50:
                 return 65
             else:
                 return 70
@@ -500,10 +506,6 @@ class TrendAnalyzer:
         logger.info(f"Analysis: {trend.value} (strength: {strength}%, bull: {bullish_strength}%, bear: {bearish_strength}%) - {recommendation}")
         
         return signal
-    
-    def get_last_signal(self) -> Optional[TrendSignal]:
-        """Get the last calculated signal without re-analyzing"""
-        return self._last_signal
     
     @staticmethod
     def _human_expiry_text(days: int) -> str:

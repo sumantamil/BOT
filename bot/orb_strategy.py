@@ -297,14 +297,30 @@ class ORBStrategy:
         if data.empty:
             return None
 
+        # Require a minimum range width to avoid noise breakouts on ultra-low-
+        # volatility mornings.  Use 1.5× the index strike interval as minimum:
+        #   NIFTY     (interval=50)  → need ≥ 75 pts
+        #   BANKNIFTY (interval=100) → need ≥ 150 pts
+        #   SENSEX    (interval=100) → need ≥ 150 pts
+        # A narrow opening range means the market is in a tiny equilibrium zone;
+        # any "breakout" is more likely to be noise than a genuine directional move.
+        _min_range = self._index.strike_interval * 1.5
+        if self._range_width < _min_range:
+            logger.info(
+                f"ORB [{self._index.display_name}]: Skipping — opening range "
+                f"{self._range_width:.1f} pts too narrow (need ≥{_min_range:.0f} pts)"
+            )
+            return None
+
         latest = data.iloc[-1]
         price  = float(latest["Close"])
         volume = float(latest.get("Volume", 0))
         cfg    = self._cfg
 
         # ── Stale data guard ──────────────────────────────────────────────────
-        # yfinance 5m data can lag up to 5-10 min.  If the last candle is older
-        # than 8 minutes the breakout may have already reversed — skip this cycle.
+        # yfinance 5m data can lag up to 15-20 min in practice (free tier).
+        # Skip only if the last candle is older than 25 minutes — beyond that
+        # the breakout has very likely already reversed or been missed entirely.
         try:
             from zoneinfo import ZoneInfo
             _ist = ZoneInfo("Asia/Kolkata")
@@ -314,7 +330,7 @@ class ORBStrategy:
             elif hasattr(_last_ts, "replace"):
                 _last_ts = _last_ts.replace(tzinfo=_ist)
             _candle_age_min = (datetime.now(_ist) - _last_ts).total_seconds() / 60
-            if _candle_age_min > 8:
+            if _candle_age_min > 25:
                 logger.debug(
                     f"ORB: Data stale ({_candle_age_min:.1f} min old) — "
                     f"skipping breakout check until fresh candle arrives"

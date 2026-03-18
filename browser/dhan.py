@@ -73,7 +73,7 @@ class OrderResult:
 
 # ── Dhan exchange / product constants ────────────────────────────────────────
 _EXCHANGE_NSE_FNO = "NSE_FNO"
-_EXCHANGE_BSE_FO  = "BSE_FO"
+_EXCHANGE_BSE_FO  = "BSE_FNO"   # Dhan uses 'BSE_FNO' (not 'BSE_FO')
 _PRODUCT_INTRADAY = "INTRADAY"
 _PRODUCT_CNC      = "CNC"        # used for AMO (queue at exchange overnight)
 _PRODUCT_MARGIN   = "MARGIN"     # required for BSE_FO (SENSEX/BANKEX options)
@@ -259,19 +259,19 @@ class DhanBroker:
             with open(path, newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    instr = row.get("SEM_INSTRUMENT_NAME", "").strip()
+                    instr = (row.get("SEM_INSTRUMENT_NAME") or "").strip()
                     if instr != "OPTIDX":        # index options only
                         continue
-                    exch = row.get("SEM_EXM_EXCH_ID", "").strip()
+                    exch = (row.get("SEM_EXM_EXCH_ID") or "").strip()
                     if exch not in ("NSE", "BSE"):
                         continue
-                    opttype = row.get("SEM_OPTION_TYPE", "").strip().upper()
+                    opttype = (row.get("SEM_OPTION_TYPE") or "").strip().upper()
                     if opttype not in ("CE", "PE"):
                         continue
-                    sec_id    = row.get("SEM_SMST_SECURITY_ID", "").strip()
-                    strike    = row.get("SEM_STRIKE_PRICE", "").strip()
-                    expiry_dt = row.get("SEM_EXPIRY_DATE", "").strip()   # 'YYYY-MM-DD HH:MM:SS'
-                    trad_sym  = row.get("SEM_TRADING_SYMBOL", "").strip()
+                    sec_id    = (row.get("SEM_SMST_SECURITY_ID") or "").strip()
+                    strike    = (row.get("SEM_STRIKE_PRICE") or "").strip()
+                    expiry_dt = (row.get("SEM_EXPIRY_DATE") or "").strip()   # 'YYYY-MM-DD HH:MM:SS'
+                    trad_sym  = (row.get("SEM_TRADING_SYMBOL") or "").strip()
                     if not (sec_id and strike and expiry_dt and trad_sym):
                         continue
                     # Index name is the prefix before the first '-'
@@ -521,12 +521,12 @@ class DhanBroker:
         return None
 
     async def get_instrument_price(self, symbol: str) -> Optional[float]:
-        """Fetch current LTP for an option symbol using positions P&L."""
+        """Fetch real-time LTP for an option symbol via Dhan quote_data API."""
         if not self._client:
             return None
         await self._ensure_instruments_loaded()
 
-        # ── LTP cache (avoid calling get_positions more than once per cycle) ──
+        # ── LTP cache (one real API call per 15s per symbol) ──────────────────
         now = datetime.now()
         cached = self._ltp_cache.get(symbol)
         if cached:
@@ -534,10 +534,32 @@ class DhanBroker:
             if (now - cached_ts).total_seconds() < self._ltp_cache_ttl:
                 return cached_price if cached_price > 0 else None
 
-        # ── Primary path: compute LTP from positions P&L ─────────────────────
-        # Dhan's positions endpoint has no live LTP field but does have
-        # unrealizedProfit which allows a reliable mark-to-market computation:
-        #   ltp ≈ costPrice + unrealizedProfit / netQty
+        # ── Primary path: quote_data endpoint (real-time LTP) ─────────────────
+        # The positions endpoint computes ltp from unrealizedProfit which can be
+        # stale/zero intraday. quote_data returns the live market feed LTP.
+        sec_id = self._sec_id_for_symbol(symbol)
+        if sec_id:
+            try:
+                # Determine exchange from symbol (SENSEX/BANKEX → BSE_FNO)
+                sym_up = symbol.upper()
+                exch = _EXCHANGE_BSE_FO if any(
+                    sym_up.startswith(x) for x in ("SENSEX", "BANKEX")
+                ) else _EXCHANGE_NSE_FNO
+                resp = await asyncio.to_thread(
+                    self._client.quote_data,
+                    {exch: [int(sec_id)]}
+                )
+                if resp and resp.get("status") == "success":
+                    exch_data = resp.get("data", {}).get(exch, {})
+                    quote = exch_data.get(str(sec_id), {})
+                    ltp_val = float(quote.get("last_price") or 0)
+                    if ltp_val > 0:
+                        self._ltp_cache[symbol] = (ltp_val, now)
+                        return ltp_val
+            except Exception as e:
+                logger.debug(f"Dhan quote_data LTP failed for {symbol}: {e}")
+
+        # ── Fallback: compute LTP from positions unrealizedProfit ─────────────
         try:
             pos_data = await self.get_kite_positions()
             for p in pos_data["day"] + pos_data["net"]:
@@ -545,13 +567,12 @@ class DhanBroker:
                     ltp_val = p.get("last_price") or 0
                     if ltp_val > 0:
                         self._ltp_cache[symbol] = (float(ltp_val), now)
-                        # Seed security-id placement cache
                         raw_sec = p.get("security_id", "")
                         if raw_sec and symbol.upper() not in self._position_security_ids:
                             self._position_security_ids[symbol.upper()] = str(raw_sec)
                         return float(ltp_val)
         except Exception as e:
-            logger.debug(f"Dhan LTP positions fetch failed for {symbol}: {e}")
+            logger.debug(f"Dhan LTP positions fallback failed for {symbol}: {e}")
         return None
 
     # ── Holdings ─────────────────────────────────────────────────────────────
@@ -742,6 +763,13 @@ class DhanBroker:
         trigger_price = round(entry_price * (1 - stop_loss_pct / 100), 1)
         limit_price   = round(trigger_price * 0.98, 1)
         dhan_exchange = _EXCHANGE_BSE_FO if "BSE" in exchange.upper() else _EXCHANGE_NSE_FNO
+        # Forever Orders (GTT equivalent) must use CNC for NSE_FNO and MARGIN for BSE_FNO.
+        # INTRADAY is rejected by Dhan with DH-906 because a GTT stop-loss
+        # is designed to persist beyond intraday — it cannot be INTRADAY.
+        if dhan_exchange == _EXCHANGE_BSE_FO:
+            product = _PRODUCT_MARGIN
+        else:
+            product = _PRODUCT_CNC
 
         try:
             resp = await asyncio.to_thread(
@@ -751,7 +779,7 @@ class DhanBroker:
                 transaction_type="SELL",
                 quantity=quantity,
                 order_type=_ORDER_LIMIT,
-                product_type=_PRODUCT_CNC,   # Forever Orders only accept CNC, not INTRADAY
+                product_type=product,
                 price=limit_price,
                 trigger_Price=trigger_price,
             )

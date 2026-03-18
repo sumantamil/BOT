@@ -65,15 +65,17 @@ class DhanConfig(BaseSettings):
 class TradingConfig(BaseSettings):
     """Trading parameters and risk management"""
     
-    # Default lot size for NIFTY options (1 lot = 50 units)
-    default_quantity: int = Field(default=50, description="Number of units per trade")
+    # Default lot size — matches NIFTY lot size; bot also auto-resolves via index_config.lot_size
+    default_quantity: int = Field(default=65, description="Number of units per trade (NIFTY lot size)")
     
     # Maximum positions at any time
     max_positions: int = Field(default=2, description="Maximum open positions (supports 2 simultaneous: 1 ORB + 1 VWAP)")
     
-    # Risk management
-    max_loss_per_trade: float = Field(default=5000.0, description="Max loss per trade in INR")
-    max_daily_loss: float = Field(default=15000.0, description="Max daily loss in INR")
+    # Risk management — calibrated for ₹45,000 capital
+    # max_loss_per_trade = 5% of capital  (20% SL on ₹6,500 NIFTY lot ≈ ₹1,300 — well within limit)
+    # max_daily_loss    = 10% of capital  (~3 SL hits before bot halts for the day)
+    max_loss_per_trade: float = Field(default=2250.0, description="Max loss per trade in INR (5%% of ₹45k capital)")
+    max_daily_loss: float = Field(default=4500.0, description="Max daily loss in INR (10%% of ₹45k capital)")
     stop_loss_percentage: float = Field(default=20.0, description="Stop loss percentage")
     target_percentage: float = Field(default=30.0, description="Target profit percentage")
     
@@ -99,8 +101,8 @@ class TradingConfig(BaseSettings):
     max_consecutive_losses: int = Field(default=3, description="Maximum consecutive losses before pausing")
     pause_after_losses_minutes: int = Field(default=30, description="Minutes to pause trading after consecutive losses")
     
-    # Safety: Daily trade limit
-    max_trades_per_day: int = Field(default=5, description="Maximum number of trades per day")
+    # Safety: Daily trade limit — 3 max for ₹45k capital (3 SL hits ≈ ₹3,900, near daily limit)
+    max_trades_per_day: int = Field(default=3, description="Maximum number of trades per day")
     min_time_between_trades_minutes: int = Field(default=5, description="Minimum time between consecutive trades")
     
     # Phase 2: Profit taking tiers (partial exits)
@@ -214,9 +216,9 @@ class VWAPConfig(BaseSettings):
     """VWAP Mean Reversion strategy configuration (active in RANGING regime)"""
 
     enabled: bool = Field(default=True, description="Enable VWAP mean-reversion strategy")
-    deviation_pct: float = Field(default=0.4, description="% deviation from VWAP required to trigger signal")
-    rsi_oversold: float = Field(default=42.0, description="RSI threshold for LONG signal (dip)")
-    rsi_overbought: float = Field(default=58.0, description="RSI threshold for SHORT signal (pop)")
+    deviation_pct: float = Field(default=0.6, description="% deviation from VWAP required to trigger signal (0.4 was too small — caught normal intraday noise at NIFTY 23k=92pts)")
+    rsi_oversold: float = Field(default=38.0, description="RSI threshold for LONG signal (dip) — 42 was too loose, caught near-neutral readings")
+    rsi_overbought: float = Field(default=62.0, description="RSI threshold for SHORT signal (pop) — 58 was too loose")
     stop_pct: float = Field(default=0.3, description="Stop loss % from entry price")
 
     model_config = SettingsConfigDict(
@@ -262,6 +264,33 @@ class GapConfig(BaseSettings):
     )
 
 
+class EODConfig(BaseSettings):
+    """End-of-Day closing momentum strategy (fires once after 14:30 IST).
+
+    After 2:30 PM institutional traders square off positions. The direction
+    of the last completed 15-minute candle reliably predicts where the index
+    will close. A strong (non-doji) candle → buy CE or PE in that direction.
+    The trade runs until the 15:27 force-exit.
+    """
+
+    enabled: bool = Field(default=True, description="Enable EOD closing momentum strategy")
+    entry_start_hour: int = Field(default=14, description="Start scanning for EOD signal (IST hour)")
+    entry_start_minute: int = Field(default=30, description="Start scanning for EOD signal (IST minute)")
+    entry_end_hour: int = Field(default=15, description="Stop taking new EOD entries (IST hour)")
+    entry_end_minute: int = Field(default=0, description="Stop taking new EOD entries (IST minute)")
+    min_body_pct: float = Field(
+        default=0.5,
+        description="Min candle body as fraction of high-low range (0.5 = 50%). "
+                    "Below this it is a doji/indecision candle — no trade taken."
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="EOD_",
+        env_file=".env",
+        extra="ignore"
+    )
+
+
 class WebConfig(BaseSettings):
     """Web server configuration"""
     
@@ -287,6 +316,7 @@ class Settings(BaseSettings):
     vwap: VWAPConfig = VWAPConfig()
     orb: ORBConfig = ORBConfig()
     gap: GapConfig = GapConfig()
+    eod: EODConfig = EODConfig()
     web: WebConfig = WebConfig()
     alert: AlertConfig = AlertConfig()
     
@@ -320,11 +350,12 @@ ZERODHA_TOTP_SECRET=your_totp_secret_optional
 DHAN_CLIENT_ID=your_dhan_client_id
 DHAN_ACCESS_TOKEN=your_dhan_permanent_access_token
 
-# Trading Settings
-TRADING_DEFAULT_QUANTITY=50
-TRADING_MAX_POSITIONS=3
-TRADING_MAX_LOSS_PER_TRADE=5000
-TRADING_MAX_DAILY_LOSS=15000
+# Trading Settings — calibrated for ₹45,000 capital
+# max_loss_per_trade = 5% of capital  |  max_daily_loss = 10% of capital  |  max_trades = 3/day
+TRADING_DEFAULT_QUANTITY=65
+TRADING_MAX_POSITIONS=2
+TRADING_MAX_LOSS_PER_TRADE=2250
+TRADING_MAX_DAILY_LOSS=4500
 TRADING_STOP_LOSS_PERCENTAGE=20
 TRADING_TARGET_PERCENTAGE=30
 TRADING_AUTO_TRADE_ENABLED=false
@@ -350,7 +381,7 @@ WEB_PORT=8000
 TRADING_CLOSE_ALL_BEFORE_MARKET_CLOSE=3
 TRADING_MAX_CONSECUTIVE_LOSSES=3
 TRADING_PAUSE_AFTER_LOSSES_MINUTES=30
-TRADING_MAX_TRADES_PER_DAY=5
+TRADING_MAX_TRADES_PER_DAY=3
 TRADING_MIN_TIME_BETWEEN_TRADES_MINUTES=5
 
 # Profit Taking Tiers (Phase 2)

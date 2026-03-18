@@ -5,6 +5,8 @@ Handles order placement logic, position tracking, and risk management.
 """
 
 import asyncio
+import json
+import os
 import re
 from typing import Optional, Dict, List
 from datetime import datetime, date, timedelta
@@ -14,7 +16,10 @@ from loguru import logger
 import sys
 sys.path.append('..')
 from config import settings
-from browser.zerodha import ZerodhaKite, OrderType, OptionType, OrderResult
+from browser.dhan import OrderType, OptionType, OrderResult
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from browser.zerodha import ZerodhaKite
 from bot.trend_analyzer import TrendSignal, Trend
 from bot.index_config import IndexConfig, NIFTY, get_index
 
@@ -45,7 +50,6 @@ class DailyStats:
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
-    gross_pnl: float = 0.0
     realized_pnl: float = 0.0
 
 
@@ -60,7 +64,7 @@ class OrderManager:
     - Trade history
     """
     
-    def __init__(self, kite: ZerodhaKite):
+    def __init__(self, kite):
         self.kite = kite
         self.config = settings.trading
         
@@ -91,6 +95,12 @@ class OrderManager:
 
         # Net qty tracker for over-sell guard: (option_type, strike) -> net qty held
         self._held_qty: Dict[tuple, int] = {}
+
+        # Persist daily P&L to disk so restarts don't reset the daily-loss limit.
+        # File: <workspace>/.daily_pnl.json  →  {"date": "YYYY-MM-DD", "pnl": -1053.0}
+        _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._pnl_file = os.path.join(_base, ".daily_pnl.json")
+        self._daily_pnl = self._load_daily_pnl()
     
     def set_active_index(self, index_config: IndexConfig):
         """Set the active trading index (NIFTY, BANKNIFTY, SENSEX)"""
@@ -107,6 +117,29 @@ class OrderManager:
         self._trade_counter += 1
         return f"TRD_{datetime.now().strftime('%Y%m%d')}_{self._trade_counter:04d}"
     
+    def _load_daily_pnl(self) -> float:
+        """Load today's realized P&L from disk (survives bot restarts)."""
+        try:
+            if os.path.exists(self._pnl_file):
+                with open(self._pnl_file, "r") as f:
+                    data = json.load(f)
+                if data.get("date") == date.today().isoformat():
+                    pnl = float(data.get("pnl", 0.0))
+                    if pnl != 0.0:
+                        logger.info(f"Loaded persisted daily P&L: ₹{pnl:,.2f}")
+                    return pnl
+        except Exception as e:
+            logger.debug(f"Could not load daily P&L file: {e}")
+        return 0.0
+
+    def _save_daily_pnl(self):
+        """Persist today's realized P&L to disk."""
+        try:
+            with open(self._pnl_file, "w") as f:
+                json.dump({"date": date.today().isoformat(), "pnl": self._daily_pnl}, f)
+        except Exception as e:
+            logger.debug(f"Could not save daily P&L file: {e}")
+
     def _reset_daily_stats_if_needed(self):
         """Reset daily stats if it's a new day"""
         today = date.today()
@@ -114,6 +147,7 @@ class OrderManager:
             logger.info(f"New trading day - resetting daily stats")
             self._daily_stats = DailyStats(date=today)
             self._daily_pnl = 0.0
+            self._save_daily_pnl()  # write 0.0 for the new day
             self._consecutive_losses = 0
             self._trading_paused_until = None
             self._strike_loss_count = {}
@@ -284,12 +318,38 @@ class OrderManager:
         )
         
         if result.success:
-            # Fetch actual option fill price (LTP) for P&L tracking and GTT
             option_symbol = f"{self._active_index.name}{strike}{option_type.value}"
+
+            # Wait for the order to settle then fetch the real fill price from
+            # the broker's positions API — same approach as manual_order().
+            # A stale or zero LTP at this point would leave trade.price=0, causing
+            # check_stop_loss_targets to skip ALL SL/target monitoring for the trade.
+            await asyncio.sleep(2)
+            option_ltp = 0.0
             try:
-                option_ltp = await self.kite.get_instrument_price(option_symbol) or 0.0
-            except Exception:
-                option_ltp = 0.0
+                pos_data = await self.kite.get_kite_positions()
+                for p in pos_data.get("day", []):
+                    sym = p.get("tradingsymbol", "")
+                    if (str(strike) in sym and option_type.value in sym
+                            and (p.get("quantity") or 0) != 0):
+                        avg = float(p.get("average_price") or 0)
+                        if avg > 0:
+                            option_ltp = avg
+                            break
+            except Exception as e:
+                logger.debug(f"execute_trade_signal: broker fill fetch failed: {e}")
+
+            if option_ltp == 0.0:
+                try:
+                    option_ltp = await self.kite.get_instrument_price(option_symbol) or 0.0
+                except Exception:
+                    pass
+
+            if option_ltp == 0.0:
+                logger.warning(
+                    f"execute_trade_signal: could not resolve fill price for {option_symbol} — "
+                    f"SL/target monitoring will not fire until price data arrives"
+                )
 
             trade = TradeRecord(
                 trade_id=self._generate_trade_id(),
@@ -298,7 +358,7 @@ class OrderManager:
                 strike=strike,
                 order_type=OrderType.BUY,
                 quantity=quantity,
-                price=option_ltp,   # option premium price, not index price
+                price=option_ltp,
                 timestamp=datetime.now(),
                 status="OPEN",
                 lot_size=self._active_index.lot_size,
@@ -309,7 +369,7 @@ class OrderManager:
             # Track held qty for over-sell guard
             _hkey = (option_type.value, strike)
             self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + quantity
-            logger.info(f"Trade recorded: {trade.trade_id} | option LTP=₹{option_ltp}")
+            logger.info(f"Trade recorded: {trade.trade_id} | fill=₹{option_ltp:.2f}")
 
             # Place GTT exchange-level stop-loss on the option premium (survives bot crash/restart)
             if self.config.use_gtt and option_ltp > 0:
@@ -317,7 +377,7 @@ class OrderManager:
                 gtt_id = await self.kite.place_gtt(
                     symbol=trade.symbol,
                     exchange=exchange,
-                    entry_price=option_ltp,          # option premium price
+                    entry_price=option_ltp,
                     stop_loss_pct=self.config.stop_loss_percentage,
                     quantity=quantity,
                 )
@@ -524,6 +584,7 @@ class OrderManager:
                 pnl = (exit_price - target.price) * qty_to_close
                 realized = pnl
                 self._daily_pnl += realized
+                self._save_daily_pnl()  # persist so restarts don't lose the daily loss tally
                 if target.pnl is None:
                     target.pnl = 0.0
                 target.pnl += realized

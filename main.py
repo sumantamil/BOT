@@ -33,7 +33,26 @@ def run_server():
     from config import settings
     import threading
     import webbrowser
-    
+    import socket
+
+    # ── Single-instance guard ──────────────────────────────────────────────
+    # Try binding to the bot port before starting uvicorn.  If it's already
+    # in use, another bot instance is running — print a clear message and exit
+    # rather than silently spawning a second process that could place duplicate
+    # trades or double-close positions.
+    _test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        _test_sock.bind((settings.web.host, settings.web.port))
+        _test_sock.close()
+    except OSError:
+        _test_sock.close()
+        logger.error(
+            f"Port {settings.web.port} is already in use — another bot instance is running!\n"
+            f"Stop the existing bot first (Stop-Process -Name python) then restart."
+        )
+        sys.exit(1)
+
     logger.info("Starting NIFTY Trading Bot Web Server...")
     logger.info(f"Open http://{settings.web.host}:{settings.web.port} in your browser")
 

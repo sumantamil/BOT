@@ -44,13 +44,15 @@ class TradeJournal:
         os.makedirs(self._dir, exist_ok=True)
         self._entries: List[JournalEntry] = []
         self._today = date.today().isoformat()
+        # Track open trade lots for P&L calculation (FIFO)
+        # key = (direction, strike) -> deque of (premium, qty)
+        # Must be initialised BEFORE _load_today() so that the replay inside
+        # _load_today() can populate it from today's persisted trade history.
+        self._open_lots: Dict[tuple, deque] = {}
         self._load_today()
         # Dedup: track last logged command text and its timestamp
         self._last_cmd: Optional[str] = None
         self._last_cmd_time: Optional[datetime] = None
-        # Track open trade lots for P&L calculation (FIFO)
-        # key = (direction, strike) -> deque of (premium, qty)
-        self._open_lots: Dict[tuple, deque] = {}
 
     def _filepath(self, day: str = None) -> str:
         day = day or self._today
@@ -63,6 +65,32 @@ class TradeJournal:
                 with open(path, "r") as f:
                     data = json.load(f)
                 self._entries = [JournalEntry(**e) for e in data]
+                # Rebuild open-lots FIFO state so that a bot restart does not
+                # lose track of positions and produce spurious over-sell warnings.
+                self._open_lots = {}
+                for entry in self._entries:
+                    if entry.event_type != "TRADE":
+                        continue
+                    action   = entry.details.get("action", "")
+                    strike   = entry.details.get("strike", 0)
+                    opt_type = entry.details.get("option_type", entry.direction)
+                    premium  = float(entry.details.get("premium", 0))
+                    qty      = int(entry.details.get("quantity", 0))
+                    key = (opt_type.upper(), strike)
+                    if action.upper() == "BUY":
+                        if key not in self._open_lots:
+                            self._open_lots[key] = deque()
+                        self._open_lots[key].append({"premium": premium, "qty": qty})
+                    elif action.upper() == "SELL":
+                        remaining = qty
+                        queue = self._open_lots.get(key, deque())
+                        while remaining > 0 and queue:
+                            lot = queue[0]
+                            closed = min(lot["qty"], remaining)
+                            lot["qty"] -= closed
+                            if lot["qty"] == 0:
+                                queue.popleft()
+                            remaining -= closed
             except Exception:
                 self._entries = []
 

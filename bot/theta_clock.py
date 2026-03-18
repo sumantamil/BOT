@@ -55,7 +55,6 @@ class ThetaDecayClock:
         self,
         premium: float,
         days_to_expiry: float,
-        iv_pct: float = 15.0,
         is_atm: bool = True,
     ) -> ThetaDecayReport:
         """
@@ -76,7 +75,7 @@ class ThetaDecayClock:
         # Theta accelerates as sqrt(T) decreases
         sqrt_t = math.sqrt(days_to_expiry / 365)
         if sqrt_t > 0:
-            theta_per_day = time_value / (2 * math.sqrt(days_to_expiry)) if days_to_expiry > 0 else time_value
+            theta_per_day = time_value / (2 * math.sqrt(days_to_expiry))
         else:
             theta_per_day = time_value
 

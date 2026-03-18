@@ -1,6 +1,6 @@
 # NIFTY Options Trading Bot
 
-A sophisticated automated trading bot for NIFTY, BANKNIFTY, and SENSEX options with **multi-broker support (Dhan + Zerodha)**, **gap-up/gap-down strategy**, **AMO (After Market Orders)**, **real-time P&L tracking**, and **Telegram alerts**.
+A sophisticated automated trading bot for NIFTY, BANKNIFTY, and SENSEX options with **multi-broker support (Dhan + Zerodha)**, **5 intraday strategies**, **real-time P&L tracking**, and **Telegram alerts**.
 
 ---
 
@@ -8,102 +8,101 @@ A sophisticated automated trading bot for NIFTY, BANKNIFTY, and SENSEX options w
 
 Already set up? Run every morning before 9:15 AM:
 
-**Dhan broker (recommended — default):**
 ```powershell
 .venv\Scripts\Activate.ps1
-python main.py   # no token refresh needed — token expires Apr 14, 2026
-```
-
-**Zerodha broker (optional):**
-```powershell
-.venv\Scripts\Activate.ps1
-python get_kite_token.py   # refresh daily access token (fully automated)
-python main.py             # start the bot
+python main.py
 ```
 
 Then open: **http://localhost:8000**
 
 ---
 
-## Initial One-Time Setup
+## Installation (First Time Setup)
 
-### Step 1: Clone Repository
+### Prerequisites
+
+- **Python 3.10 or higher** — [Download](https://www.python.org/downloads/)
+- **Git** — [Download](https://git-scm.com/downloads/)
+- A **Dhan account** ([dhanhq.co](https://dhanhq.co/)) — free API, recommended
+
+---
+
+### Step 1 — Clone the Repository
+
 ```powershell
 git clone <repo-url>
-cd nifty-trading-bot
+cd "VS Code BOT\BOT"
 ```
 
-### Step 2: Create Virtual Environment
+---
+
+### Step 2 — Create Virtual Environment
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
 
-### Step 3: Install Dependencies
+> If PowerShell blocks the script, run once as Administrator:
+> `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+---
+
+### Step 3 — Install Dependencies
+
 ```powershell
 pip install -r requirements.txt
+```
 
-# Zerodha users only — install headless browser for daily token refresh:
+Core packages installed:
+
+| Package | Purpose |
+|---------|---------|
+| `fastapi` + `uvicorn` | Web dashboard server |
+| `dhanhq` | Dhan broker API (free) |
+| `kiteconnect` | Zerodha Kite API (optional) |
+| `playwright` | Browser automation — Zerodha token refresh only |
+| `yfinance` | Market data (15m/5m/1m candles) |
+| `pandas`, `numpy` | Data processing |
+| `pydantic-settings` | Configuration management |
+| `loguru` | Structured logging |
+| `httpx` | Async HTTP (Telegram alerts) |
+| `curl_cffi` | NSE option chain scraping |
+
+**Zerodha users only** — install headless browser:
+```powershell
 playwright install chromium
 ```
 
-Required packages:
-- `fastapi` + `uvicorn` — Web server
-- `dhanhq` — Dhan API SDK (**free broker, recommended**)
-- `kiteconnect` — Zerodha REST API (optional)
-- `playwright` — Browser automation (**Zerodha only**: token refresh + fallback)
-- `pyotp` — TOTP 2FA auto-login (Zerodha, optional)
-- `yfinance` — Market data
-- `curl_cffi` — NSE option chain data (TLS bypass)
-- `pandas`, `numpy` — Data processing
-- `ta` — Technical indicators
-- `pydantic` + `pydantic-settings` — Configuration
-- `loguru` — Logging
-- `python-dotenv` — `.env` file loading
+---
 
-### Step 4: Create `.env` File
+### Step 4 — Create `.env` File
 
-Create `.env` in the project root:
+Create a file named `.env` in the project root:
 
 ```env
 # ============ BROKER SELECTION ============
-# 'dhan'     = Dhan API (free, permanent token) — RECOMMENDED
-# 'zerodha'  = Kite Connect API (₹2,360/month)
-BROKER=dhan
+BROKER=dhan          # 'dhan' (recommended — free) or 'zerodha'
 
-# ============ DHAN API (if BROKER=dhan) ============
-# Get your token from: https://developer.dhanhq.co/apps
-# Steps:
-#   1. Log in to https://developer.dhanhq.co
-#   2. Navigate to "My Apps" or use the direct link above
-#   3. Click on your app (or create one if needed)
-#   4. Copy the "Sandbox Client ID" and "Access Token" from the table
-#   5. Paste below
-# Token expires on the date shown in the portal (e.g., "14 Apr" = April 14, 2026)
-# When expired, log in to the portal and click "Regenerate Token"
+# ============ DHAN API ============
+# Get from: https://developer.dhanhq.co → My Apps → your app → copy token
+# Token is long-lived (~1 year). Regenerate from portal when expired.
 DHAN_CLIENT_ID=your_dhan_client_id
-DHAN_ACCESS_TOKEN=your_dhan_access_token_from_portal
-DHAN_MOBILE=your_10_digit_mobile         # for manual token regeneration
-DHAN_PASSWORD=your_dhan_account_password # for manual token regeneration
-DHAN_PORTAL_URL=https://developer.dhanhq.co
+DHAN_ACCESS_TOKEN=your_dhan_access_token
 
-# ============ ZERODHA CREDENTIALS (if BROKER=zerodha) ============
-ZERODHA_USER_ID=your_user_id_here
-ZERODHA_PASSWORD=your_password_here
-ZERODHA_PIN=your_6_digit_pin      # used by auto token refresh (2FA)
-ZERODHA_TOTP_SECRET=              # optional: overrides PIN if set
-
-# ============ KITE CONNECT API (if BROKER=zerodha) ============
-# Get from: https://kite.trade/
-KITE_API_KEY=your_api_key_here
-KITE_API_SECRET=your_api_secret_here
-KITE_ACCESS_TOKEN=                # auto-filled by get_kite_token.py
+# ============ ZERODHA (only if BROKER=zerodha) ============
+ZERODHA_USER_ID=your_user_id
+ZERODHA_PASSWORD=your_password
+ZERODHA_PIN=your_6_digit_pin         # used by get_kite_token.py for 2FA
+ZERODHA_TOTP_SECRET=                 # optional: overrides PIN if set
+KITE_API_KEY=your_api_key
+KITE_API_SECRET=your_api_secret
+KITE_ACCESS_TOKEN=                   # auto-filled by get_kite_token.py
 KITE_USE_KITE_API=true
 
-# ============ TRADING CONFIGURATION ============
-TRADING_AUTO_TRADE_ENABLED=false   # Set true after testing
+# ============ TRADING RISK SETTINGS ============
+TRADING_AUTO_TRADE_ENABLED=false     # Set true only after testing
 
-# Safety
 TRADING_MAX_POSITIONS=2
 TRADING_MAX_LOSS_PER_TRADE=2500
 TRADING_MAX_DAILY_LOSS=5000
@@ -113,274 +112,218 @@ TRADING_MAX_CONSECUTIVE_LOSSES=3
 TRADING_PAUSE_AFTER_LOSSES_MINUTES=30
 TRADING_MAX_TRADES_PER_DAY=4
 TRADING_CLOSE_ALL_BEFORE_MARKET_CLOSE=3
+TRADING_TIME_STOP_MINUTES=45        # exit positions open > 45 min without profit
 
-# Smart Exits
+# Smart exits
 TRADING_USE_TRAILING_STOP_LOSS=true
 TRADING_TRAILING_STOP_PERCENTAGE=12
+TRADING_TRAILING_STOP_ACTIVATION_PCT=10
 TRADING_USE_PROFIT_TIERS=true
 TRADING_TAKE_PROFIT_TIER_1_PERCENT=15
 TRADING_TAKE_PROFIT_TIER_1_QUANTITY_PERCENT=50
 TRADING_TAKE_PROFIT_TIER_2_PERCENT=25
 TRADING_TAKE_PROFIT_TIER_2_QUANTITY_PERCENT=50
 
-# GTT / Forever Orders (exchange-level stop orders — survive bot crash/restart)
+# GTT / Forever Orders (exchange-level stop — survives bot crash)
 TRADING_USE_GTT=true
 
-# AMO — After Market Orders (place gap trades during evening/overnight window)
-# Window: 17:00–23:59 and 00:00–09:08 IST on weekdays
+# AMO — After Market Orders (Dhan only)
 TRADING_AMO_ENABLED=true
 
-# Market Filters
-TRADING_AVOID_RSI_RANGE=true
-TRADING_VOLATILITY_THRESHOLD=2.0
-TRADING_AVOID_LOW_VOLUME_HOURS=true
+TRADING_MIN_TIME_BETWEEN_TRADES_MINUTES=10
+TREND_ANALYSIS_INTERVAL_SECONDS=60
 
-# Trade Frequency
-TRADING_MIN_TIME_BETWEEN_TRADES_MINUTES=10  # min gap between consecutive trades
-
-# Analysis
-TREND_ANALYSIS_INTERVAL_SECONDS=60   # market scan interval in seconds
-
-# ============ GAP STRATEGY ============
+# ============ STRATEGY THRESHOLDS ============
+# Gap detection
 GAP_ENABLED=true
-GAP_MIN_GAP_PCT=0.75          # moderate gap threshold
-GAP_STRONG_GAP_PCT=1.5        # strong gap → immediate entry
+GAP_MIN_GAP_PCT=0.75
+GAP_STRONG_GAP_PCT=1.5
 GAP_STOP_LOSS_PCT=25
 GAP_TARGET_PCT=50
-GAP_QUANTITY_MULTIPLIER=1.0   # 1.0 = normal lot size
+
+# VWAP Mean Reversion (tightened to avoid noise)
+VWAP_DEVIATION_PCT=0.6        # % deviation from VWAP to trigger (default: 0.6)
+VWAP_RSI_OVERSOLD=38          # for LONG signal (default: 38)
+VWAP_RSI_OVERBOUGHT=62        # for SHORT signal (default: 62)
+
+# EOD Closing Momentum (14:30–15:00 IST)
+EOD_ENABLED=true
+EOD_MIN_BODY_PCT=0.5          # 50% body minimum to avoid doji candles
 
 # ============ TELEGRAM ALERTS (Optional) ============
 ALERT_TELEGRAM_ENABLED=false
-ALERT_TELEGRAM_BOT_TOKEN=your_bot_token_here
-ALERT_TELEGRAM_CHAT_ID=your_chat_id_here
+ALERT_TELEGRAM_BOT_TOKEN=your_bot_token
+ALERT_TELEGRAM_CHAT_ID=your_chat_id
 ```
-
-> **Note on Lot Sizes**: The bot automatically uses the correct lot size per index.
-> - **NIFTY** → 65 units/lot
-> - **BANKNIFTY** → 30 units/lot
-> - **SENSEX** → 20 units/lot
-
-### Step 5: Configure Kite API Redirect URL — **Zerodha only**
-
-1. Log in at [kite.trade](https://kite.trade/) → **My Apps** → select your app
-2. Set **Redirect URL** to exactly: `http://127.0.0.1`
-3. Save — without this, the automated token capture will time out
-
-### Step 6: Get Kite API Access Token — **Zerodha only**
-
-Add your Zerodha PIN to `.env`:
-```env
-ZERODHA_PIN=your_6_digit_pin
-```
-
-Then run the token refresher:
-```powershell
-python get_kite_token.py
-```
-
-This is **fully automated** — it launches a headless browser, logs into Zerodha, completes 2FA with your PIN (or TOTP if configured), captures the OAuth token, and writes it to `.env` automatically. No manual steps needed.
-
-> **Access tokens expire every day at midnight IST.** Run `get_kite_token.py` every morning before 9:15 AM.
-
-If you have a TOTP app set up for Zerodha, set `ZERODHA_TOTP_SECRET` instead of `ZERODHA_PIN` for even more reliable 2FA automation.
 
 ---
 
-## Telegram Alerts (Optional)
+### Step 5 — Verify Setup
+
+```powershell
+.venv\Scripts\python.exe -c "import dhanhq, yfinance, fastapi; print('All packages OK')"
+```
+
+---
+
+### Step 6 — Start the Bot
+
+```powershell
+python main.py
+```
+
+Open **http://localhost:8000** — you should see the dashboard.
+
+> The bot starts with `TRADING_AUTO_TRADE_ENABLED=false`. It will analyse and show signals but will not place real orders until you set that to `true`.
+
+---
+
+### Step 7 — Enable Telegram Alerts (Optional)
 
 1. Open Telegram → search `@BotFather` → `/newbot` → copy token
 2. Send any message to your new bot
-3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates`, copy `id` from `"chat"`
-4. Add both to `.env` and set `ALERT_TELEGRAM_ENABLED=true`
+3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` → copy `id` from `"chat"`
+4. Add to `.env`:
+   ```env
+   ALERT_TELEGRAM_ENABLED=true
+   ALERT_TELEGRAM_BOT_TOKEN=your_token
+   ALERT_TELEGRAM_CHAT_ID=your_chat_id
+   ```
 5. Restart the bot
 
 ---
 
-## Daily Usage
+### Step 8 — Enable Live Trading
 
-### Daily Timing Schedule (IST)
+Once you've watched signals for 1–2 weeks and are satisfied:
 
-**Dhan broker (no token refresh needed):**
-
-| Time | Action |
-|---|---|
-| **8:45 AM** | Start bot: `python main.py` |
-| **9:15 AM** | Market opens — gap detector fires, all strategies activate |
-| **9:15–9:30 AM** | Gap Up/Down strategy window (fires if gap > 0.75%) |
-| **9:30–11:30 AM** | ORB (Opening Range Breakout) entry window |
-| **9:15 AM – 3:30 PM** | VWAP & Trend Following active |
-| **3:27 PM** | Bot auto-closes all open positions (3 min before close) |
-| **3:30 PM** | Market closes — no new trades |
-| **5:00 PM – 9:08 AM** | AMO window: gap orders placed for next day open |
-
-**Zerodha broker (daily token refresh required):**
-
-| Time | Action |
-|---|---|
-| **8:45 AM** | Run `get_kite_token.py` — refresh daily access token |
-| **8:55 AM** | Run `python main.py` — start the bot (20 min before open) |
-| **9:15 AM** | Market opens — gap detector fires, all strategies activate |
-| **9:15–9:30 AM** | Gap Up/Down strategy window (fires if gap > 0.75%) |
-| **9:30–11:30 AM** | ORB (Opening Range Breakout) entry window |
-| **9:15 AM – 3:30 PM** | VWAP & Trend Following active |
-| **3:27 PM** | Bot auto-closes all open positions (3 min before close) |
-| **3:30 PM** | Market closes — no new trades |
-
-> The auto-close time is controlled by `TRADING_CLOSE_ALL_BEFORE_MARKET_CLOSE=3` in `.env`.
-
-### Every Morning (Dhan — 8:45 AM IST)
-```powershell
-.venv\Scripts\Activate.ps1
-python main.py   # no token refresh needed until expiry date
+```env
+TRADING_AUTO_TRADE_ENABLED=true
+TRADING_DEFAULT_QUANTITY=65    # NIFTY lot (30 for BANKNIFTY, 20 for SENSEX)
 ```
 
-### When Dhan Token Expires (Check portal for expiry date)
-1. Log in to https://developer.dhanhq.co/apps
-2. Click your app → Click "Regenerate Token" button
-3. Copy the new token → paste into `.env` → `DHAN_ACCESS_TOKEN=...`
-4. Restart the bot
-
-### Every Morning (Zerodha — 8:45 AM IST)
-```powershell
-.venv\Scripts\Activate.ps1
-python get_kite_token.py   # refresh token (run at 8:45 AM)
-python main.py             # start bot   (run at 8:55 AM)
-```
-
-Open: **http://localhost:8000**
-
-### Every Evening (3:35 PM IST)
-```powershell
-# Stop the bot after market close
-Ctrl+C
-```
-
-Or if running in background:
-```powershell
-Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
-```
-
-### Dashboard Overview
-
-**Left — Controls:**
-- Login to Kite, Start/Stop analysis, Analyze Now
-- Symbol Finder with NSE/BSE exchange filter
-
-**Center — Trading Console:**
-- Live chat interface for all commands
-- Quick-action buttons: Status, Analyze, Smart Strikes, Positions, Daily
-
-**Right — Live Statistics:**
-- Trend, current index price, RSI
-- Daily P&L (pulled from Kite API — includes trades from any source)
-- **Best to Trade Today** — real-time NIFTY / BANKNIFTY / SENSEX comparison
-- **Trades Today** — all day trades with OPEN/CLOSED status and individual P&L
-
-### Stop the Bot
-```
-Ctrl+C
-```
+> **Start with 1 lot** (`TRADING_DEFAULT_QUANTITY=65` for NIFTY = 1 lot). Scale up gradually.
 
 ---
 
-## Running Unattended (Background Mode)
+## Daily Startup Schedule (IST)
 
-The bot can run in the background when you lock your screen or step away from your computer.
+| Time | Action |
+|------|--------|
+| **8:45 AM** | `python main.py` |
+| **9:15 AM** | Market opens — Gap strategy fires |
+| **9:15–9:30 AM** | Opening gap window |
+| **9:30–11:30 AM** | ORB entry window |
+| **9:30 AM–2:00 PM** | Auto trend trades |
+| **9:30 AM–2:30 PM** | VWAP mean reversion active |
+| **2:30–3:00 PM** | EOD Closing Momentum window |
+| **3:27 PM** | Bot force-closes all positions |
+| **3:30 PM** | Market closes |
 
-### Quick Start for Unattended Trading
+---
 
-```powershell
-# 1. Disable sleep (one-time setup)
-powercfg /change standby-timeout-ac 0
+## Strategies
 
-# 2. Start the bot
-.\start_bot_background.ps1
+### 1. Gap Up / Gap Down
+Fires once at market open (9:15–9:30 AM). Compares today's open to yesterday's close.
 
-# 3. Minimize the window (don't close it!)
-# 4. Lock your screen (Windows + L)
-# 5. Go anywhere - bot keeps trading! ✅
-```
+| Gap % | Action |
+|-------|--------|
+| > 1.5% up | Buy CE immediately |
+| 0.75–1.5% up | Wait for ORB confirmation |
+| < ±0.75% | No gap trade — normal strategies |
+| 0.75–1.5% down | Wait for ORB confirmation |
+| > 1.5% down | Buy PE immediately |
 
-### Important Requirements
+---
 
-**✅ Bot WILL keep running when you:**
-- Lock your screen (Windows + L)
-- Switch users
-- Minimize the terminal window
-- Step away from your computer
+### 2. Opening Range Breakout (ORB)
+- **Range built**: 9:15–9:30 AM (first 15 minutes)
+- **Entry window**: 9:30–11:30 AM
+- **Requires**: 2 consecutive closes beyond range + volume confirmation
+- **Stop loss**: Opposite end of opening range
+- **Targets**: Range width × 1.5 (T1), × 2.0 (T2)
+- **Guards**: Minimum range width (≥75 pts NIFTY, ≥150 pts BANKNIFTY/SENSEX), trend-direction filter, 15m MTF confluence, RSI extreme filter
+- Max 1 trade per index per day
 
-**⚠️ Bot WILL STOP if you:**
-- Close the terminal window
-- Log out of Windows
-- Computer goes to sleep/hibernate
-- Shut down or restart computer
+---
 
-### Best Practices
+### 3. Trend Following (Auto)
+- Runs every 60 seconds during market hours
+- Uses SMA(20/50), EMA(9/21), RSI(14), MACD, Supertrend, VWAP, Bollinger Bands
+- Only fires when regime confirms a trending market (ADX > 25, Hurst > 0.55)
+- **Cutoff: 14:00 IST** — no new trend auto-entries after 2 PM (thin liquidity)
+- Marks both daily slots on success — max 1 auto-trade per index per session
 
-1. **Disable sleep while plugged in** (one-time setup):
-   ```powershell
-   powercfg /change standby-timeout-ac 0
-   ```
+---
 
-2. **Start bot using the background script**:
-   - Double-click `start_bot_background.ps1` 
-   - Or right-click → "Run with PowerShell"
+### 4. VWAP Mean Reversion
+- Active when regime is **RANGING** or strong trend (ADX > 50) with neutral 5m signal
+- Entry window: 9:30 AM–2:30 PM
+- Requires deviation ≥ **0.6%** from VWAP (tightened from 0.4% to cut noise)
+- RSI confirmation: < **38** for LONG, > **62** for SHORT (tightened from 42/58)
+- Minimum **60% confidence score** required (volume spike or deep RSI extreme)
+- Regime-direction alignment: TRENDING DOWN blocks CE; TRENDING UP blocks PE
+- Max 1 VWAP trade per index per day
 
-3. **Minimize the window** (don't close it!)
+---
 
-4. **Lock your screen** and go anywhere — bot continues trading
+### 5. EOD Closing Momentum *(new)*
+- Fires once between **2:30–3:00 PM** per index per day
+- Reads the last completed **15-minute candle**
+- Requires candle body ≥ **50% of the candle's high-low range** (filters out doji/indecision)
+- Bullish candle → Buy CE; Bearish candle → Buy PE
+- Trend-direction alignment enforced (counter-trend trades blocked)
+- Position exits at 3:27 PM force-close
+- Validated on March 18, 2026: all 3 indices (NIFTY −72 pts, BANKNIFTY −151 pts, SENSEX −209 pts) predicted and traded correctly from the 14:30 candle
 
-5. **Access remotely** (optional - see detailed setup below)
+---
 
-### Remote Access from Mobile/Tablet
+### Strategy Selection by Regime
 
-To monitor your bot from your phone or tablet:
+| Regime | Active Strategies | Max Positions |
+|--------|------------------|---------------|
+| TRENDING UP/DOWN (ADX ≤ 50) | Trend + ORB + Gap + EOD | 2 |
+| TRENDING UP/DOWN (ADX > 50) | Trend + ORB + VWAP + Gap + EOD | 2 |
+| RANGING | VWAP + ORB + Gap + EOD | 2 |
+| VOLATILE | ORB + Gap only | 1 |
 
-**Step 1: Configure Firewall (First-time setup)**
+---
 
-Open PowerShell **as Administrator** and run:
-```powershell
-# Allow port 8000 through Windows Firewall
-New-NetFirewallRule -DisplayName "NIFTY Trading Bot" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
-```
+## Risk Management
 
-**Step 2: Find Your Computer's IP Address**
-```powershell
-# Run this on your PC
-ipconfig
-```
-Look for **IPv4 Address** under your active network adapter (usually starts with `192.168.` or `10.0.`)
+### Entry Guards (False Signal Prevention)
 
-Example output:
-```
-Wireless LAN adapter Wi-Fi:
-   IPv4 Address. . . . . . . . . . . : 192.168.1.100
-```
+| Guard | Where | Detail |
+|-------|-------|--------|
+| Market regime filter | All strategies | Only trades TRENDING/VOLATILE conditions |
+| Trend-direction alignment | ORB, VWAP, EOD | Blocks counter-trend entries |
+| 15m MTF confluence | ORB | 15m candle must agree with ORB direction |
+| RSI extreme filter | ORB | Blocks CE when RSI > 88, PE when RSI < 12 |
+| ORB strength ≥ 75% | ORB | Minimum breakout confidence |
+| ORB strength ≥ 65% (NEUTRAL) | ORB | Relaxed only on NEUTRAL trend days |
+| ORB min range width | ORB | ≥ 75 pts NIFTY / ≥ 150 pts BANKNIFTY/SENSEX |
+| VWAP deviation ≥ 0.6% | VWAP | Was 0.4% — tightened to cut noise |
+| VWAP RSI thresholds 38/62 | VWAP | Was 42/58 — tightened for real extremes |
+| VWAP confidence ≥ 60% | VWAP | Needs volume spike or deep RSI extreme |
+| Auto-trade 14:00 cutoff | Auto | No trend entries after 2 PM |
+| EOD body ≥ 50% | EOD | Doji / indecision candles skipped |
+| 2 consecutive ORB closes | ORB | Requires 2 closes beyond trigger before entry |
+| Strike-loss guard | OrderManager | Blocks re-entry on a strike already lost today |
+| Over-sell guard | OrderManager | Prevents naked shorts |
 
-**Step 3: Access Dashboard from Mobile**
+### Position Limits
 
-1. Make sure your phone/tablet is on the **same Wi-Fi network** as your PC
-2. Open browser on your mobile device
-3. Navigate to: `http://YOUR_PC_IP:8000`
-   - Example: `http://192.168.1.100:8000`
-4. Bookmark it for quick access!
+- Max 2 open positions at any time (`TRADING_MAX_POSITIONS=2`)
+- Both ORB and VWAP slots tracked per-index per-day independently
+- Auto-trade consumes **both** slots on success — no double-entry after SL
+- Max 4 trades per day total across all indices
 
-**Troubleshooting Mobile Access:**
+### Daily P&L Persistence
+Daily P&L is saved to `.daily_pnl.json` on each trade close. Survives bot restarts — the daily loss limit is never reset by restarting.
 
-If you can't connect from mobile:
-- ✅ Verify both devices are on the same Wi-Fi network
-- ✅ Check firewall rule is added (Step 1 above)
-- ✅ Confirm bot is running on your PC
-- ✅ Try accessing from PC first: `http://localhost:8000` (should work)
-- ✅ Disable VPN on either device if active
-- ✅ Restart the bot after adding firewall rule
-
-### Security Tips
-
-- Always lock your screen before leaving (Windows + L)
-- Set a strong Windows password
-- Keep `.env` file secure (contains API credentials)
-- Monitor your bot remotely via the dashboard
+### Exchange-Level Stop Orders (GTT / Forever Orders)
+Every entry automatically places a GTT/Forever Order at the exchange level. These survive bot crashes, internet outages, and system restarts.
 
 ---
 
@@ -391,202 +334,63 @@ If you can't connect from mobile:
 index nifty          Switch to NIFTY 50 (lot: 65)
 index banknifty      Switch to BANK NIFTY (lot: 30)
 index sensex         Switch to SENSEX (lot: 20)
-index                Show current index info
 ```
 
 ### Analysis
 ```
 status               Bot status + current trend
 analyze              Run immediate analysis
-research             Smart strike recommendations (option chain)
+research             Smart strike recommendations
 regime               Market regime: trending / ranging / volatile
-mtf / confluence     Multi-timeframe (5m + 15m + 1h) confluence
-gap                  Today's gap-up/gap-down analysis
+mtf                  Multi-timeframe (5m + 15m + 1h) confluence
+gap                  Today's gap-up/gap-down status
+orb                  Opening Range Breakout levels
+vwap                 VWAP Mean Reversion status
 ```
 
-### Options Trading
+### Trading
 ```
-buy CE [strike] [qty]    Buy Call (deep research runs first)
-buy PE [strike] [qty]    Buy Put (deep research runs first)
-buy CE                   ATM strike selected automatically
+buy CE [strike] [qty]    Buy Call (deep research first)
+buy PE [strike] [qty]    Buy Put (deep research first)
 sell <symbol>            Exit position by symbol
 close all                Close all open positions
 positions                Show open positions
+daily / summary          Today's P&L summary
 ```
 
-### Strike Analysis & Monitoring
+### Strike Monitoring
 ```
-strike 25000 CE 17mar    Analyse 25000 CE expiring 17 Mar
-strike 24900 PE          Analyse put at next expiry
-watch 25000 CE 17mar     Monitor every 30s until stopped
-watch 25000 CE 17mar 60  Monitor every 60s
-stop / unwatch           Stop monitoring
-```
-
-### ORB & VWAP Strategies
-```
-orb                  Opening Range Breakout status / levels
-orb on/off           Enable/disable ORB auto-trading
-vwap                 VWAP Mean Reversion status / levels
-vwap on/off          Enable/disable VWAP auto-trading (RANGING days)
-vwap set dev <N>     Deviation threshold % (default 0.4)
-```
-
-### Stock / Equity (research only, no execution)
-```
-stock RELIANCE       Technical analysis for any stock
-stock HDFCBANK NSE   Specify exchange
-screen bullish       Scan for bullish signals
-screen oversold      RSI < 30 candidates
-screen overbought    RSI > 70 candidates
+strike 25000 CE 17mar    Analyse specific strike
+watch 25000 CE 17mar     Monitor every 30s
+stop                     Stop monitoring
 ```
 
 ### Custom Rules
 ```
-rule list                         Show all rules
 rule add if rsi < 30 then buy ce
-rule add if trend is bearish and rsi > 65 then buy pe
-rule enable / disable <id>        Toggle rule
-rule remove <id>                  Delete rule
-rule help                         Full syntax guide
+rule add if trend is bearish then buy pe
+rule list
+rule enable/disable/remove <id>
 ```
 
-### Advanced Analysis
+### Settings
 ```
-backtest [1m|3m|6m|1y|2y]    Backtest strategy (win rate, Sharpe, drawdown)
-theta <premium> <days>        Theta decay clock for an option
-journal                       Today's session summary
-journal review                Post-market lessons
-journal export                Export to CSV
-```
-
-### Settings & Control
-```
-set sl <pct>       Override stop-loss %
-set target <pct>   Override target %
-pause / resume     Pause/resume auto-trading
+set sl <pct>         Override stop-loss %
+set target <pct>     Override target %
+set qty <n>          Override lot quantity
+pause / resume       Pause/resume auto-trading
+orb on/off           Enable/disable ORB
+vwap on/off          Enable/disable VWAP
 ```
 
----
-
-## Strategies
-
-### 1. Trend Following (default)
-Runs every `TREND_ANALYSIS_INTERVAL_SECONDS`. Uses SMA(20/50), RSI(14), MACD, and EMA(9/21) to detect BULLISH / BEARISH signals. Only trades when the market regime confirms a trending condition.
-
-### 2. Opening Range Breakout (ORB)
-Captures the high/low of the first 15 minutes (9:15–9:30 AM). Trades breakouts with volume confirmation. Entry window: 9:30–11:30 AM. Max 1 trade per day.
-
-### 3. VWAP Mean Reversion
-Active on **RANGING** regime days and on **strong TRENDING days (ADX > 50)** with neutral 5-minute signal. Enters when price deviates >0.4% from VWAP with RSI confirmation. Good for sideways, choppy markets and strong-trend mean-reversion entries.
-
-- On RANGING days: runs independently alongside ORB
-- On TRENDING days (ADX > 50): acts as a **secondary entry** when the 5-minute signal is neutral
-- Regime-direction alignment enforced: TRENDING DOWN only allows PE entry; TRENDING UP only allows CE entry
-- Max 1 VWAP trade per day (2nd slot of the 2-position limit)
-
-### 4. Gap Up / Gap Down (new)
-Runs once daily at market open (9:15–9:30 AM). Detects opening gaps caused by overnight events (global markets, news, geopolitical/war events).
-
-| Gap % | Type | Action |
-|---|---|---|
-| > 1.5% up | Strong Gap Up 🚀 | Buy CE immediately |
-| 0.75–1.5% up | Moderate Gap Up 📈 | Wait for ORB confirmation |
-| < ±0.75% | Neutral ➡️ | Normal ORB / trend strategy |
-| 0.75–1.5% down | Moderate Gap Down 📉 | Wait for ORB confirmation |
-| > 1.5% down | Strong Gap Down 💥 | Buy PE immediately |
-
-Configure thresholds in `.env`:
-```env
-GAP_MIN_GAP_PCT=0.75      # minimum gap to trade
-GAP_STRONG_GAP_PCT=1.5    # threshold for immediate (no-wait) entry
+### Research Tools
 ```
-
-Type `gap` in the chat UI anytime to see today's gap analysis.
-
-### Strategy Selection by Regime
-
-The bot supports **2 simultaneous open positions** — one from ORB and one from VWAP, running independently. `TRADING_MAX_POSITIONS=2` controls this limit.
-
-| Regime | Active Strategies | Max Simultaneous Positions |
-|---|---|---|
-| TRENDING UP/DOWN (ADX ≤ 50) | Trend Following + ORB + Gap | 1 (ORB only) |
-| TRENDING UP/DOWN (ADX > 50) | Trend Following + ORB + **VWAP** + Gap | **2 (ORB + VWAP)** |
-| RANGING | VWAP Mean Reversion + ORB + Gap | **2 (ORB + VWAP)** |
-| VOLATILE | ORB + Gap only (trend-follow paused) | 1 (ORB only) |
-
-> **How 2 simultaneous trades work:** ORB fires in the morning (9:30–11:30 AM) and takes slot 1. VWAP fires later in the day when price deviates >0.4% from VWAP, taking slot 2. Both positions are monitored independently with their own GTT stop-loss orders.
-
----
-
-## Broker Selection
-
-Set `BROKER` in `.env` to choose your broker:
-
-| Broker | Setting | Cost | Auth | GTT / Stop Orders |
-|---|---|---|---|---|
-| **Dhan** (recommended) | `BROKER=dhan` | **Free** | Permanent token — set once | Forever Orders (exchange-level) |
-| **Zerodha** | `BROKER=zerodha` | ₹2,360/month (Kite Connect) | Daily token via `get_kite_token.py` | GTT Orders |
-
-Both brokers implement an identical interface — the rest of the bot is unchanged.
-
-### Switching to Dhan (Free API)
-
-1. Sign up at **https://dhanhq.co/** → open an account
-2. Go to **API portal** → create an app → copy **Client ID** and **Access Token**
-   - Sandbox (for testing, no real money): **https://developer.dhanhq.co**
-   - Live (real trading): **https://developer.dhanhq.co** → Live section
-3. Set in `.env`:
-   ```env
-   BROKER=dhan
-   DHAN_CLIENT_ID=your_client_id
-   DHAN_ACCESS_TOKEN=your_permanent_token
-   DHAN_PASSWORD=your_dhan_account_password
-   DHAN_PORTAL_URL=https://developer.dhanhq.co
-   ```
-4. `pip install dhanhq` (already in `requirements.txt`)
-5. Start the bot normally — no token refresh script needed
-
-> The Dhan instrument master CSV is downloaded automatically on first run each day and cached at `browser/.dhan_instruments.csv` (18,000+ FNO entries).
-
-> **Token regeneration**: Dhan tokens are long-lived (~1 year). If your token ever expires or is revoked, run `python get_dhan_token.py` to auto-regenerate it — no manual copy-paste needed.
-
-### AMO (After Market Orders) — Dhan
-
-With Dhan, the bot can place orders outside market hours for execution at the next open:
-
-| Window | Type |
-|---|---|
-| 17:00 – 23:59 (evening) | AMO window |
-| 00:00 – 09:08 (overnight/morning) | AMO window |
-| 09:15 – 15:30 | Normal intraday orders |
-
-Enable in `.env`:
-```env
-TRADING_AMO_ENABLED=true
+backtest [1m|3m|6m]  Backtest strategy (win rate, Sharpe)
+theta <premium> <days>   Theta decay clock
+stock RELIANCE       Stock technical analysis
+screen bullish       Scan for bullish stocks
+journal              Today's session summary
 ```
-
-AMO orders are placed as `CNC` product type with `after_market_order=True`. They execute at market open. Stop-loss / target are set via **Forever Orders** (Dhan's exchange-level GTT equivalent) placed alongside.
-
-### Forever Orders (Dhan GTT)
-
-Dhan uses **Forever Orders** as the equivalent of Zerodha GTT. They are placed at the exchange level and survive bot restarts, internet outages, and system crashes. The bot automatically places a Forever Order for stop-loss whenever a position is opened.
-
----
-
-### Kite API — Execution Modes (Zerodha only)
-
-The bot supports two order execution modes when `BROKER=zerodha`:
-
-| Mode | Setting | Description |
-|---|---|---|
-| **Kite API** (recommended) | `KITE_USE_KITE_API=true` | Official REST API, reliable, real P&L |
-| **Browser Automation** (fallback) | `KITE_USE_KITE_API=false` | Playwright-driven, less reliable |
-
-**Symbol format** is built automatically per index and expiry type:
-- NIFTY/SENSEX weekly: `NIFTY{YY}{month_code}{DD}{strike}{CE|PE}` (e.g. `NIFTY26317CE24000`)
-- BANKNIFTY monthly: `BANKNIFTY{DD}{MON}{YY}{strike}{CE|PE}` (e.g. `BANKNIFTY25MAR2648000CE`)
-- SENSEX uses `BFO` exchange; NIFTY/BANKNIFTY use `NFO`
 
 ---
 
@@ -594,114 +398,102 @@ The bot supports two order execution modes when `BROKER=zerodha`:
 
 ```
 nifty-trading-bot/
-├── main.py                       # Entry point
-├── config.py                     # All configuration (Dhan, Zerodha, Trading, Gap, etc.)
-├── get_kite_token.py             # Zerodha only: automated daily token refresher
-├── get_dhan_token.py             # Dhan: regenerate access token (rarely needed)
+├── main.py                     # Entry point (single-instance guard on port 8000)
+├── config.py                   # All configuration (Dhan, Zerodha, Trading, VWAP, ORB, EOD, Gap)
 ├── requirements.txt
-├── .env                          # Credentials & settings (never commit)
-├── pytest.ini                    # Test config (asyncio_mode=auto)
+├── .env                        # Credentials & settings (never commit)
+├── pytest.ini                  # asyncio_mode=auto
 ├── README.md
 ├── bot/
-│   ├── engine.py                 # Core orchestration engine (broker-agnostic)
-│   ├── trend_analyzer.py         # Technical analysis (SMA/RSI/MACD)
-│   ├── order_manager.py          # Order execution, risk management, AMO window
-│   ├── index_config.py           # Index configs (NIFTY / BANKNIFTY / SENSEX)
-│   ├── market_research.py        # Smart strike and stock analysis
-│   ├── instructions.py           # Custom rules engine
-│   ├── backtester.py             # Strategy backtesting
-│   ├── market_regime.py          # Regime detection (ADX + ATR + Hurst)
-│   ├── multi_timeframe.py        # Multi-timeframe confluence (5m/15m/1h)
-│   ├── orb_strategy.py           # Opening Range Breakout strategy
-│   ├── vwap_strategy.py          # VWAP Mean Reversion strategy
-│   ├── gap_detector.py           # Gap up/gap-down detection & trading
-│   ├── theta_clock.py            # Theta decay calculator
-│   ├── trade_journal.py          # Trade history and reporting
-│   ├── nse_scraper.py            # NSE option chain data
-│   └── bse_scraper.py            # BSE/SENSEX option chain data
+│   ├── engine.py               # Core orchestration: 5 strategies, 3-index scan, daily slots
+│   ├── trend_analyzer.py       # 15-indicator trend scoring with adaptive ATR threshold
+│   ├── order_manager.py        # Orders, risk, daily P&L persistence, GTT, AMO
+│   ├── orb_strategy.py         # ORB strategy with min range width + 2-close confirmation
+│   ├── vwap_strategy.py        # VWAP Mean Reversion (tightened thresholds)
+│   ├── gap_detector.py         # Gap up/down detection & trading
+│   ├── market_regime.py        # Regime detection (ADX + ATR + Hurst exponent)
+│   ├── multi_timeframe.py      # Multi-timeframe confluence (5m/15m/1h)
+│   ├── index_config.py         # NIFTY / BANKNIFTY / SENSEX configs
+│   ├── market_research.py      # Smart strike and stock analysis
+│   ├── instructions.py         # Custom rules engine
+│   ├── backtester.py           # Strategy backtesting (7-indicator scoring)
+│   ├── theta_clock.py          # Theta decay calculator
+│   ├── trade_journal.py        # Trade history and reporting
+│   ├── nse_scraper.py          # NSE option chain data
+│   └── bse_scraper.py          # BSE/SENSEX option chain data
 ├── browser/
-│   ├── dhan.py                   # DhanBroker: Dhan API, Forever Orders, AMO
-│   ├── zerodha.py                # ZerodhaKite: Kite API + browser automation fallback
-│   ├── factory.py                # create_broker() — returns DhanBroker or ZerodhaKite
-│   └── .dhan_instruments.csv     # Dhan FNO instrument master (auto-refreshed daily)
+│   ├── dhan.py                 # DhanBroker: Dhan API, Forever Orders, AMO
+│   ├── zerodha.py              # ZerodhaKite: Kite API + browser automationfallback
+│   └── factory.py              # create_broker()
 ├── tests/
-│   ├── test_zerodha.py           # 47 unit tests (Kite API + browser modes)
-│   └── test_dhan_order_flows.py  # 8 unit tests (Dhan orders, AMO, symbol matching)
-└── web/
-    ├── app.py                    # FastAPI REST endpoints
-    ├── websocket.py              # WebSocket for real-time chat
-    └── static/
-        └── index_v2.html           # Dashboard UI (shows broker badge: Dhan / Kite)
+│   ├── test_dhan_order_flows.py   # 8 Dhan tests
+│   ├── test_gtt_flows.py          # GTT / Forever Order tests
+│   └── test_zerodha.py            # 47 Zerodha tests
+├── web/
+│   ├── app.py                  # FastAPI REST endpoints
+│   ├── websocket.py            # WebSocket real-time chat
+│   └── static/index_v2.html   # Dashboard UI
+└── journals/                   # Daily trade logs (JSON)
 ```
 
 ---
 
-## Features
+## Daily Usage
 
-### Multi-Index Support
-- Switch between NIFTY 50, BANK NIFTY, and SENSEX at runtime
-- Correct lot sizes applied automatically (65 / 30 / 20)
-- Correct strike intervals and expiry days per index
-- Live index comparison with auto-switch option
+### Start the Bot
+```powershell
+.venv\Scripts\Activate.ps1
+python main.py
+```
 
-### Free Broker Support (Dhan)
-- Dhan API is completely free — no monthly subscription
-- Permanent access token — set once, never refresh
-- Instrument master auto-downloaded daily (18,000+ FNO entries)
-- Flexible symbol matching handles all Dhan compact/dash option formats
-- Security-ID cache ensures correct strikes for GTT and exit orders
+### At End of Day
+```
+Ctrl+C
+```
 
-### Real P&L and Trade Tracking
-- Daily P&L pulled from Kite API — reflects **all** trades including manual Kite web trades
-- Trades Today panel shows every day trade (open + closed) with individual P&L
-- Position count matches Kite's own Positions counter
+Or if running in background:
+```powershell
+Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
+```
 
-### Safety Guardrails
-- Daily loss limit, per-trade loss limit, max open positions
-- Max trades per day, pause after N consecutive losses
-- Auto-close all positions before market close
+### Zerodha — Daily Token Refresh (8:45 AM)
+```powershell
+.venv\Scripts\Activate.ps1
+python get_kite_token.py   # automated: logs in, does 2FA, writes token to .env
+python main.py
+```
 
-### Smart Exits
-- Trailing stop loss (percentage-based, trails from peak)
-- Profit tiers (partial exits at two configurable levels)
-- RSI market filter, volatility filter, avoid low-volume hours
+### Dhan — Token Expiry
+Dhan tokens are long-lived (~1 year). When expired:
+1. Log in to **https://developer.dhanhq.co**
+2. Click your app → **Regenerate Token**
+3. Update `DHAN_ACCESS_TOKEN` in `.env`
+4. Restart the bot
 
-### Gap Strategy
-- Detects gap-up/gap-down at market open
-- Immediate entry on strong gaps (>1.5%); ORB confirmation on moderate gaps
-- Fires once per trading day, resets automatically at midnight
-- Configurable thresholds and position sizing multiplier
+---
 
-### Deep Research Before Every Trade
-- Option chain analysis (OI, PCR, IV estimation)
-- Conservative / Moderate / Aggressive strike recommendations
-- Strike-level GO / NO-GO with confidence score
-- NSE real option chain data when available
+## Running Unattended
 
-### Advanced Analysis Tools
-- Market regime detection (trending / ranging / volatile, using ADX + Hurst exponent)
-- Multi-timeframe confluence (5m + 15m + 1h must all agree)
-- Strategy backtesting with win rate, profit factor, Sharpe ratio
-- Theta decay clock
-- Trade journal with daily review and CSV export
+```powershell
+# Prevent sleep while plugged in (one-time)
+powercfg /change standby-timeout-ac 0
 
-### Automated Daily Token Refresh (Zerodha only)
-- `get_kite_token.py` runs headless Playwright to log in, complete 2FA (PIN or TOTP), and auto-update `.env`
-- No manual copy-paste required
-- **Not needed for Dhan** — Dhan tokens are permanent
-- Run once every morning before 9:15 AM IST (Zerodha users)
+# Start background script
+.\start_bot_background.ps1
+```
 
-### AMO (After Market Orders)
-- Place gap-strategy orders in the evening for next-day market-open execution
-- AMO window: **17:00–23:59** and **00:00–09:08** IST (weekdays)
-- Orders execute at market open alongside a Forever Order stop-loss
-- Controlled by `TRADING_AMO_ENABLED=true` in `.env`
-- Supported on Dhan only
+Lock your screen — the bot keeps running.
 
-### Alerts
-- Telegram notifications (trade entry, exit, gap alerts, P&L updates)
-- Daily report at market close
-- Real-time WebSocket dashboard updates
+### Mobile Access
+
+```powershell
+# Allow port (run as Administrator, one-time)
+New-NetFirewallRule -DisplayName "NIFTY Trading Bot" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+```
+
+Find your PC's IP: `ipconfig` → look for **IPv4 Address** (e.g. `192.168.1.100`)
+
+From your phone (same Wi-Fi): `http://192.168.1.100:8000`
 
 ---
 
@@ -709,29 +501,29 @@ nifty-trading-bot/
 
 ```powershell
 .venv\Scripts\Activate.ps1
-python -m pytest tests/ -v
+pip install pytest pytest-asyncio   # one-time
+pytest tests/ -v
 ```
 
-**55 tests total** across two test files:
+**55 tests — all passing ✅**
 
-`tests/test_zerodha.py` — **47 tests**:
-- Kite API initialization (key/token, missing credentials)
-- `_build_option_symbol` for all indices and month codes
-- `place_order` — buy/sell, NFO/BFO exchange, no `price` on MARKET orders
-- `get_positions` / `close_position` via API and browser
-- `get_instrument_price`, `get_holdings`
-- Order routing (API vs browser fallback)
-- Browser login/logout, initialize skip in API mode
+| Test File | Tests | Coverage |
+|-----------|-------|---------|
+| `test_dhan_order_flows.py` | 8 | Dhan orders, GTT, AMO, symbol matching, SL logic, profit tiers |
+| `test_gtt_flows.py` | — | Forever Order flows |
+| `test_zerodha.py` | 47 | Kite API, browser fallback, symbol building, position tracking |
 
-`tests/test_dhan_order_flows.py` — **8 tests**:
-- `test_place_order` — correct security ID, exchange, INTRADAY, MARKET, qty
-- `test_gtt_place` — Forever Order trigger/limit prices, SELL INTRADAY
-- `test_gtt_cancel` — `cancel_forever_order` called with correct ID
-- `test_close_position` — SELL MARKET, correct quantity
-- `test_stop_loss_logic` — SL −20%, target +35%, trailing SL, no false trigger
-- `test_profit_tiers` — Tier 1 +20% exit 50%, Tier 2 +30% after Tier 1
-- `test_amo_order` — 18:30/08:00 = AMO, 10:30 = not AMO; `after_market_order=True` + `CNC` sent; `OrderManager` AMO bypass
-- `test_symbol_matching` — all 5 symbol format variants; cache-first priority; map fallback
+---
+
+## Broker Comparison
+
+| Feature | Dhan | Zerodha |
+|---------|------|---------|
+| API Cost | **Free** | ₹2,360/month |
+| Token refresh | Long-lived (~1 year) | Daily via `get_kite_token.py` |
+| GTT/Stop orders | ✅ Forever Orders | ✅ GTT Orders |
+| AMO orders | ✅ Supported | ❌ Not implemented |
+| Recommended for | All users | High-volume / existing Zerodha users |
 
 ---
 
@@ -739,216 +531,108 @@ python -m pytest tests/ -v
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/status` | Bot state, P&L, position count (from Kite) |
-| GET | `/api/positions` | Open positions (from Kite net positions) |
-| GET | `/api/trades` | All day trades with OPEN/CLOSED status |
-| GET | `/api/compare-indices` | NIFTY vs BANKNIFTY vs SENSEX comparison |
-| GET | `/api/symbols` | Symbol search for auto-suggest |
-| POST | `/api/login` | Trigger Kite login |
+| GET | `/api/status` | Bot state, P&L, positions |
+| GET | `/api/positions` | Open positions |
+| GET | `/api/trades` | All day trades |
+| GET | `/api/compare-indices` | NIFTY vs BANKNIFTY vs SENSEX |
+| POST | `/api/login` | Trigger broker login |
 | POST | `/api/start` | Start analysis loop |
 | POST | `/api/stop` | Stop analysis loop |
-| POST | `/api/command` | Execute a trading command |
+| POST | `/api/command` | Execute chat command |
+| WS | `/ws` | WebSocket live chat |
 | GET | `/health` | Health check |
-| WS | `/ws` | WebSocket for live chat |
 
 ---
 
-## Troubleshooting
-
-### `ModuleNotFoundError`
-```powershell
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### Bot will not start
-1. Activate venv first
-2. Check `python --version` — must be 3.10+
-3. Reinstall: `pip install -r requirements.txt`
-
-### Port 8000 in use
-```powershell
-taskkill /F /IM python.exe /T
-Start-Sleep -Seconds 2
-python main.py
-```
-
-### Kite token expired / `Incorrect api_key or access_token` (Zerodha only)
-```powershell
-python get_kite_token.py   # fully automated — no manual steps
-python main.py             # restart bot
-```
-
-Make sure `ZERODHA_PIN` (or `ZERODHA_TOTP_SECRET`) is set in `.env`.
-
-### Dhan `401 Unauthorized` / token error
-- Your Dhan access token may have expired or been revoked
-- Run the automated token refresher:
-  ```powershell
-  python get_dhan_token.py
-  python main.py
-  ```
-- Or regenerate manually: log in at **https://developer.dhanhq.co** → generate a new token → update `DHAN_ACCESS_TOKEN` in `.env`
-
-### P&L shows 0 or wrong value
-- Ensure broker API is connected (status badge shows green — **Dhan: Online** or **Kite: Online**)
-- P&L is fetched live from the broker — requires a valid access token
-
-### Trades Today panel is empty
-- Trades appear only for the current trading day
-- Requires a valid broker API connection
-
-### No trades executing
-1. Check `TRADING_AUTO_TRADE_ENABLED=true` in `.env`
-2. Verify daily loss limit has not been hit
-3. Check market hours (9:15 AM – 3:30 PM IST, weekdays only)
-4. Check bot logs or Telegram for error messages
-
-### Gap trade not firing
-- Ensure `GAP_ENABLED=true` in `.env`
-- Gap check only runs between 9:15–9:30 AM IST
-- If gap is < `GAP_MIN_GAP_PCT` (0.75%), it is classified as NEUTRAL — no trade
-
-### Browser Automation (Fallback)
-Set `KITE_USE_KITE_API=false` to use Playwright browser automation.
-This mode does **not** support real P&L or position fetching from Kite.
-Use only if Kite API setup is unavailable.
-
----
-
-## Technical Indicators Reference
+## Technical Indicators
 
 | Indicator | Period | Use |
 |-----------|--------|-----|
-| SMA(20) | 20 candles | Short-term trend |
-| SMA(50) | 50 candles | Long-term trend |
-| RSI | 14 candles | Overbought (>70) / Oversold (<30) |
+| SMA | 20 / 50 | Trend direction |
+| EMA | 9 / 21 | Fast momentum |
+| RSI | 14 | Overbought/oversold |
 | MACD | 12/26/9 | Momentum |
-| ATR | 14 candles | Volatility |
-| ADX | 14 candles | Trend strength (regime detection) |
-| Hurst Exponent | 60 days | Trending vs mean-reverting |
-| Bollinger Bands | 20/2σ | Support / Resistance |
-
-**Trend logic:**
-- **BULLISH**: SMA(20) > SMA(50), RSI < 70, EMA(9) > EMA(21)
-- **BEARISH**: SMA(20) < SMA(50), RSI > 30, EMA(9) < EMA(21)
-- **NEUTRAL**: Mixed signals
-
-**Regime logic:**
-- **TRENDING**: ADX > 25, Hurst > 0.55
-- **RANGING**: ADX < 20, Hurst < 0.45
-- **VOLATILE**: High ATR percentile, no clear direction
+| Bollinger Bands | 20 / 2σ | Support/resistance |
+| ATR | 14 | Volatility (adaptive threshold) |
+| Supertrend | 10 / 3.0 | Trend confirmation |
+| VWAP | Intraday | Institutional price reference |
+| ADX | 14 | Trend strength (regime) |
+| Hurst exponent | 60 days | Trending vs mean-reverting |
 
 ---
 
 ## Capital Requirements
 
-| Risk Level | Capital | Settings |
-|---|---|---|
-| Conservative (recommended to start) | ₹75,000+ | `MAX_POSITIONS=2`, `MAX_DAILY_LOSS=5000` |
-| Moderate | ₹1,50,000+ | Default `.env` settings |
-| Aggressive | ₹2,50,000+ | Default + increase position limits |
+| Mode | Capital | Settings |
+|------|---------|---------|
+| Testing / watch-only | Any | `TRADING_AUTO_TRADE_ENABLED=false` |
+| Conservative (start here) | ₹30,000+ | 1 lot, `MAX_DAILY_LOSS=2000` |
+| Normal | ₹75,000+ | 1 lot per index, default settings |
+| Aggressive | ₹1,50,000+ | 2 positions, higher limits |
 
-### Start Conservatively (recommended first week)
-
-When going live, start with minimal risk settings:
-
+**Recommended first week `.env`:**
 ```env
 TRADING_AUTO_TRADE_ENABLED=true
-TRADING_DEFAULT_QUANTITY=1         # Start with 1 lot only
-TRADING_MAX_POSITIONS=1            # Limit to 1 position
-TRADING_MAX_LOSS_PER_TRADE=1000    # Lower loss limit
-TRADING_MAX_DAILY_LOSS=2000        # Lower daily limit
+TRADING_DEFAULT_QUANTITY=65      # 1 NIFTY lot
+TRADING_MAX_POSITIONS=1
+TRADING_MAX_LOSS_PER_TRADE=1000
+TRADING_MAX_DAILY_LOSS=2000
 ```
-
-**Capital needed:** ₹20,000–₹30,000
-
-### Gradually Scale Up (after 5-10 successful days)
-
-Once you've verified the bot works correctly with your broker and you're comfortable with the strategy:
-
-```env
-TRADING_DEFAULT_QUANTITY=65        # Full NIFTY lot (or 30 for BANKNIFTY, 20 for SENSEX)
-TRADING_MAX_POSITIONS=2            # Back to default
-TRADING_MAX_LOSS_PER_TRADE=2500    # Normal limits
-TRADING_MAX_DAILY_LOSS=5000        # Normal daily limit
-```
-
-**Capital needed:** ₹75,000+
-
-> **Start conservative.** Run in signal-only mode (`TRADING_AUTO_TRADE_ENABLED=false`) for 2–4 weeks, review journal, then enable live trading with 1 lot. Scale up gradually after consistent success.
-
 
 ---
 
-## Testing & Validation
+## Troubleshooting
 
-All core functionality is covered by automated tests:
-
-```powershell
-pytest tests/ -v
-```
-
-**Test Coverage (55 tests passing):**
-- ✅ Dhan broker: Order placement, GTT (Forever Orders), position management, AMO orders
-- ✅ Zerodha broker: API mode, browser fallback, symbol matching, position tracking
-- ✅ All order flows validated with mocked broker responses
-
-**Latest Test Run:** March 15, 2026 — **55/55 PASSED** ✅
-
----
-
-## Broker Comparison
-
-| Feature | Dhan | Zerodha |
-|---|---|---|
-| **API Cost** | Free 🎉 | ₹2,360/month |
-| **Token Refresh** | Manual (expires ~monthly) | Daily (8:45 AM) |
-| **Token Script** | Manual copy from portal | `get_kite_token.py` (automated) |
-| **GTT Orders** | ✅ Supported | ✅ Supported |
-| **AMO Orders** | ✅ Supported | ❌ Not implemented yet |
-| **Position Tracking** | Real-time via API | Real-time via API |
-| **Recommended For** | All users (cost-effective) | High-volume traders |
-
-**Currently Active:** Dhan (set in `.env` as `BROKER=dhan`)
+| Problem | Fix |
+|---------|-----|
+| `ModuleNotFoundError` | `pip install -r requirements.txt` |
+| Port 8000 in use | `taskkill /F /IM python.exe /T` then restart |
+| Dhan 401 Unauthorized | Regenerate token at developer.dhanhq.co |
+| Zerodha token expired | `python get_kite_token.py`, ensure `ZERODHA_PIN` is set |
+| No trades executing | Check `TRADING_AUTO_TRADE_ENABLED=true`, market hours, daily loss limit |
+| Gap trade not firing | Ensure `GAP_ENABLED=true`, check logs — fires only 9:15–9:30 AM |
+| EOD trade not firing | Check `EOD_ENABLED=true`, ensure the 14:30 candle body ≥ 50% |
+| P&L shows wrong value | Verify broker API connection (green badge in dashboard) |
+| `asyncio` test errors | `pip install pytest-asyncio` |
+| PowerShell script blocked | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
 
 ---
 
-## File Structure
+## Changelog
 
-```
-nifty-trading-bot/
-├── .env                    # Configuration (never commit!)
-├── main.py                 # Bot entry point
-├── config.py               # Settings loader
-├── get_kite_token.py       # Zerodha token refresh (automated)
-├── requirements.txt        # Python dependencies
-├── README.md              # This file
-├── bot/                   # Trading strategies & logic
-│   ├── engine.py          # Main trading engine
-│   ├── gap_detector.py    # Gap up/down strategy
-│   ├── orb_strategy.py    # Opening Range Breakout
-│   ├── vwap_strategy.py   # VWAP mean reversion
-│   ├── trend_analyzer.py  # Trend detection
-│   ├── market_regime.py   # Regime classification
-│   ├── multi_timeframe.py # MTF confluence
-│   ├── backtester.py      # Strategy backtesting
-│   ├── order_manager.py   # Order execution logic
-│   ├── trade_journal.py   # Session logging
-│   └── ...
-├── browser/               # Broker integrations
-│   ├── dhan.py           # Dhan API wrapper
-│   ├── zerodha.py        # Zerodha Kite Connect + browser
-│   └── factory.py        # Broker factory
-├── web/                   # Web dashboard
-│   ├── app.py            # FastAPI server
-│   ├── websocket.py      # Real-time updates
-│   └── static/           # HTML/JS UI
-├── tests/                 # Automated test suite
-│   ├── test_dhan_order_flows.py      # Dhan tests
-│   └── test_zerodha.py               # Zerodha tests
-└── journals/              # Daily trade logs (JSON)
-```
+### March 2026 — Session Quality Overhaul
+
+**Bug fixes (runtime crashes):**
+- Fixed `AttributeError` when typing `screenshot` command (Dhan has no `get_screenshot()`)
+- Fixed `AttributeError` on `/api/login` endpoint — Dhan uses API key, no interactive login needed
+- `order_manager.py` no longer imports `ZerodhaKite` at startup when `BROKER=dhan` (was loading Playwright unnecessarily)
+
+**Dead code removed:**
+- `get_kite_token.py` deleted (Kite OAuth script — dead for Dhan)
+- `monitor.py` deleted (duplicate of `watchdog_monitor.py`)
+- `DailyStats.gross_pnl` field removed (was declared but never written)
+- `TrendAnalyzer.get_last_signal()` removed (was never called)
+- `backtester._compute_signal()`: removed two `False # stoch_rsi placeholder` entries; divisor corrected `/8 → /7`
+- `theta_clock.calculate()`: removed unused `iv_pct` parameter; removed unreachable `else time_value` branch
+
+**False-entry prevention:**
+- VWAP deviation threshold: `0.4%` → **`0.6%`** (0.4% = 92 pts at NIFTY 23k — pure noise)
+- VWAP RSI oversold/overbought: `42/58` → **`38/62`** (42/58 was nearly neutral, not an extreme)
+- VWAP minimum confidence gate: **60% required** (ensures volume spike or deep RSI, not just threshold crossing)
+- Auto-trend-trade **14:00 IST cutoff**: no new trend entries after 2 PM (thin liquidity, time-stop kills them anyway)
+- Auto-trend-trade now marks **both ORB and VWAP slots** on success (prevents a second sequential auto-entry after SL)
+- ORB minimum opening range width: **≥75 pts NIFTY / ≥150 pts BANKNIFTY/SENSEX** (sub-threshold ranges are coin-flips)
+
+**New strategy — EOD Closing Momentum:**
+- Fires once per index between 14:30–15:00 IST
+- Reads the last completed 15-minute candle
+- Requires candle body ≥ 50% of high-low range (doji/indecision candles skipped)
+- Trend-direction alignment enforced (counter-trend blocked)
+- Validated March 18, 2026: NIFTY −72 pts, BANKNIFTY −151 pts, SENSEX −209 pts — all 3 correct from 14:30 candle
+
+**Daily P&L persistence:**
+- P&L now saved to `.daily_pnl.json` on every trade close
+- Bot restart no longer resets daily P&L to zero (was a loophole for the daily loss limit)
 
 ---
 
@@ -959,5 +643,4 @@ nifty-trading-bot/
 - Trading is risky — you can lose money
 - Past performance does not guarantee future results
 - The authors are NOT responsible for financial losses
-- Always test with paper trading before enabling live trades
-
+- Always test in signal-only mode (`TRADING_AUTO_TRADE_ENABLED=false`) for at least 1–2 weeks before enabling live trades

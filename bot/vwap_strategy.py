@@ -189,6 +189,30 @@ class VWAPStrategy:
             )
             return signal
 
+        # ── Neither condition met — log why for diagnostics ──────────────────
+        # Throttle to once per 10 minutes to avoid log spam
+        _now_min = now.hour * 60 + now.minute
+        _last_log = getattr(self, '_last_no_signal_log_min', -999)
+        if _now_min - _last_log >= 10:
+            self._last_no_signal_log_min = _now_min
+            if self._long_fired and self._short_fired:
+                logger.debug(f"VWAP [{self._index.display_name}]: both signals already fired today")
+            else:
+                reasons = []
+                if deviation_pct > -cfg.deviation_pct and not self._long_fired:
+                    reasons.append(f"dev={deviation_pct:+.2f}% (need <-{cfg.deviation_pct:.1f}%)")
+                if deviation_pct <= -cfg.deviation_pct and rsi >= cfg.rsi_oversold and not self._long_fired:
+                    reasons.append(f"RSI={rsi:.0f} not oversold (need <{cfg.rsi_oversold:.0f})")
+                if deviation_pct < cfg.deviation_pct and not self._short_fired:
+                    reasons.append(f"dev={deviation_pct:+.2f}% (need >+{cfg.deviation_pct:.1f}%)")
+                if deviation_pct >= cfg.deviation_pct and rsi <= cfg.rsi_overbought and not self._short_fired:
+                    reasons.append(f"RSI={rsi:.0f} not overbought (need >{cfg.rsi_overbought:.0f})")
+                logger.debug(
+                    f"VWAP [{self._index.display_name}]: no signal — "
+                    f"price={price:.0f} vwap={vwap:.0f} dev={deviation_pct:+.2f}% rsi={rsi:.0f} | "
+                    + ("; ".join(reasons) if reasons else "conditions not met")
+                )
+
         return None
 
     def get_status(self) -> Dict:

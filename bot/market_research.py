@@ -832,7 +832,8 @@ class MarketResearch:
         spot_price: float,
         trend: str,
         trend_strength: float,
-        rsi: float
+        rsi: float,
+        strike_interval: int = 50,
     ) -> OptionChainAnalysis:
         """
         Analyze option chain and provide smart strike recommendations.
@@ -852,7 +853,6 @@ class MarketResearch:
         Returns:
             OptionChainAnalysis with recommendations
         """
-        strike_interval = 50
         atm_strike = round(spot_price / strike_interval) * strike_interval
         
         # Estimate support/resistance based on round numbers and ATM

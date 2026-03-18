@@ -163,7 +163,6 @@ class StrategyBacktester:
             row["Close"] > row["sma_short"],
             row["Close"] > row["vwap"],
             row["st_dir"] == 1,
-            False  # stoch_rsi placeholder
         ])
         bearish = sum([
             row["sma_short"] <= row["sma_long"],
@@ -173,14 +172,13 @@ class StrategyBacktester:
             row["Close"] <= row["sma_short"],
             row["Close"] <= row["vwap"],
             row["st_dir"] != 1,
-            False
         ])
 
         if bullish >= 5 and row["rsi"] <= self._rsi_overbought:
-            strength = min(int(bullish / 8 * 100), 100)
+            strength = min(int(bullish / 7 * 100), 100)
             return ("CE", strength)
         elif bearish >= 5 and row["rsi"] >= self._rsi_oversold:
-            strength = min(int(bearish / 8 * 100), 100)
+            strength = min(int(bearish / 7 * 100), 100)
             return ("PE", strength)
         return (None, 50)
 
