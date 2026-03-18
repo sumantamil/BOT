@@ -174,10 +174,15 @@ class TrendConfig(BaseSettings):
 class AlertConfig(BaseSettings):
     """Phase 3: Notifications and alerts configuration"""
     
-    # Telegram Bot
+    # Telegram Bot (primary)
     telegram_enabled: bool = Field(default=False, description="Enable Telegram notifications")
     telegram_bot_token: str = Field(default="", description="Telegram Bot API token")
     telegram_chat_id: str = Field(default="", description="Telegram chat ID for notifications")
+
+    # Telegram Bot (secondary — optional second channel/user)
+    telegram2_enabled: bool = Field(default=False, description="Enable secondary Telegram notifications")
+    telegram2_bot_token: str = Field(default="", description="Secondary Telegram Bot API token (can reuse primary bot)")
+    telegram2_chat_id: str = Field(default="", description="Secondary Telegram chat ID for notifications")
     
     # Email
     email_enabled: bool = Field(default=False, description="Enable email notifications")

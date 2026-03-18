@@ -172,36 +172,44 @@ class TradingBot:
                 logger.error(f"Callback error: {e}")
     
     async def _send_telegram_alert(self, message: str, alert_type: str = "info"):
-        """Send alert to Telegram"""
-        if not self.config.alert.telegram_enabled:
-            return
-        
-        if not self.config.alert.telegram_bot_token or not self.config.alert.telegram_chat_id:
-            logger.warning("Telegram not properly configured")
-            return
-        
-        try:
-            bot_token = self.config.alert.telegram_bot_token
-            chat_id = self.config.alert.telegram_chat_id
+        """Send alert to primary (and optional secondary) Telegram channel"""
+        async def _post(bot_token: str, chat_id: str, label: str) -> None:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url,
-                    json={
-                        "chat_id": chat_id,
-                        "text": message,
-                    },
-                    timeout=10
-                )
-                
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        url,
+                        json={"chat_id": chat_id, "text": message},
+                        timeout=10,
+                    )
                 if response.status_code != 200:
-                    logger.error(f"Telegram send failed: {response.status_code} - {response.text}")
+                    logger.error(f"Telegram {label} send failed: {response.status_code} - {response.text}")
                 else:
-                    logger.debug(f"Telegram alert sent: {alert_type}")
-                    
-        except Exception as e:
-            logger.error(f"Error sending Telegram alert: {e}")
+                    logger.debug(f"Telegram {label} alert sent: {alert_type}")
+            except Exception as e:
+                logger.error(f"Error sending Telegram {label} alert: {e}")
+
+        # Primary channel
+        if self.config.alert.telegram_enabled:
+            if not self.config.alert.telegram_bot_token or not self.config.alert.telegram_chat_id:
+                logger.warning("Primary Telegram not properly configured")
+            else:
+                await _post(
+                    self.config.alert.telegram_bot_token,
+                    self.config.alert.telegram_chat_id,
+                    "primary",
+                )
+
+        # Secondary channel
+        if self.config.alert.telegram2_enabled:
+            if not self.config.alert.telegram2_bot_token or not self.config.alert.telegram2_chat_id:
+                logger.warning("Secondary Telegram not properly configured")
+            else:
+                await _post(
+                    self.config.alert.telegram2_bot_token,
+                    self.config.alert.telegram2_chat_id,
+                    "secondary",
+                )
     
     async def initialize(self):
         """Initialize all bot components"""
