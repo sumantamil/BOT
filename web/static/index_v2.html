@@ -1530,6 +1530,69 @@
                         </div>
                     </div>
 
+                    <!-- Paper Trading Panel -->
+                    <div class="stats-section" id="paperTradingSection">
+                        <div class="stats-section-title">
+                            <span>📋</span> Paper Trading
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">💰</span>
+                                <span class="stat-label">Paper P&amp;L</span>
+                            </div>
+                            <span class="stat-value" id="paperPnl">₹0</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">🎯</span>
+                                <span class="stat-label">Win Rate</span>
+                            </div>
+                            <span class="stat-value" id="paperWinRate">0%</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">📊</span>
+                                <span class="stat-label">Trades</span>
+                            </div>
+                            <span class="stat-value" id="paperTrades">0</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">🔄</span>
+                                <span class="stat-label">Open</span>
+                            </div>
+                            <span class="stat-value" id="paperOpen">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Market Overview Panel -->
+                    <div class="stats-section">
+                        <div class="stats-section-title">
+                            <span>🌡️</span> Market Overview
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">⚡</span>
+                                <span class="stat-label">India VIX</span>
+                            </div>
+                            <span class="stat-value" id="indiaVix">—</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">📐</span>
+                                <span class="stat-label">Regime</span>
+                            </div>
+                            <span class="stat-value neutral" id="marketRegime">—</span>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-card-header">
+                                <span class="stat-icon">🎲</span>
+                                <span class="stat-label">Straddle</span>
+                            </div>
+                            <span class="stat-value" id="straddleSummary">—</span>
+                        </div>
+                    </div>
+
                 </div>
                 
                 <div class="section-divider" style="margin: 12px 0;"></div>
@@ -2195,6 +2258,46 @@
                     else strEl.className = 'stat-value negative';
                     animateValueChange('currentStrength', strVal.toFixed(0));
                 }
+
+                // ── Paper Trading Panel ───────────────────────────────────────
+                const pt = data.paper_trading;
+                const ptSection = document.getElementById('paperTradingSection');
+                if (pt && ptSection) {
+                    ptSection.style.display = '';
+                    const pnl = pt.total_pnl || 0;
+                    const pnlEl = document.getElementById('paperPnl');
+                    pnlEl.textContent = '₹' + pnl.toFixed(0);
+                    pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
+                    animateValueChange('paperPnl', pnl.toFixed(0));
+                    document.getElementById('paperWinRate').textContent = pt.win_rate || '0%';
+                    document.getElementById('paperTrades').textContent = pt.total_trades || 0;
+                    document.getElementById('paperOpen').textContent = pt.open_positions || 0;
+                } else if (ptSection) {
+                    ptSection.style.display = 'none';
+                }
+
+                // ── Market Overview: Regime ───────────────────────────────────
+                if (data.regime || (data.paper_trading && data.paper_trading._regime)) {
+                    // Regime comes via analysis messages; attempt to read from cached signal
+                }
+
+                // ── Straddle Summary ─────────────────────────────────────────
+                const ss = data.straddle;
+                if (ss) {
+                    const stEl = document.getElementById('straddleSummary');
+                    if (stEl) {
+                        if (ss.open > 0) {
+                            stEl.textContent = ss.open + ' open';
+                            stEl.className = 'stat-value positive';
+                        } else if (ss.total > 0) {
+                            stEl.textContent = ss.win_rate + ' WR';
+                            stEl.className = 'stat-value neutral';
+                        } else {
+                            stEl.textContent = 'No trades';
+                            stEl.className = 'stat-value neutral';
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('Error fetching status:', error);
             }
@@ -2243,6 +2346,32 @@
                 else if (strVal >= 50) strEl.className = 'stat-value neutral';
                 else strEl.className = 'stat-value negative';
                 animateValueChange('currentStrength', strVal.toFixed(0));
+            }
+
+            // VIX from log lines like "India VIX = 18.5" or "VIX filter passed: India VIX = 18.5"
+            const vixMatch = message.match(/India VIX[^:]*[=:]\s*([\d.]+)/i);
+            if (vixMatch) {
+                const vix = parseFloat(vixMatch[1]);
+                const vixEl = document.getElementById('indiaVix');
+                if (vixEl) {
+                    vixEl.textContent = vix.toFixed(1);
+                    if (vix < 15) vixEl.className = 'stat-value positive';
+                    else if (vix < 20) vixEl.className = 'stat-value neutral';
+                    else vixEl.className = 'stat-value negative';
+                }
+            }
+
+            // Regime from log lines like "Regime: RANGING | ADX=..."
+            const regimeMatch = message.match(/Regime:\s*([A-Z_]+)/);
+            if (regimeMatch) {
+                const regEl = document.getElementById('marketRegime');
+                if (regEl) {
+                    const r = regimeMatch[1];
+                    regEl.textContent = r;
+                    if (r.includes('TRENDING')) regEl.className = 'stat-value positive';
+                    else if (r === 'VOLATILE') regEl.className = 'stat-value negative';
+                    else regEl.className = 'stat-value neutral';
+                }
             }
         }
 

@@ -1,0 +1,166 @@
+================================================================================
+  NIFTY OPTIONS BOT — PAPER TRADING & IMPROVEMENT PLAN
+  Created: March 2026
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 1 — DAILY PAPER TRADING ROUTINE  (Every trading day until 15+ signals)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — Start bot (9:10 AM sharp — BEFORE market opens at 9:15)
+  ★ MUST start by 9:10 AM — ORB needs the 9:15-9:30 opening range
+  ★ If you start after 9:30, ORB is lost for the day
+  cd "d:\Users\sundlnu\VS Code BOT\BOT"
+  .venv\Scripts\Activate.ps1
+  python main.py
+
+STEP 2 — Seed IV history (first time only, or if iv status shows < 5 days)
+  > iv backfill 30
+  > iv status
+  > health
+
+STEP 3 — Watch for signals (9:15 AM – 11:30 AM for ORB/VWAP)
+  Log every signal in signal_log.txt (see template below)
+  For each signal, manually track if price hits Target or SL by 3:15 PM
+
+STEP 4 — End of day check (3:30 PM)
+  > daily
+  > positions
+  Update "Hit?" column in signal_log.txt
+
+────────────────────────────────────────────────────────────────────────────────
+SIGNAL LOG TEMPLATE  (save as signal_log.txt)
+────────────────────────────────────────────────────────────────────────────────
+
+Date       | Time  | Strategy | Dir | Strength | Entry  | SL     | Target | Hit?   | Notes
+-----------|-------|----------|-----|----------|--------|--------|--------|--------|--------
+2026-03-19 | 09:47 | ORB      | CE  | 78%      | 23450  | 23380  | 23555  | WIN    | Clean breakout
+2026-03-19 | 14:15 | VWAP     | PE  | 62%      | 23480  | 23510  | 23440  | LOSS   | Reverted too slow
+           |       |          |     |          |        |        |        |        |
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 2 — WEEKEND CODE IMPROVEMENTS  (Do on Saturday or Sunday)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 5 — Fix ORB strategy ✅ DONE (March 19 2026)
+  Changes applied to .env + bot/engine.py:
+  1. Target multiplier 1.5x → 2.5x (T1), 2.0x → 3.5x (T2)  — bigger R:R
+  2. Entry window extended 11:30 → 12:30 PM  — more signals captured
+  3. RSI quality filter: CE only if RSI < 55, PE only if RSI > 45
+
+STEP 6 — Simplify TREND indicators (bot/trend_analyzer.py)
+  Tell GitHub Copilot:
+  "Simplify the trend signal from 7 indicators to 5:
+   Keep: ema9 > ema21, close > sma50, rsi < 55, supertrend == 1, adx > 25
+   Remove: macd vs macd_signal, close vs vwap, sma20 vs sma50
+   Change pass threshold from 5/7 to 4/5"
+
+STEP 7 — Loosen VWAP threshold ✅ DONE (March 19 2026)
+  Changes applied to .env:
+  DEV_PCT:   0.6 → 0.5   (catch signals earlier)
+  RSI_LONG:  38  → 40   (slightly more permissive)
+  RSI_SHORT: 62  → 60   (slightly more permissive)
+
+STEP 8 — Re-run validator after all 3 changes
+  python -m bot.strategy_validator --full --json validation_after_fix.json
+  Compare results to validation_nifty.json (the before baseline)
+  ORB win rate should improve from 25% toward 40%+
+
+STEP 9 — Run tests to confirm nothing broke
+  cd "d:\Users\sundlnu\VS Code BOT\BOT"
+  .venv\Scripts\python.exe -m pytest tests/ -q
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3 — DECISION POINT  (After 15–20 signals tracked)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 10 — Calculate your actual win rate from signal_log.txt
+
+  Total signals logged:  ___
+  Wins (hit target):     ___
+  Losses (hit SL):       ___
+  Win Rate:              ___  %
+
+  DECISION TABLE:
+  ┌─────────────┬────────────────────────────────────────────────────────┐
+  │ Win Rate    │ Action                                                 │
+  ├─────────────┼────────────────────────────────────────────────────────┤
+  │ >= 55%      │ Enable auto-trading at 0.25 lot (16 qty)               │
+  │ 50% – 55%   │ Paper trade 1 more week                                │
+  │ < 50%       │ Come back to GitHub Copilot to re-tune thresholds      │
+  └─────────────┴────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 4 — GO LIVE  (Only if Win Rate >= 55% from paper trading)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 11 — Update .env for live trading
+
+  # Enable auto-trading
+  TRADING_AUTO_TRADE_ENABLED=true
+
+  # Enabled strategies (based on paper results)
+  ORB_ENABLED=true
+  VWAP_ENABLED=true
+  GAP_ENABLED=true
+  TREND_FOLLOWING_ENABLED=false   # keep off until it shows 40%+ WR in paper
+  EOD_ENABLED=false               # keep off until _eod_tracker shows >= 20 trades
+
+  # All filters ON
+  TRADING_VIX_FILTER_ENABLED=true
+  TRADING_IV_FILTER_ENABLED=true
+
+  # Conservative size (0.25 lot)
+  TRADING_MAX_POSITIONS=1
+  TRADING_MAX_DAILY_LOSS=2250
+  TRADING_MAX_TRADES=3
+
+STEP 12 — First live week: max 1 trade per day, watch every entry
+
+STEP 13 — After 10 live trades: run validator again
+  python -m bot.strategy_validator --full --json validation_live_week1.json
+  Compare to validation_nifty.json and validation_after_fix.json
+
+────────────────────────────────────────────────────────────────────────────────
+USEFUL COMMANDS (quick reference)
+────────────────────────────────────────────────────────────────────────────────
+
+Chat console commands:
+  > daily              — today's P&L and trade summary
+  > positions          — open positions
+  > health             — bot health score (0-100)
+  > iv status          — IV history days + EOD win rate
+  > iv backfill 30     — seed 30 days of India VIX history
+  > validate           — run strategy validator (takes ~10s)
+  > validate BANKNIFTY — run for BANKNIFTY
+
+Terminal commands:
+  python main.py                                          — start bot
+  python -m bot.strategy_validator --full                 — full validation
+  python -m bot.strategy_validator --full --wf-detail     — with walk-forward detail
+  python -m bot.strategy_validator --full --json out.json — save to JSON
+  python -m pytest tests/ -q                              — run all tests
+
+────────────────────────────────────────────────────────────────────────────────
+CURRENT STRATEGY STATUS  (as of March 2026 validation)
+────────────────────────────────────────────────────────────────────────────────
+
+Strategy  | Status           | Backtest WR | Notes
+----------|------------------|-------------|----------------------------------
+ORB       | ENABLED (paper)  | 25% WR      | ✅ Fixed: target 2.5x, window→12:30, RSI filter
+VWAP      | ENABLED (paper)  | 6 trades    | ✅ Fixed: deviation 0.5%, RSI 40/60
+GAP       | ENABLED (paper)  | 6 trades    | Rare event — keep watching
+TREND     | ENABLED (paper)  | 17% WR      | ✅ Fixed: max_score 25, RANGING override, MTF crash fix
+EOD       | DISABLED         | 19% WR      | Below breakeven — keep disabled
+
+Additional fixes applied March 19 2026:
+  - max_score 30→25 (scoring normalisation — phantom points removed)
+  - MTF bear scoring fixed (rsi<70 was counting as bullish on crash days)
+  - RANGING regime override: fires auto-trade on clear 5m signal (ADX lag)
+  - VWAP 5m direction guard: blocks VWAP from buying CE on crash days
+  - ORB gap bonus ×8 (was ×5) — 800pt crash now scores 80%+
+  - Intraday range reducer: >3% swing drops threshold to 52 (was 55 min)
+  - VIX_MAX raised 20→25 (was blocking entries on volatile crash days)
+  - EOD paper mode fixed (was skipping analysis entirely when auto_trade=false)
+
+================================================================================

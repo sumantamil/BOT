@@ -596,8 +596,27 @@ class DhanBroker:
         """
         if not self._client:
             return {"day": [], "net": [], "total_pnl": 0.0}
+
+        # Retry once on transient network errors (RemoteDisconnected, ConnectionAborted).
+        # Dhan API occasionally drops keep-alive connections — a single retry resolves it.
+        resp = None
+        for _attempt in range(2):
+            try:
+                resp = await asyncio.to_thread(self._client.get_positions)
+                break
+            except Exception as e:
+                _is_transient = any(k in str(e) for k in (
+                    "RemoteDisconnected", "Connection aborted",
+                    "ConnectionResetError", "BrokenPipeError",
+                ))
+                if _attempt == 0 and _is_transient:
+                    logger.debug(f"Dhan get_positions transient error, retrying ({e})")
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning(f"Dhan get_positions failed: {e}")
+                return {"day": [], "net": [], "total_pnl": 0.0}
+
         try:
-            resp = await asyncio.to_thread(self._client.get_positions)
             if not resp or resp.get("status") != "success":
                 err_code = (resp.get("data", {}) or {}).get("errorCode", "") if resp else ""
                 if err_code == "DH-901":

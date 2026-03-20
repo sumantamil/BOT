@@ -441,6 +441,168 @@ def test_symbol_matching():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST 9 — can_place_order() validation chain: one test per gate
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_om():
+    """Return a minimal OrderManager with all guards in their permissive state."""
+    import unittest.mock as um
+    from bot.order_manager import OrderManager
+    from bot.index_config import NIFTY
+
+    om = OrderManager.__new__(OrderManager)
+    om.config = MagicMock(
+        amo_enabled=False,
+        max_trades_per_day=5,
+        min_time_between_trades_minutes=10,
+        max_positions=3,
+        max_daily_loss=5000,
+        max_consecutive_losses=3,
+        pause_after_losses_minutes=30,
+        market_open_hour=9,  market_open_minute=15,
+        market_close_hour=15, market_close_minute=30,
+    )
+    om._active_index = NIFTY
+    om._positions = {}
+    om._daily_stats = MagicMock(date=date.today(), total_trades=0)
+    om._daily_pnl = 0.0
+    om._trading_paused_until = None
+    om._last_trade_time = None
+    om._consecutive_losses = 0
+    om._strike_loss_count = {}
+    om._max_strike_losses = 2
+    om._held_qty = {}
+    return om
+
+
+def test_validation_chain():
+    """
+    Exercise every return-False path in the validation chain independently.
+
+    Gates tested (in can_place_order call order):
+      G1 market_hours  — outside 9:15–15:30 IST, AMO disabled
+      G1b AMO          — outside market hours, AMO enabled + in window
+      G2 cool_off      — trading_paused_until in the future
+      G3 daily_limit   — total_trades >= max_trades_per_day
+      G4 min_gap       — last trade was < min_time_between_trades_minutes ago
+      G4b min_gap_skip — hedge leg: gap NOT enforced when positions are open
+      G5 max_positions — active_positions >= max_positions
+      G6 daily_loss    — daily_pnl <= -max_daily_loss
+
+    Gates tested in can_enter_strike:
+      G7 strike_repeat — already lost max_strike_losses times on this strike
+
+    Gate tested in PaperTrader.paper_buy:
+      G8 paper_dedup   — same (index, strategy, option_type) already open today
+    """
+    import unittest.mock as um
+    from bot.order_manager import OrderManager
+    from bot.paper_trader import PaperTrader
+    print("\n── TEST 9: Validation Chain (all 8 gates) ──")
+
+    # ── G1: outside market hours, AMO disabled ───────────────────────────────
+    om = _make_om()
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=False), \
+         um.patch.object(OrderManager, '_is_amo_window',  return_value=False):
+        can, reason = om.can_place_order()
+    check("G1 market_hours — blocked outside hours", not can, reason)
+    check("G1 reason contains 'market hours'", "market hours" in reason.lower(), reason)
+
+    # ── G1b: outside market hours, AMO enabled & in window ───────────────────
+    om = _make_om()
+    om.config.amo_enabled = True
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=False), \
+         um.patch.object(OrderManager, '_is_amo_window',  return_value=True):
+        can, reason = om.can_place_order()
+    check("G1b AMO — allowed in AMO window", can, reason)
+    check("G1b reason is 'AMO window'", reason == "AMO window", reason)
+
+    # ── G2: consecutive-loss cool-off ─────────────────────────────────────────
+    om = _make_om()
+    om._consecutive_losses = 3
+    om._trading_paused_until = datetime.now() + timedelta(minutes=25)
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G2 cool_off — blocked during pause window", not can, reason)
+    check("G2 reason mentions consecutive losses", "consecutive" in reason.lower(), reason)
+
+    # ── G3: daily trade limit ─────────────────────────────────────────────────
+    om = _make_om()
+    om._daily_stats.total_trades = 5   # == max_trades_per_day
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G3 daily_limit — blocked at limit", not can, reason)
+    check("G3 reason mentions daily trade limit", "daily trade limit" in reason.lower(), reason)
+
+    # ── G4: min gap between trades (no open positions = fresh entry) ──────────
+    om = _make_om()
+    om._last_trade_time = datetime.now() - timedelta(minutes=3)   # only 3 min ago
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G4 min_gap — blocked when last trade was 3 min ago", not can, reason)
+    check("G4 reason mentions 'too soon'", "too soon" in reason.lower(), reason)
+
+    # ── G4b: hedge bypass — open positions exempt from min-gap ───────────────
+    om = _make_om()
+    om._last_trade_time = datetime.now() - timedelta(minutes=3)
+    # Simulate one open position
+    mock_pos = MagicMock()
+    mock_pos.status = "OPEN"
+    om._positions = {"TRD_001": mock_pos}
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G4b min_gap hedge bypass — allowed with open position", can, reason)
+
+    # ── G5: max concurrent positions ─────────────────────────────────────────
+    om = _make_om()
+    om.config.max_positions = 2
+    mock_p1, mock_p2 = MagicMock(status="OPEN"), MagicMock(status="OPEN")
+    om._positions = {"T1": mock_p1, "T2": mock_p2}   # 2 == max_positions
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G5 max_positions — blocked at 2/2 open", not can, reason)
+    check("G5 reason mentions max positions", "max positions" in reason.lower(), reason)
+
+    # ── G6: daily loss limit ─────────────────────────────────────────────────
+    om = _make_om()
+    om._daily_pnl = -5000.0   # exactly at the -5000 limit
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G6 daily_loss — blocked when pnl == -max_daily_loss", not can, reason)
+    check("G6 reason mentions daily loss limit", "daily loss limit" in reason.lower(), reason)
+
+    # ── G_pass: all gates open → OK ──────────────────────────────────────────
+    om = _make_om()
+    with um.patch.object(OrderManager, '_is_market_hours', return_value=True):
+        can, reason = om.can_place_order()
+    check("G_pass all gates open — allowed", can, reason)
+    check("G_pass reason is 'OK'", reason == "OK", reason)
+
+    # ── G7: can_enter_strike — strike already lost twice today ───────────────
+    om = _make_om()
+    om._strike_loss_count[("CE", 24500)] = 2   # == _max_strike_losses
+    can, reason = om.can_enter_strike("CE", 24500)
+    check("G7 strike_repeat — blocked after 2 losses on same strike", not can, reason)
+    check("G7 reason mentions 'lost'", "lost" in reason.lower(), reason)
+
+    # First loss: only 1 loss, should still be allowed
+    om2 = _make_om()
+    om2._strike_loss_count[("CE", 24500)] = 1
+    can2, reason2 = om2.can_enter_strike("CE", 24500)
+    check("G7 strike_repeat — allowed after only 1 loss", can2, reason2)
+
+    # ── G8: PaperTrader deduplication — same signal twice same day ────────────
+    pt = PaperTrader()
+    first = pt.paper_buy(index_name="NIFTY", index_price=22500.0, option_type="CE", strategy="ORB")
+    second = pt.paper_buy(index_name="NIFTY", index_price=22600.0, option_type="CE", strategy="ORB")
+    check("G8 paper_dedup — first entry accepted", first is not None)
+    check("G8 paper_dedup — duplicate same-day entry rejected", second is None)
+
+    # Different option type on same strategy → allowed (CE and PE are independent)
+    third = pt.paper_buy(index_name="NIFTY", index_price=22500.0, option_type="PE", strategy="ORB")
+    check("G8 paper_dedup — opposite side allowed (PE after CE)", third is not None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
@@ -456,6 +618,7 @@ async def main():
     test_profit_tiers()
     await test_amo_order()
     test_symbol_matching()
+    test_validation_chain()
 
     total = len(results)
     passed = sum(1 for _, ok in results if ok)

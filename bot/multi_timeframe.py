@@ -112,23 +112,36 @@ class MultiTimeframeEngine:
         price_above = current > sma_20
         ema_bull = ema_9 > ema_21
 
-        # Determine trend
+        # Bull/bear signal count — symmetric scoring so crash days read as BEARISH
+        # NOT BULLISH.
+        # Old code used `rsi < 70` as a bullish criterion: on a crash day RSI=25
+        # this was True, adding a spurious +1 bullish point.  On early crash days
+        # where SMA/EMA hasn't turned yet this pushed bull_count to 3-4 → BULLISH,
+        # causing Guard 5 in engine.py to BLOCK the PE entry.
+        # Fix: use `rsi > 55` for bullish (momentum) and `rsi < 45` for bearish.
         bull_count = sum([
             sma_20 > sma_50 if not pd.isna(sma_50) else False,
             ema_bull,
             macd_bull,
             price_above,
-            rsi < 70,
+            rsi > 55,   # genuinely bullish RSI (momentum zone)
+        ])
+        bear_count = sum([
+            (sma_20 < sma_50) if not pd.isna(sma_50) else False,
+            not ema_bull,
+            not macd_bull,
+            not price_above,
+            rsi < 45,   # genuinely bearish RSI
         ])
 
-        if bull_count >= 4:
-            trend = "BULLISH"
-        elif bull_count <= 1:
+        if bear_count >= 4:
             trend = "BEARISH"
+        elif bull_count >= 4:
+            trend = "BULLISH"
         else:
             trend = "NEUTRAL"
 
-        strength = bull_count / 5 * 100
+        strength = (bull_count if trend == "BULLISH" else bear_count if trend == "BEARISH" else 0) / 5 * 100
 
         return TimeframeSignal(
             timeframe=tf,

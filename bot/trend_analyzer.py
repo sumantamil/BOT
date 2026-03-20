@@ -87,15 +87,32 @@ class TrendAnalyzer:
             data = ticker.history(period=period, interval=interval)
             
             if data.empty:
-                logger.warning("No data received from Yahoo Finance")
+                logger.warning(
+                    f"TrendAnalyzer [{self._index.display_name}]: no data from yfinance "
+                    f"(symbol={self._index.yahoo_symbol}, period={period}, interval={interval})"
+                )
                 return pd.DataFrame()
-            
+
             self._last_data = data
-            logger.info(f"Fetched {len(data)} data points")
+            # Log row count + latest candle timestamp in IST
+            try:
+                from zoneinfo import ZoneInfo
+                _ist = ZoneInfo("Asia/Kolkata")
+                _last_ts = data.index[-1]
+                _last_ts_ist = _last_ts.tz_convert(_ist) if hasattr(_last_ts, "tz_convert") else _last_ts
+                _age_min = (datetime.now(_ist) - _last_ts_ist).total_seconds() / 60
+                _stale = f" ⚠️ STALE ({_age_min:.0f} min old)" if _age_min > 20 else ""
+                logger.info(
+                    f"TrendAnalyzer [{self._index.display_name}]: fetched {len(data)} candles "
+                    f"(period={period}, interval={interval}) "
+                    f"| latest={_last_ts_ist.strftime('%H:%M IST')}{_stale}"
+                )
+            except Exception as _tz_err:
+                logger.info(f"TrendAnalyzer [{self._index.display_name}]: fetched {len(data)} candles (TZ check skipped: {_tz_err})")
             return data
-            
+
         except Exception as e:
-            logger.error(f"Error fetching data: {e}")
+            logger.error(f"TrendAnalyzer [{self._index.display_name}]: data fetch failed — {e}")
             return pd.DataFrame()
     
     def calculate_sma(self, data: pd.DataFrame, period: int) -> pd.Series:
@@ -439,8 +456,14 @@ class TrendAnalyzer:
             bearish_signals_list['below_resistance'] * 1
         )
         
-        # MAXIMUM POSSIBLE SCORE = 30 (for normalization)
-        max_score = 30
+        # MAXIMUM POSSIBLE SCORE — normalise against the achievable max, NOT the
+        # theoretical max (30).  Two signals almost never fire intraday:
+        #   sma_crossover  (+3 pts) — SMA takes multiple days to cross
+        #   volume_spike   (+2 pts) — yfinance index volume is unreliable
+        # Using 30 as the denominator permanently understates strength by ~17%.
+        # Using 25 (the achievable max without those two) means those two signals
+        # become bonus points that push strong setups toward 100% — correct behaviour.
+        max_score = 25
         
         # DETERMINE TREND AND STRENGTH (NOW WITH ADAPTIVE CONFIDENCE THRESHOLD)
         bullish_strength = min(int((bullish_score / max_score) * 100), 100)
@@ -448,7 +471,48 @@ class TrendAnalyzer:
         
         # ADAPTIVE THRESHOLD: Lower in volatile markets (war/crisis), higher in calm markets
         HIGH_CONFIDENCE_THRESHOLD = self.get_dynamic_confidence_threshold(latest_atr, current_price)
-        
+
+        # BIG-SWING INTRADAY REDUCER: On crash/rally days the 5-day ATR gets
+        # diluted by previous calm sessions, keeping the threshold too high.
+        # If today's high-low range is large relative to price, the market is
+        # clearly in a strong directional move — reduce threshold accordingly.
+        try:
+            from datetime import date as _date
+            _today_date = datetime.now().date()
+            _today_mask = [
+                (ts.date() == _today_date if hasattr(ts, 'date') else False)
+                for ts in data.index
+            ]
+            _today_data = data[_today_mask]
+            if len(_today_data) >= 3:
+                _day_open  = float(_today_data.iloc[0]['Open'])
+                _day_high  = float(_today_data['High'].max())
+                _day_low   = float(_today_data['Low'].min())
+                _intraday_range_pct = (_day_high - _day_low) / _day_open * 100
+
+                # Also measure the overnight gap (prev close → today open)
+                # A 250pt NIFTY gap-up may only have 100pt intraday range (consolidation),
+                # so the intraday reducer alone misses it. The gap-from-prev-close measures
+                # the true directional move that started before market open.
+                _prev_close = float(data[~pd.Series(_today_mask, index=data.index)]['Close'].iloc[-1]) if any(~pd.Series(_today_mask, index=data.index)) else _day_open
+                _gap_from_prev_pct = abs(_day_open - _prev_close) / _prev_close * 100
+
+                # Use the larger of intraday range or overnight gap
+                _effective_pct = max(_intraday_range_pct, _gap_from_prev_pct)
+
+                if _effective_pct > 3.0:    # e.g. NIFTY swing > 675 pts (major crash/event)
+                    HIGH_CONFIDENCE_THRESHOLD = max(52, HIGH_CONFIDENCE_THRESHOLD - 15)
+                elif _effective_pct > 2.0:    # e.g. NIFTY swing > 450 pts
+                    HIGH_CONFIDENCE_THRESHOLD = max(55, HIGH_CONFIDENCE_THRESHOLD - 10)
+                elif _effective_pct > 1.5:  # e.g. NIFTY swing > 330 pts
+                    HIGH_CONFIDENCE_THRESHOLD = max(57, HIGH_CONFIDENCE_THRESHOLD - 7)
+                elif _effective_pct > 1.0:  # e.g. 250pt NIFTY gap-up (~1.1%)
+                    HIGH_CONFIDENCE_THRESHOLD = max(55, HIGH_CONFIDENCE_THRESHOLD - 7)
+                elif _effective_pct > 0.7:  # moderate gap
+                    HIGH_CONFIDENCE_THRESHOLD = max(58, HIGH_CONFIDENCE_THRESHOLD - 4)
+        except Exception:
+            pass  # non-fatal — fall back to ATR-only threshold
+
         logger.info(f"📊 Signal Analysis: Bullish {bullish_strength}% | Bearish {bearish_strength}% | ATR ₹{latest_atr:.2f} | Threshold {HIGH_CONFIDENCE_THRESHOLD}%")
         
         if bullish_strength >= HIGH_CONFIDENCE_THRESHOLD and bullish_strength > bearish_strength:

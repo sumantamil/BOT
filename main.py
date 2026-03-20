@@ -64,12 +64,20 @@ def run_server():
 
     threading.Timer(1.0, _open_browser).start()
     
+    # Suppress favicon noise from uvicorn access log
+    import logging
+    class _FaviconFilter(logging.Filter):
+        def filter(self, record):
+            return "favicon.ico" not in record.getMessage()
+    logging.getLogger("uvicorn.access").addFilter(_FaviconFilter())
+
     uvicorn.run(
         "web.app:app",
         host=settings.web.host,
         port=settings.web.port,
         reload=False,
-        log_level="info"
+        log_level="info",
+        access_log=True,
     )
 
 

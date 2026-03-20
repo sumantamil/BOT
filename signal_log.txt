@@ -1,0 +1,84 @@
+================================================================================
+  NIFTY OPTIONS BOT — PAPER TRADE SIGNAL LOG
+  Started: March 2026  |  Target: 15+ signals before going live
+================================================================================
+
+HOW TO FILL:
+  - Log every 📋 PAPER signal shown in the bot dashboard
+  - Hit? = WIN (reached Target), LOSS (hit SL), OPEN (still running), SKIP (filtered)
+  - After 15 signals: calculate Win Rate → see DECISION TABLE at bottom
+
+--------------------------------------------------------------------------------
+Date       | Time  | Index    | Strategy | Dir | Strength | Entry  | SL     | Target | Hit?   | Notes
+-----------|-------|----------|----------|-----|----------|--------|--------|--------|--------|--------
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+           |       |          |          |     |          |        |        |        |        |
+
+================================================================================
+  DAILY SUMMARY  (fill at 3:30 PM each day)
+================================================================================
+
+Date       | Signals | Wins | Losses | Win Rate | Notes
+-----------|---------|------|--------|----------|---------------------------
+           |         |      |        |          |
+           |         |      |        |          |
+           |         |      |        |          |
+           |         |      |        |          |
+           |         |      |        |          |
+
+================================================================================
+  DECISION TABLE  (check after 15+ total signals)
+================================================================================
+
+  Total signals: ___   Wins: ___   Losses: ___   Win Rate: ___%
+
+  ┌─────────────┬────────────────────────────────────────────────────────────┐
+  │ Win Rate    │ Action                                                     │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ >= 55%      │ ✅ Enable auto-trading (TRADING_AUTO_TRADE_ENABLED=true)   │
+  │ 50% – 55%   │ ⏳ Paper trade 1 more week, then re-evaluate               │
+  │ < 50%       │ 🔧 Return to Copilot to re-tune thresholds                │
+  └─────────────┴────────────────────────────────────────────────────────────┘
+
+================================================================================
+  STRATEGY SIGNAL REFERENCE  (what to look for in the dashboard)
+================================================================================
+
+  📋 PAPER ORB   : Opening Range Breakout  |  Window: 9:15–9:30  |  Entry: 9:30–12:30
+     Look for    : "📋 PAPER ORB: Would buy CE/PE | strength XX%"
+     Record      : Entry price = range high/low + buffer  |  SL = other end of range
+     Target T1   : entry ± (range_width × 2.5)
+     Target T2   : entry ± (range_width × 3.5)
+
+  📋 PAPER VWAP  : VWAP Mean Reversion  |  Window: 9:30–14:30  |  RANGING regime only
+     Look for    : "📋 PAPER VWAP: Would buy CE/PE | deviation XX%"
+     Record      : Entry = current price  |  Target = VWAP level
+     Trigger     : Price > 0.5% below/above VWAP  AND  RSI < 40 (LONG) / > 60 (SHORT)
+
+  📋 PAPER TREND : 5m Multi-Indicator Trend  |  Any time before 14:00
+     Look for    : "📋 PAPER TREND [NIFTY/BANKNIFTY/SENSEX]: Would buy CE/PE"
+     Record      : Entry = current spot price  |  SL = 15%  |  Target = 30%
+
+  📋 PAPER GAP   : Gap open trade  |  Window: 9:15–11:00
+     Look for    : "Gap Trade Executed" or gap report with direction
+     Record      : Entry = ATM at open  |  SL = 25%  |  Target = 50%
+
+================================================================================

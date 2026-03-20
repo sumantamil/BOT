@@ -13,9 +13,10 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+import logging
 
 import sys
 sys.path.append('..')
@@ -123,6 +124,12 @@ async def websocket_route(websocket: WebSocket):
     await websocket_endpoint(websocket)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Silence the browser's automatic favicon request — no file needed."""
+    return Response(status_code=204)
+
+
 @app.get("/api/status")
 async def get_status():
     """Get current bot status"""
@@ -180,6 +187,10 @@ async def get_status():
         "connections": manager.get_connection_count(),
         "rsi": round(status.last_signal.rsi, 1) if status.last_signal else None,
         "strength": round(status.last_signal.strength, 0) if status.last_signal else None,
+        # Paper trading stats (only populated in paper mode)
+        "paper_trading": bot.paper_trader.get_summary() if not status.auto_trade_enabled else None,
+        # Straddle strategy stats
+        "straddle": bot.straddle_strategy.get_summary() if hasattr(bot, "straddle_strategy") else None,
     }
 
 
@@ -641,6 +652,138 @@ async def list_symbols(
     """List symbols for auto-suggest"""
     return {
         "symbols": market_research.list_symbols(query=query, exchange=exchange, limit=limit)
+    }
+
+
+@app.get("/api/health-score")
+async def get_health_score():
+    """
+    Bot health score (0–100) with grade and issue list.
+
+    Checks:
+    - Win rate (deducted if < 50%)
+    - IV history days (deducted if < 5)
+    - Consecutive losses (deducted if ≥ 4)
+    - Open positions with critical theta (deducted if any theta < -80 ₹/day)
+    - Today's slippage (deducted if avg > ₹5)
+    - EOD win rate (deducted if < 55% after 20 trades)
+    """
+    if not bot:
+        raise HTTPException(status_code=503, detail="Bot not initialized")
+
+    from bot.iv_monitor import iv_monitor
+    from bot.engine import _eod_tracker
+
+    score = 100
+    issues: list[str] = []
+    details: dict = {}
+
+    # ── 1. Win rate ──────────────────────────────────────────────────────
+    try:
+        stats = bot.order_manager._daily_stats if bot.order_manager else None
+        total_trades = stats.total_trades if stats else 0
+        wins = stats.winning_trades if stats else 0
+        if total_trades >= 5:
+            wr = wins / total_trades
+            details["win_rate_pct"] = round(wr * 100, 1)
+            if wr < 0.50:
+                score -= 20
+                issues.append(f"Win rate {wr*100:.1f}% (below 50%)")
+        else:
+            details["win_rate_pct"] = None
+    except Exception:
+        details["win_rate_pct"] = None
+
+    # ── 2. IV history ────────────────────────────────────────────────────
+    try:
+        iv_days = max(
+            (len(v) for v in iv_monitor._iv_history.values()),
+            default=0
+        )
+        details["iv_history_days"] = iv_days
+        if iv_days < 5:
+            score -= 10
+            issues.append(f"IV history only {iv_days} day(s) — need 5+ to activate filter")
+    except Exception:
+        details["iv_history_days"] = 0
+
+    # ── 3. Consecutive losses ────────────────────────────────────────────
+    try:
+        consec = bot.order_manager._consecutive_losses if bot.order_manager else 0
+        details["consecutive_losses"] = consec
+        if consec >= 4:
+            score -= 15
+            issues.append(f"{consec} consecutive losses — consider pausing")
+    except Exception:
+        details["consecutive_losses"] = 0
+
+    # ── 4. Critical theta on open positions ──────────────────────────────
+    try:
+        critical_theta_positions = []
+        if bot.order_manager:
+            for t in bot.order_manager._positions.values():
+                if t.status == "OPEN" and t.theta_daily_at_entry < -80:
+                    critical_theta_positions.append(t.symbol)
+        details["critical_theta_positions"] = critical_theta_positions
+        if critical_theta_positions:
+            score -= 10
+            issues.append(
+                f"Critical theta on: {', '.join(critical_theta_positions)}"
+            )
+    except Exception:
+        details["critical_theta_positions"] = []
+
+    # ── 5. Today's slippage ──────────────────────────────────────────────
+    try:
+        slippages = []
+        if bot.order_manager:
+            for t in bot.order_manager._trade_history + list(bot.order_manager._positions.values()):
+                if t.slippage != 0.0:
+                    slippages.append(abs(t.slippage))
+        avg_slip = round(sum(slippages) / len(slippages), 2) if slippages else 0.0
+        details["avg_slippage_today"] = avg_slip
+        if avg_slip > 5:
+            score -= 15
+            issues.append(f"High avg slippage today: ₹{avg_slip:.1f}")
+    except Exception:
+        details["avg_slippage_today"] = 0.0
+
+    # ── 6. EOD win rate ──────────────────────────────────────────────────
+    try:
+        eod_wr = _eod_tracker.win_rate()
+        eod_n = _eod_tracker.count()
+        details["eod_win_rate_pct"] = round(eod_wr * 100, 1) if eod_wr >= 0 else None
+        details["eod_trades"] = eod_n
+        if eod_wr >= 0 and eod_wr < 0.55:
+            score -= 10
+            issues.append(
+                f"EOD win rate {eod_wr*100:.1f}% over {eod_n} trades — below 55% target"
+            )
+    except Exception:
+        details["eod_win_rate_pct"] = None
+        details["eod_trades"] = 0
+
+    score = max(0, score)
+    if score >= 85:
+        grade = "A"
+        colour = "🟢"
+    elif score >= 70:
+        grade = "B"
+        colour = "🟡"
+    elif score >= 50:
+        grade = "C"
+        colour = "🟠"
+    else:
+        grade = "F"
+        colour = "🔴"
+
+    return {
+        "score": score,
+        "grade": grade,
+        "colour": colour,
+        "label": f"{colour} Bot Health: {score}/100 (Grade {grade})",
+        "issues": issues,
+        "details": details,
     }
 
 

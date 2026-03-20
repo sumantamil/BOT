@@ -10,6 +10,7 @@ import os
 import re
 from typing import Optional, Dict, List
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from loguru import logger
 
@@ -39,8 +40,18 @@ class TradeRecord:
     status: str = "OPEN"
     highest_price: float = 0.0   # tracks peak for trailing-stop
     tier1_exited: bool = False   # True after tier-1 partial exit fires
+    tier2_exited: bool = False   # True after tier-2 partial exit fires — triggers tighter trail
     gtt_id: Optional[int] = None  # Kite GTT stop-loss order ID (exchange-level safety net)
     lot_size: int = 1               # index lot size at entry — used for partial-exit calc
+    source: str = "Manual"          # GAP | ORB | VWAP | Auto | EOD | Rule | Manual
+    vix_at_entry: float = 0.0       # India VIX at time of entry (0 = not captured / manual trade)
+    slippage: float = 0.0           # fill_price − pre_order_ltp in ₹; positive = paid more than expected
+    # Greeks & IV at entry — populated by iv_monitor after each successful entry
+    iv_pct_at_entry: float = 0.0        # ATM IV % at entry (e.g. 14.5)
+    iv_percentile_at_entry: float = 0.0 # IV percentile rank vs last 30 days (0–100; -1 = unknown)
+    delta_at_entry: float = 0.0         # Option delta (CE: 0–1, PE: -1–0)
+    theta_daily_at_entry: float = 0.0   # Daily theta in ₹ per unit at entry (negative)
+    vega_at_entry: float = 0.0          # Vega: ₹ change per 1% IV move per unit
 
 
 @dataclass
@@ -167,20 +178,26 @@ class OrderManager:
             # Allow order if AMO is enabled and we're in the AMO window
             if self.config.amo_enabled and self._is_amo_window():
                 # AMO: skip per-day limits that don't apply pre-market
+                logger.debug("can_place_order: GATE[market_hours] PASS via AMO window")
                 return True, "AMO window"
+            logger.debug("can_place_order: GATE[market_hours] BLOCK — outside 9:15–15:30 IST and AMO not applicable")
             return False, "Outside market hours"
 
         # ── Consecutive-loss cool-off ─────────────────────────────────────────
         if self._trading_paused_until and datetime.now() < self._trading_paused_until:
             mins_left = int((self._trading_paused_until - datetime.now()).total_seconds() / 60) + 1
-            return False, (
+            reason = (
                 f"Trading paused after {self._consecutive_losses} consecutive losses. "
                 f"Resumes in {mins_left} min."
             )
+            logger.warning(f"can_place_order: GATE[cool_off] BLOCK — {reason}")
+            return False, reason
 
         # ── Daily trade limit ────────────────────────────────────────────────
         if self._daily_stats.total_trades >= self.config.max_trades_per_day:
-            return False, f"Daily trade limit reached ({self.config.max_trades_per_day} trades)"
+            reason = f"Daily trade limit reached ({self.config.max_trades_per_day} trades)"
+            logger.warning(f"can_place_order: GATE[daily_limit] BLOCK — {reason}")
+            return False, reason
 
         # ── Minimum time between trades ──────────────────────────────────────
         # Skip cooldown when adding a hedge leg (already have >=1 open position);
@@ -189,19 +206,31 @@ class OrderManager:
         if self._last_trade_time and active_positions == 0:
             elapsed_min = (datetime.now() - self._last_trade_time).total_seconds() / 60
             if elapsed_min < self.config.min_time_between_trades_minutes:
-                return False, (
+                reason = (
                     f"Too soon after last trade ({elapsed_min:.1f} min elapsed, "
                     f"min {self.config.min_time_between_trades_minutes} min required)"
                 )
+                logger.debug(f"can_place_order: GATE[min_gap] BLOCK — {reason}")
+                return False, reason
 
         # ── Max concurrent positions ───────────────────────────────────────────
         if active_positions >= self.config.max_positions:
-            return False, f"Max positions reached ({self.config.max_positions})"
+            reason = f"Max positions reached ({self.config.max_positions})"
+            logger.warning(f"can_place_order: GATE[max_positions] BLOCK — {reason}")
+            return False, reason
 
         # ── Daily loss limit ─────────────────────────────────────────────────
         if self._daily_pnl <= -self.config.max_daily_loss:
-            return False, f"Daily loss limit reached (₹{self.config.max_daily_loss:,.0f})"
+            reason = f"Daily loss limit reached (₹{self.config.max_daily_loss:,.0f})"
+            logger.warning(f"can_place_order: GATE[daily_loss] BLOCK — daily_pnl=₹{self._daily_pnl:,.0f} limit=₹{self.config.max_daily_loss:,.0f}")
+            return False, reason
 
+        logger.debug(
+            f"can_place_order: ALL GATES PASS — "
+            f"trades={self._daily_stats.total_trades}/{self.config.max_trades_per_day} "
+            f"positions={active_positions}/{self.config.max_positions} "
+            f"daily_pnl=₹{self._daily_pnl:,.0f}"
+        )
         return True, "OK"
 
     def can_enter_strike(self, option_type: str, strike: int) -> tuple[bool, str]:
@@ -238,7 +267,7 @@ class OrderManager:
     
     def _is_market_hours(self) -> bool:
         """Check if current time is within market hours (9:15–15:30 weekdays)"""
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
         if now.weekday() > 4:
             return False
         market_open = now.replace(
@@ -256,7 +285,7 @@ class OrderManager:
     @staticmethod
     def _is_amo_window() -> bool:
         """Dhan AMO window: weekdays 17:00–23:59 and 00:00–09:08"""
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
         if now.weekday() > 4:
             return False
         mins = now.hour * 60 + now.minute
@@ -390,7 +419,8 @@ class OrderManager:
         option_type: str,  # "CE" or "PE"
         strike: int,
         order_type: str = "BUY",  # "BUY" or "SELL"
-        quantity: int = None
+        quantity: int = None,
+        source: str = "Manual",     # GAP | ORB | VWAP | Auto | EOD | Rule | Manual
     ) -> OrderResult:
         """
         Place a manual order (from chat command).
@@ -439,7 +469,45 @@ class OrderManager:
                 return OrderResult(success=False, order_id=None, message=msg, timestamp=datetime.now())
         
         quantity = quantity or self.get_active_quantity()
-        
+
+        # Capture pre-order LTP so we can measure slippage after fill
+        _pre_order_ltp = 0.0
+        if ord_type == OrderType.BUY:
+            _pre_symbol = f"{self._active_index.name}{strike}{opt_type.value}"
+            try:
+                _pre_order_ltp = await self.kite.get_instrument_price(_pre_symbol) or 0.0
+            except Exception:
+                pass
+
+        # Pre-trade risk gate: ensure potential SL loss won't breach the daily cap.
+        # can_place_order() only checks current P&L — this forward-projects the worst-case
+        # outcome so Trade 3 can't push total losses past max_daily_loss.
+        if ord_type == OrderType.BUY and _pre_order_ltp > 0:
+            _potential_loss = _pre_order_ltp * quantity * self.config.stop_loss_percentage / 100
+            _projected_pnl = self._daily_pnl - _potential_loss
+            logger.debug(
+                f"GATE[pre_trade_risk]: ltp=₹{_pre_order_ltp:.0f} qty={quantity} "
+                f"sl={self.config.stop_loss_percentage}% "
+                f"potential_loss=₹{_potential_loss:.0f} "
+                f"projected_pnl=₹{_projected_pnl:,.0f} cap=-₹{self.config.max_daily_loss:,.0f}"
+            )
+            if _projected_pnl < -self.config.max_daily_loss:
+                logger.warning(
+                    f"Pre-trade risk gate: ₹{_potential_loss:.0f} potential loss "
+                    f"(₹{_pre_order_ltp:.0f} × {quantity} × {self.config.stop_loss_percentage}% SL) "
+                    f"would push daily P&L to ₹{_projected_pnl:,.0f} — "
+                    f"below cap of -₹{self.config.max_daily_loss:,.0f}"
+                )
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    message=(
+                        f"Trade blocked: ₹{_potential_loss:.0f} potential loss would breach daily cap "
+                        f"(current P&L ₹{self._daily_pnl:,.0f}, cap ₹{self.config.max_daily_loss:,.0f})"
+                    ),
+                    timestamp=datetime.now(),
+                )
+
         result = await self.kite.place_order(
             option_type=opt_type,
             strike=strike,
@@ -459,6 +527,7 @@ class OrderManager:
                 timestamp=datetime.now(),
                 status="OPEN",
                 lot_size=self._active_index.lot_size,
+                source=source,
             )
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
@@ -495,6 +564,14 @@ class OrderManager:
                 trade.price = fill_price
                 trade.highest_price = fill_price
                 logger.info(f"manual_order: entry fill price = ₹{fill_price:.2f} for {trade.symbol}")
+                # Slippage: positive = paid more than pre-order snapshot (bad)
+                if _pre_order_ltp > 0:
+                    trade.slippage = round(fill_price - _pre_order_ltp, 2)
+                    if abs(trade.slippage) > 5:
+                        logger.warning(
+                            f"High slippage: ₹{trade.slippage:+.2f} on {trade.symbol} "
+                            f"(expected ₹{_pre_order_ltp:.2f}, filled ₹{fill_price:.2f})"
+                        )
 
             # Place GTT exchange-level stop-loss (optional, survives bot restarts)
             if self.config.use_gtt and trade.price > 0:
@@ -738,9 +815,15 @@ class OrderManager:
                     qty = max(trade.quantity, 1)
                     trail_sl = trade.highest_price - (self.config.trailing_stop_amount / qty)
                 else:
-                    trail_sl = trade.highest_price * (
-                        1 - self.config.trailing_stop_percentage / 100
+                    # After BOTH profit tiers hit, tighten the trail on the final
+                    # runner — default tight trail = 5% vs 12% normal distance.
+                    # This locks nearly all remaining gains once the big move is done.
+                    _trail_pct = (
+                        getattr(self.config, 'tight_trail_after_tier2_pct', 5.0)
+                        if getattr(trade, 'tier2_exited', False)
+                        else self.config.trailing_stop_percentage
                     )
+                    trail_sl = trade.highest_price * (1 - _trail_pct / 100)
                 if current <= trail_sl:
                     locked_pct = ((trade.highest_price - entry) / entry) * 100
                     logger.info(
@@ -752,7 +835,27 @@ class OrderManager:
                     continue  # skip fixed SL/target check
 
             # ── Time-stop: exit if open > N minutes with no meaningful profit ──
-            time_stop_mins = getattr(self.config, 'time_stop_minutes', 45)
+            # Per-strategy adaptive limits reflect each strategy's natural hold time:
+            #   GAP=60 min  (gaps need time to develop or fill)
+            #   ORB=45 min  (standard breakout window)
+            #   VWAP=30 min (mean-reversion is fast — works or doesn't within 30 min)
+            #   Auto=90 min (trend-following needs time to play out)
+            #   EOD=15 min  (sprint to close — no time to wait)
+            #   Others=45 min (conservative default)
+            _source_time_stops = {
+                "GAP":    60,
+                "ORB":    45,
+                "VWAP":   30,
+                "Auto":   90,
+                "EOD":    15,
+                "Rule":   45,
+                "Manual": 45,
+            }
+            _trade_source = getattr(trade, 'source', 'Manual')
+            time_stop_mins = _source_time_stops.get(
+                _trade_source,
+                getattr(self.config, 'time_stop_minutes', 45)
+            )
             if time_stop_mins > 0:
                 age_min = (datetime.now() - trade.timestamp).total_seconds() / 60
                 # Trigger only if: old enough AND peak never exceeded entry by 2%

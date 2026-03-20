@@ -16,6 +16,7 @@ Rules:
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, time, date
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Optional, Dict
 from enum import Enum
@@ -110,9 +111,10 @@ class ORBStrategy:
         cfg = self._cfg
 
         if not cfg.enabled:
+            logger.debug(f"ORB [{self._index.display_name}]: disabled (ORB_ENABLED=false)")
             return None
 
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
         t = now.time()
 
         # Before market open
@@ -129,23 +131,42 @@ class ORBStrategy:
         if t >= self._entry_end():
             if self._state not in (ORBState.TRIGGERED, ORBState.EXPIRED):
                 self._state = ORBState.EXPIRED
+                logger.debug(
+                    f"ORB [{self._index.display_name}]: entry window closed "
+                    f"(past {self._entry_end().strftime('%H:%M')} IST) — no new signals"
+                )
             return None
 
         # Still in range-building window
         if t < self._range_end():
             self._state = ORBState.BUILDING
             self._try_build_range()
+            _rh, _rl = self._range_high, self._range_low
+            if _rh > 0:
+                logger.debug(
+                    f"ORB [{self._index.display_name}]: BUILDING range "
+                    f"{_rl:.0f}–{_rh:.0f} (window closes {self._range_end().strftime('%H:%M')})"
+                )
+            else:
+                logger.debug(
+                    f"ORB [{self._index.display_name}]: BUILDING — range not yet established"
+                )
             return None
 
         # Already fired today → enforce 1 trade/day limit
         if self._signal_fired:
             self._state = ORBState.TRIGGERED
+            logger.debug(f"ORB [{self._index.display_name}]: signal already fired today (1/day limit)")
             return None
 
         # Ensure range was built before checking breakout
         if self._range_high == 0.0:
             self._try_build_range()
             if self._range_high == 0.0:
+                logger.info(
+                    f"ORB [{self._index.display_name}]: READY but range is 0 — "
+                    f"data fetch failed (yfinance issue?)"
+                )
                 return None
 
         self._state = ORBState.READY
@@ -243,9 +264,33 @@ class ORBStrategy:
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
             data = ticker.history(period="1d", interval="5m")
+            if data.empty:
+                logger.warning(
+                    f"ORB [{self._index.display_name}]: _fetch_intraday returned empty "
+                    f"(symbol={self._index.yahoo_symbol}, period=1d, interval=5m)"
+                )
+                return pd.DataFrame()
+            # Log row count + latest candle timestamp in IST
+            try:
+                from zoneinfo import ZoneInfo
+                _ist = ZoneInfo("Asia/Kolkata")
+                _last_ts = data.index[-1]
+                _last_ts_ist = _last_ts.tz_convert(_ist) if hasattr(_last_ts, "tz_convert") else _last_ts
+                _age_min = (datetime.now(_ist) - _last_ts_ist).total_seconds() / 60
+                _stale = f" ⚠️ STALE ({_age_min:.0f} min old — yfinance lag?)" if _age_min > 20 else ""
+                logger.debug(
+                    f"ORB [{self._index.display_name}]: fetched {len(data)} candles "
+                    f"| latest={_last_ts_ist.strftime('%H:%M IST')} "
+                    f"| age={_age_min:.0f}min{_stale}"
+                )
+            except Exception as _tz_err:
+                logger.debug(
+                    f"ORB [{self._index.display_name}]: fetched {len(data)} candles "
+                    f"(TZ check skipped: {_tz_err})"
+                )
             return data
         except Exception as e:
-            logger.error(f"ORB: Intraday data fetch failed: {e}")
+            logger.error(f"ORB [{self._index.display_name}]: data fetch failed — {e}")
             return pd.DataFrame()
 
     def _try_build_range(self):
@@ -295,6 +340,10 @@ class ORBStrategy:
         """Fetch latest price and check if it has broken the opening range."""
         data = self._fetch_intraday()
         if data.empty:
+            logger.warning(
+                f"ORB [{self._index.display_name}]: breakout check skipped "
+                f"— no intraday data returned"
+            )
             return None
 
         # Require a minimum range width to avoid noise breakouts on ultra-low-
@@ -351,17 +400,30 @@ class ORBStrategy:
         long_break  = price > long_trigger
         short_break = price < short_trigger
 
+        # ── Diagnostic scoreboard (logged every cycle while READY) ──────────
+        _range_pct = self._range_width / self._range_high * 100 if self._range_high > 0 else 0
+        _vol_tag   = "vol✓" if volume_ok else "vol✗"
+        _now_str   = now.strftime("%H:%M:%S")
         if not long_break and not short_break:
             self._breakout_count = 0   # price retreated — reset counter
+            logger.info(
+                f"ORB [{self._index.display_name}] {_now_str} → FAIL "
+                f"| range={self._range_low:.0f}–{self._range_high:.0f} "
+                f"({self._range_width:.0f}pts, {_range_pct:.2f}%) "
+                f"| price={price:.0f} "
+                f"| need >{long_trigger:.0f} or <{short_trigger:.0f} "
+                f"| {_vol_tag}"
+            )
             return None
 
         # Require 2 consecutive closes beyond trigger before firing
         self._breakout_count += 1
+        direction_hint = "LONG" if long_break else "SHORT"
         if self._breakout_count < 2:
-            direction_hint = "LONG" if long_break else "SHORT"
-            logger.debug(
-                f"ORB: {direction_hint} close #{self._breakout_count}/2 "
-                f"@ {price:.2f} — waiting for confirmation candle"
+            logger.info(
+                f"ORB [{self._index.display_name}] {_now_str} → WAIT (candle {self._breakout_count}/2) "
+                f"| {direction_hint} breakout @ {price:.0f} vs trigger {long_trigger if long_break else short_trigger:.0f} "
+                f"| range {self._range_width:.0f}pts ({_range_pct:.2f}%) | {_vol_tag}"
             )
             return None
 
@@ -379,14 +441,31 @@ class ORBStrategy:
             target_2  = price - rw * cfg.target_multiplier_2
             gap_pct   = (self._range_low - price) / self._range_low * 100
 
-        # Confidence score: 60 base + 20 volume + up to 20 for decisive gap
+        # Confidence score: 60 base + 20 volume + up to 25 for decisive gap.
+        # Gap bonus uses ×8 multiplier so a 1.5% gap (NIFTY ~330 pts) = 12 pts
+        # and a 2.5% gap (NIFTY ~550 pts / an 800-pt crash day) = 20 pts.
+        # This ensures genuine large breakouts qualify WITHOUT unreliable volume.
         strength = 60.0
         if volume_ok:
             strength += 20.0
-        strength += min(gap_pct * 5, 20.0)
+        strength += min(gap_pct * 8, 25.0)
         strength = min(strength, 100.0)
 
-        self._signal_fired = True
+        # Time decay: ORB breakouts after 11:00 AM are progressively weaker.
+        # Each 6-minute slot past 11:00 costs 2 strength points (10 pts per hour).
+        # A valid 9:35 AM breakout at 90% stays 90%; a 11:00 AM breakout loses up
+        # to 20 pts. This naturally pushes late entries below the 75% entry threshold.
+        if now.hour >= 11:
+            _late_mins = (now.hour - 11) * 60 + now.minute
+            _late_penalty = min(20, (_late_mins // 6) * 2)
+            strength = max(60.0, strength - _late_penalty)
+            if _late_penalty > 0:
+                logger.debug(
+                    f"ORB: Late-entry penalty −{_late_penalty:.0f} pts "
+                    f"→ adjusted strength={strength:.0f}%  "
+                    f"({_late_mins} min past 11:00)"
+                )
+
         self._state = ORBState.TRIGGERED
 
         signal = ORBSignal(
@@ -403,9 +482,13 @@ class ORBStrategy:
             timestamp=now,
         )
 
+        _range_pct = rw / self._range_high * 100 if self._range_high > 0 else 0
         logger.info(
-            f"ORB BREAKOUT [{self._index.display_name}]: {direction} @ {price:.2f} | "
-            f"SL={stop_loss:.2f}  T1={target_1:.2f}  T2={target_2:.2f} | "
-            f"Strength={strength:.0f}%  VolumeOK={volume_ok}"
+            f"ORB [{self._index.display_name}] {now.strftime('%H:%M:%S')} → PASS\u2713 "
+            f"| range={self._range_low:.0f}–{self._range_high:.0f} "
+            f"({rw:.0f}pts, {_range_pct:.2f}%) "
+            f"| {direction} breakout @ {price:.0f} "
+            f"| strength={strength:.0f}% "
+            f"| vol={'✓' if volume_ok else '✗'}"
         )
         return signal

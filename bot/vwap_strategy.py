@@ -26,6 +26,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, time, date
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Optional, Dict
 from enum import Enum
@@ -102,7 +103,7 @@ class VWAPStrategy:
 
         self._ensure_daily_reset()
 
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
         t = now.time()
 
         if t < time(9, 30):   # Let VWAP settle for the first 15 min
@@ -113,23 +114,32 @@ class VWAPStrategy:
             self._state = VWAPState.EXPIRED
             return None
 
+        logger.debug(f"VWAP [{self._index.display_name}]: analyze() called at {now.strftime('%H:%M:%S')}")
         self._state = VWAPState.WATCHING
 
         data = self._fetch_intraday()
         if data is None or data.empty or len(data) < 5:
             return None
 
-        latest = data.iloc[-1]
-        price  = float(latest["Close"])
-        volume = float(latest.get("Volume", 0))
+        try:
+            latest = data.iloc[-1]
+            price  = float(latest["Close"])
+            volume = float(latest.get("Volume", 0))
 
-        vwap        = self._calc_vwap(data)
-        rsi         = self._calc_rsi(data)
-        bb_upper, bb_lower = self._calc_bb(data)
-        avg_vol     = float(data["Volume"].iloc[-20:].mean()) if "Volume" in data.columns and len(data) >= 20 else 0
+            vwap        = self._calc_vwap(data)
+            rsi         = self._calc_rsi(data)
+            bb_upper, bb_lower = self._calc_bb(data)
+            avg_vol     = float(data["Volume"].iloc[-20:].mean()) if "Volume" in data.columns and len(data) >= 20 else 0
 
-        deviation_pct = (price - vwap) / vwap * 100
-        volume_ok     = (avg_vol > 0) and (volume >= avg_vol * 1.15)
+            if vwap == 0:
+                logger.warning(f"VWAP [{self._index.display_name}]: VWAP is zero — skipping analysis")
+                return None
+
+            deviation_pct = (price - vwap) / vwap * 100
+            volume_ok     = (avg_vol > 0) and (volume >= avg_vol * 1.15)
+        except Exception:
+            logger.exception(f"VWAP [{self._index.display_name}]: indicator calculation failed")
+            return None
 
         cfg = self._cfg
 
@@ -189,28 +199,30 @@ class VWAPStrategy:
             )
             return signal
 
-        # ── Neither condition met — log why for diagnostics ──────────────────
-        # Throttle to once per 10 minutes to avoid log spam
+        # ── Neither condition met — log why (throttled to once per 10 min) ───
         _now_min = now.hour * 60 + now.minute
         _last_log = getattr(self, '_last_no_signal_log_min', -999)
         if _now_min - _last_log >= 10:
             self._last_no_signal_log_min = _now_min
+            _vol_tag = "vol✓" if volume_ok else f"vol✗(cur={volume:.0f} avg={avg_vol:.0f})"
+            _now_str = now.strftime("%H:%M:%S")
             if self._long_fired and self._short_fired:
-                logger.debug(f"VWAP [{self._index.display_name}]: both signals already fired today")
+                logger.info(
+                    f"VWAP [{self._index.display_name}] {_now_str} → SKIP "
+                    f"| both signals already fired today"
+                )
             else:
-                reasons = []
-                if deviation_pct > -cfg.deviation_pct and not self._long_fired:
-                    reasons.append(f"dev={deviation_pct:+.2f}% (need <-{cfg.deviation_pct:.1f}%)")
-                if deviation_pct <= -cfg.deviation_pct and rsi >= cfg.rsi_oversold and not self._long_fired:
-                    reasons.append(f"RSI={rsi:.0f} not oversold (need <{cfg.rsi_oversold:.0f})")
-                if deviation_pct < cfg.deviation_pct and not self._short_fired:
-                    reasons.append(f"dev={deviation_pct:+.2f}% (need >+{cfg.deviation_pct:.1f}%)")
-                if deviation_pct >= cfg.deviation_pct and rsi <= cfg.rsi_overbought and not self._short_fired:
-                    reasons.append(f"RSI={rsi:.0f} not overbought (need >{cfg.rsi_overbought:.0f})")
-                logger.debug(
-                    f"VWAP [{self._index.display_name}]: no signal — "
-                    f"price={price:.0f} vwap={vwap:.0f} dev={deviation_pct:+.2f}% rsi={rsi:.0f} | "
-                    + ("; ".join(reasons) if reasons else "conditions not met")
+                # Build a per-condition PASS/FAIL breakdown
+                _long_dev  = "✓" if deviation_pct <= -cfg.deviation_pct else f"✗(dev={deviation_pct:+.2f}%,need<-{cfg.deviation_pct:.1f}%)"
+                _long_rsi  = "✓" if rsi < cfg.rsi_oversold else f"✗(RSI={rsi:.0f},need<{cfg.rsi_oversold:.0f})"
+                _long_bb   = "✓" if float(data["Close"].iloc[-1]) > float((data["Close"].rolling(20).mean() - 2*data["Close"].rolling(20).std()).iloc[-1]) else "✗(below BB)"
+                _short_dev = "✓" if deviation_pct >= cfg.deviation_pct else f"✗(dev={deviation_pct:+.2f}%,need>+{cfg.deviation_pct:.1f}%)"
+                _short_rsi = "✓" if rsi > cfg.rsi_overbought else f"✗(RSI={rsi:.0f},need>{cfg.rsi_overbought:.0f})"
+                logger.info(
+                    f"VWAP [{self._index.display_name}] {_now_str} → FAIL "
+                    f"| price={price:.0f} vwap={vwap:.0f} dev={deviation_pct:+.2f}% rsi={rsi:.0f} {_vol_tag} "
+                    f"| LONG[dev={_long_dev} rsi={_long_rsi} bb={_long_bb}] "
+                    f"| SHORT[dev={_short_dev} rsi={_short_rsi}]"
                 )
 
         return None
@@ -276,12 +288,12 @@ class VWAPStrategy:
     # ─────────────────────────────────────────────
 
     def _ensure_daily_reset(self):
-        today = datetime.now().date()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         if self._today != today:
             self._reset_daily()
 
     def _reset_daily(self):
-        self._today = datetime.now().date()
+        self._today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         self._long_fired  = False
         self._short_fired = False
         self._state = VWAPState.WAITING
@@ -291,9 +303,33 @@ class VWAPStrategy:
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
             data = ticker.history(period="1d", interval="5m")
-            return data if not data.empty else None
+            if data is None or data.empty:
+                logger.warning(
+                    f"VWAP [{self._index.display_name}]: _fetch_intraday returned empty "
+                    f"(symbol={self._index.yahoo_symbol}, period=1d, interval=5m)"
+                )
+                return None
+            # Log row count + latest candle timestamp in IST
+            try:
+                from zoneinfo import ZoneInfo
+                _ist = ZoneInfo("Asia/Kolkata")
+                _last_ts = data.index[-1]
+                _last_ts_ist = _last_ts.tz_convert(_ist) if hasattr(_last_ts, "tz_convert") else _last_ts
+                _age_min = (datetime.now(_ist) - _last_ts_ist).total_seconds() / 60
+                _stale = f" ⚠️ STALE ({_age_min:.0f} min old — yfinance lag?)" if _age_min > 20 else ""
+                logger.debug(
+                    f"VWAP [{self._index.display_name}]: fetched {len(data)} candles "
+                    f"| latest={_last_ts_ist.strftime('%H:%M IST')} "
+                    f"| age={_age_min:.0f}min{_stale}"
+                )
+            except Exception as _tz_err:
+                logger.debug(
+                    f"VWAP [{self._index.display_name}]: fetched {len(data)} candles "
+                    f"(TZ check skipped: {_tz_err})"
+                )
+            return data
         except Exception as e:
-            logger.error(f"VWAP: intraday fetch failed: {e}")
+            logger.error(f"VWAP [{self._index.display_name}]: data fetch failed — {e}")
             return None
 
     @staticmethod
