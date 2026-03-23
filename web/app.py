@@ -53,12 +53,13 @@ async def lifespan(app: FastAPI):
         await bot.initialize()
         logger.info("Bot initialized")
 
-        # Auto-start analysis + position monitor if configured
+        # Auto-start analysis loop always — paper mode still needs live signals.
+        # auto_trade_enabled=false only prevents real order execution; analysis is always safe.
+        await bot.start_analysis_loop()
         if settings.trading.auto_trade_enabled:
-            await bot.start_analysis_loop()
-            logger.info("Auto-trade enabled — analysis loop started automatically")
+            logger.info("Auto-trade enabled — analysis loop started (LIVE mode)")
         else:
-            logger.info("Auto-trade disabled — click 'Start' in the UI to begin")
+            logger.info("Paper trading mode — analysis loop started automatically (no real orders)")
     except Exception as e:
         logger.error(f"Bot initialization error: {e}")
     
@@ -187,6 +188,10 @@ async def get_status():
         "connections": manager.get_connection_count(),
         "rsi": round(status.last_signal.rsi, 1) if status.last_signal else None,
         "strength": round(status.last_signal.strength, 0) if status.last_signal else None,
+        "trend": status.last_signal.trend if status.last_signal else None,
+        # Regime + VIX from engine cache (populated after first analysis cycle)
+        "regime": bot._cached_regime.regime.value if getattr(bot, '_cached_regime', None) and bot._cached_regime else None,
+        "india_vix": round(bot._cached_vix, 2) if getattr(bot, '_cached_vix', 0) else None,
         # Paper trading stats (only populated in paper mode)
         "paper_trading": bot.paper_trader.get_summary() if not status.auto_trade_enabled else None,
         # Straddle strategy stats
@@ -203,6 +208,18 @@ async def get_pnl():
         raise HTTPException(status_code=503, detail="Bot not initialized")
 
     now = datetime.now()
+
+    # Paper trading mode — serve live P&L from in-memory paper_trader (always fresh).
+    # No broker call needed; P&L is updated every analysis cycle via check_exits().
+    if not settings.trading.auto_trade_enabled:
+        realized_pnl   = float(bot.paper_trader._total_pnl)
+        unrealized_pnl = sum(float(p.get("pnl", 0.0)) for p in bot.paper_trader._positions)
+        return {
+            "daily_pnl":   round(realized_pnl + unrealized_pnl, 2),
+            "current_pnl": round(unrealized_pnl, 2),
+            "last_updated": now.isoformat(),
+        }
+
     cache = getattr(app.state, "pnl_cache", None)
     cache_time = getattr(app.state, "pnl_cache_time", None)
 
@@ -325,10 +342,30 @@ async def execute_command(command: dict):
 
 @app.get("/api/positions")
 async def get_positions():
-    """Get current open positions from Kite API"""
+    """Get current open positions from Kite API (or paper_trader in paper mode)"""
     if not bot:
         raise HTTPException(status_code=503, detail="Bot not initialized")
-    
+
+    # Paper trading mode — serve paper_trader open positions
+    if not settings.trading.auto_trade_enabled:
+        positions = []
+        for pos in bot.paper_trader._positions:
+            pnl_pct       = pos.get("pnl_pct", 0.0)
+            premium_entry = pos.get("premium_entry", 0.0)
+            est_ltp       = round(premium_entry * (1 + pnl_pct / 100), 2)
+            positions.append({
+                "symbol":        f"{pos['index_name']} {pos['option_type']}",
+                "product":       "PAPER",
+                "quantity":      1,
+                "average_price": round(premium_entry, 2),
+                "last_price":    est_ltp,
+                "pnl":           round(pos.get("pnl", 0.0), 2),
+                "exchange":      "PAPER",
+                "strategy":      pos.get("strategy", ""),
+                "entry_time":    pos.get("entry_time", ""),
+            })
+        return {"positions": positions, "source": "paper_trader"}
+
     # Fetch live positions from Kite API
     try:
         kite_data = await bot.kite.get_kite_positions()
@@ -366,10 +403,59 @@ async def get_positions():
 
 @app.get("/api/trades")
 async def get_trades():
-    """Get today's trades (open + closed) from Kite API"""
+    """Get today's trades (open + closed) from Kite API or paper_trader."""
     if not bot:
         raise HTTPException(status_code=503, detail="Bot not initialized")
-    
+
+    # Paper trading mode — return paper_trader open + closed trades
+    if not settings.trading.auto_trade_enabled:
+        today_str  = datetime.now().date().isoformat()
+        all_trades = []
+        # Open paper positions (live unrealised P&L updated by check_exits)
+        for pos in bot.paper_trader._positions:
+            pnl_pct       = pos.get("pnl_pct", 0.0)
+            premium_entry = pos.get("premium_entry", 0.0)
+            est_ltp       = round(premium_entry * (1 + pnl_pct / 100), 2)
+            all_trades.append({
+                "symbol":        f"{pos['index_name']} {pos['option_type']} [{pos['strategy']}]",
+                "product":       "PAPER",
+                "buy_quantity":  1,
+                "sell_quantity": 0,
+                "quantity":      1,
+                "average_price": round(premium_entry, 2),
+                "last_price":    est_ltp,
+                "pnl":           round(pos.get("pnl", 0.0), 2),
+                "realised":      0.0,
+                "unrealised":    round(pos.get("pnl", 0.0), 2),
+                "status":        "OPEN",
+                "exchange":      "PAPER",
+                "exit_reason":   "",
+            })
+        # Closed paper trades from today
+        for trade in bot.paper_trader._trades:
+            if trade.get("entry_time", "")[:10] != today_str:
+                continue
+            premium_entry = trade.get("premium_entry", 0.0)
+            pnl_pct       = trade.get("pnl_pct", 0.0)
+            est_exit      = round(premium_entry * (1 + pnl_pct / 100), 2)
+            all_trades.append({
+                "symbol":        f"{trade['index_name']} {trade['option_type']} [{trade['strategy']}]",
+                "product":       "PAPER",
+                "buy_quantity":  1,
+                "sell_quantity": 1,
+                "quantity":      0,
+                "average_price": round(premium_entry, 2),
+                "last_price":    est_exit,
+                "pnl":           round(trade.get("pnl", 0.0), 2),
+                "realised":      round(trade.get("pnl", 0.0), 2),
+                "unrealised":    0.0,
+                "status":        "CLOSED",
+                "exchange":      "PAPER",
+                "exit_reason":   trade.get("exit_reason", ""),
+            })
+        total_pnl = sum(t["pnl"] for t in all_trades)
+        return {"trades": all_trades, "total_pnl": round(total_pnl, 2), "count": len(all_trades)}
+
     try:
         kite_data = await bot.kite.get_kite_positions()
         day_trades = [

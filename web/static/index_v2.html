@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trading Bot | NIFTY - BANKNIFTY - SENSEX</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
             --bg-primary: #0a0a0f;
@@ -1189,6 +1190,135 @@
             }
         }
 
+        /* ===== TOAST NOTIFICATIONS ===== */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            pointer-events: none;
+        }
+        .toast {
+            pointer-events: auto;
+            min-width: 280px;
+            max-width: 380px;
+            padding: 12px 16px;
+            border-radius: var(--radius-md);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-color);
+            border-left-width: 4px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 13px;
+            animation: toastIn 0.3s cubic-bezier(0.4,0,0.2,1);
+        }
+        .toast.toast-out {
+            animation: toastOut 0.3s cubic-bezier(0.4,0,0.2,1) forwards;
+        }
+        .toast.success  { border-left-color: var(--accent-green); }
+        .toast.error    { border-left-color: var(--accent-red); }
+        .toast.warning  { border-left-color: var(--accent-orange); }
+        .toast.info     { border-left-color: var(--accent-cyan); }
+        .toast.signal   { border-left-color: var(--accent-magenta); }
+        .toast-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+        .toast-body { flex: 1; }
+        .toast-title { font-weight: 600; color: var(--text-primary); margin-bottom: 2px; }
+        .toast-msg   { color: var(--text-secondary); font-size: 12px; }
+        .toast-close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; flex-shrink: 0; }
+        .toast-close:hover { color: var(--text-primary); }
+        @keyframes toastIn {
+            from { transform: translateX(120%); opacity: 0; }
+            to   { transform: translateX(0);    opacity: 1; }
+        }
+        @keyframes toastOut {
+            from { transform: translateX(0);    opacity: 1; max-height: 80px; margin-bottom: 8px; }
+            to   { transform: translateX(120%); opacity: 0; max-height: 0;   margin-bottom: 0; }
+        }
+
+        /* ===== THEME TOGGLE ===== */
+        .theme-toggle-btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            flex-shrink: 0;
+        }
+        .theme-toggle-btn:hover {
+            background: var(--bg-hover, var(--bg-elevated));
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            transform: scale(1.1);
+        }
+
+        /* ===== LIGHT THEME OVERRIDE ===== */
+        body.light-theme {
+            --bg-primary:    #f0f2f5;
+            --bg-secondary:  #ffffff;
+            --bg-tertiary:   #e8eaed;
+            --bg-card:       rgba(255,255,255,0.85);
+            --bg-elevated:   rgba(255,255,255,0.95);
+            --text-primary:  #1a1a2e;
+            --text-secondary: #444466;
+            --text-muted:    #888899;
+            --border-color:  rgba(0,0,0,0.1);
+            --accent-cyan:   #0099cc;
+            --accent-green:  #00aa55;
+            --accent-red:    #cc2244;
+            --accent-orange: #cc6600;
+            --accent-magenta:#aa0099;
+            --accent-purple: #6633cc;
+        }
+        body.light-theme .app-container {
+            background-image:
+                radial-gradient(ellipse 80% 50% at 20% -20%, rgba(0,153,204,0.08), transparent),
+                radial-gradient(ellipse 60% 40% at 80% 0%, rgba(0,170,85,0.06), transparent);
+        }
+
+        /* ===== UPTIME CLOCK ===== */
+        .uptime-badge {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            letter-spacing: 0.5px;
+        }
+
+        /* ===== LOG LEVEL COLOURING ===== */
+        .log-info    { color: var(--accent-cyan); }
+        .log-success { color: var(--accent-green); }
+        .log-warning { color: var(--accent-orange); font-weight: 600; }
+        .log-error   { color: var(--accent-red);    font-weight: 600; }
+        .log-signal  { color: var(--accent-magenta); font-weight: 600; }
+        .log-debug   { color: var(--text-muted); font-size: 11px; }
+
+        /* ===== PERFORMANCE CHART ===== */
+        .perf-chart-wrap {
+            padding: 16px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-md);
+            margin-bottom: 12px;
+        }
+        .perf-chart-wrap canvas {
+            max-height: 180px;
+        }
+
     </style>
 </head>
 <body>
@@ -1218,16 +1348,21 @@
             </div>
 
             <div class="header-right">
+                <span class="uptime-badge" id="uptimeBadge" title="Bot uptime">⏱ 00:00:00</span>
                 <div class="status-badge" id="wsStatusBadge">
                     <span class="dot"></span>
                     <span id="wsStatusText">Disconnected</span>
                 </div>
                 <div class="status-badge" id="kiteStatus">
                     <span class="dot"></span>
-                    <span>Kite: Offline</span>
+                    <span>Dhan: Offline</span>
                 </div>
+                <button class="theme-toggle-btn" id="themeToggleBtn" title="Toggle light/dark theme" onclick="toggleTheme()">🌙</button>
             </div>
         </header>
+
+        <!-- TOAST CONTAINER -->
+        <div class="toast-container" id="toastContainer"></div>
 
         <!-- MAIN LAYOUT -->
         <div class="main-layout">
@@ -1495,10 +1630,15 @@
                         </div>
                         <div class="stat-card compact">
                             <div class="stat-card-header">
-                                <span class="stat-icon">📋</span>
+                                <span class="stat-icon">�</span>
                                 <span class="stat-label">Trades Today</span>
                             </div>
                             <span class="stat-value" id="tradesTodayCount">0</span>
+                        </div>
+                        <!-- P&L Performance Chart -->
+                        <div class="perf-chart-wrap" id="perfChartWrap" style="display:none">
+                            <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px; font-weight:600;">P&amp;L Curve</div>
+                            <!-- canvas injected by initPerfChart() -->
                         </div>
                     </div>
 
@@ -1623,6 +1763,51 @@
         let symbolExchange = 'ALL';
         let suggestionTimer = null;
         let autoSwitchEnabled = true;  // default: auto index selection
+        const _botStartTime = Date.now();
+        let _currentTheme = localStorage.getItem('botTheme') || 'dark';
+
+        // Apply saved theme immediately
+        if (_currentTheme === 'light') {
+            document.body.classList.add('light-theme');
+            document.addEventListener('DOMContentLoaded', () => {
+                const btn = document.getElementById('themeToggleBtn');
+                if (btn) btn.textContent = '☀️';
+            });
+        }
+
+        function toggleTheme() {
+            _currentTheme = _currentTheme === 'dark' ? 'light' : 'dark';
+            localStorage.setItem('botTheme', _currentTheme);
+            document.body.classList.toggle('light-theme', _currentTheme === 'light');
+            const btn = document.getElementById('themeToggleBtn');
+            if (btn) btn.textContent = _currentTheme === 'light' ? '☀️' : '🌙';
+        }
+
+        // ── Uptime clock ───────────────────────────────────────────────────
+        function updateUptime() {
+            const elapsed = Math.floor((Date.now() - _botStartTime) / 1000);
+            const h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
+            const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
+            const s = String(elapsed % 60).padStart(2, '0');
+            const el = document.getElementById('uptimeBadge');
+            if (el) el.textContent = `⏱ ${h}:${m}:${s}`;
+        }
+        setInterval(updateUptime, 1000);
+
+        // ── Toast notifications ────────────────────────────────────────────
+        function showToast(title, msg, type = 'info', duration = 4000) {
+            const icons = { success:'✅', error:'❌', warning:'⚠️', info:'ℹ️', signal:'🎯' };
+            const container = document.getElementById('toastContainer');
+            if (!container) return;
+            const t = document.createElement('div');
+            t.className = `toast ${type}`;
+            t.innerHTML = `<span class="toast-icon">${icons[type] || 'ℹ️'}</span><div class="toast-body"><div class="toast-title">${title}</div>${msg ? `<div class="toast-msg">${msg}</div>` : ''}</div><button class="toast-close" onclick="this.closest('.toast').remove()">✕</button>`;
+            container.appendChild(t);
+            setTimeout(() => {
+                t.classList.add('toast-out');
+                setTimeout(() => t.remove(), 320);
+            }, duration);
+        }
 
         // ── Ledger state ────────────────────────────────────────────────────
         let _ledgerRecords = [];
@@ -1902,16 +2087,41 @@
                 case 'user': messageClass += 'user'; break;
                 case 'bot': messageClass += 'bot'; break;
                 case 'system': messageClass += 'system'; break;
-                case 'error': case 'trade_error': messageClass += 'error'; break;
-                case 'success': case 'trade_success': messageClass += 'success'; break;
+                case 'error': case 'trade_error':
+                    messageClass += 'error';
+                    showToast('Bot Error', data.message.substring(0, 80), 'error');
+                    break;
+                case 'success': case 'trade_success':
+                    messageClass += 'success';
+                    showToast('Trade Success', data.message.substring(0, 80), 'success');
+                    break;
                 case 'analysis': messageClass += 'analysis'; updateStatsFromAnalysis(data.message); break;
-                case 'trade_signal': messageClass += 'bot'; break;
-                case 'alert': messageClass += 'alert'; playAlertSound(); break;
-                case 'rule_triggered': messageClass += 'rule_triggered'; break;
+                case 'trade_signal':
+                    messageClass += 'bot';
+                    showToast('📊 Signal', data.message.substring(0, 80), 'signal', 6000);
+                    break;
+                case 'alert':
+                    messageClass += 'alert';
+                    playAlertSound();
+                    showToast('⚠️ Alert', data.message.substring(0, 80), 'warning', 6000);
+                    break;
+                case 'rule_triggered':
+                    messageClass += 'rule_triggered';
+                    showToast('Rule Triggered', data.message.substring(0, 80), 'info');
+                    break;
                 default: messageClass += 'bot';
             }
+            // ── Log level colour coding ──────────────────────────────────
+            const rawMsg = data.message || '';
+            let logClass = '';
+            if (rawMsg.includes('ERROR') || rawMsg.includes('❌') || data.type === 'error' || data.type === 'trade_error') logClass = 'log-error';
+            else if (rawMsg.includes('WARNING') || rawMsg.includes('⚠️')) logClass = 'log-warning';
+            else if (rawMsg.includes('PAPER TRADE') || rawMsg.includes('🎯') || data.type === 'trade_signal') logClass = 'log-signal';
+            else if (data.type === 'success' || data.type === 'trade_success' || rawMsg.includes('✅')) logClass = 'log-success';
+            else if (data.type === 'analysis') logClass = 'log-info';
             messageDiv.className = messageClass;
-            messageDiv.innerHTML = `<div>${escapeHtml(data.message)}</div><div class="message-time">${formatTime(data.timestamp)}</div>`;
+            const escapedMsg = escapeHtml(rawMsg);
+            messageDiv.innerHTML = `<div class="${logClass}">${escapedMsg}</div><div class="message-time">${formatTime(data.timestamp)}</div>`;
             chatMessages.appendChild(messageDiv);
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
@@ -2277,8 +2487,38 @@
                 }
 
                 // ── Market Overview: Regime ───────────────────────────────────
-                if (data.regime || (data.paper_trading && data.paper_trading._regime)) {
-                    // Regime comes via analysis messages; attempt to read from cached signal
+                if (data.regime) {
+                    const regEl = document.getElementById('marketRegime');
+                    if (regEl) {
+                        const r = data.regime;
+                        regEl.textContent = r;
+                        if (r.includes('TRENDING')) regEl.className = 'stat-value positive';
+                        else if (r === 'VOLATILE') regEl.className = 'stat-value negative';
+                        else regEl.className = 'stat-value neutral';
+                    }
+                }
+
+                // ── Market Overview: India VIX ────────────────────────────────
+                if (data.india_vix != null) {
+                    const vixEl = document.getElementById('indiaVix');
+                    if (vixEl) {
+                        vixEl.textContent = parseFloat(data.india_vix).toFixed(1);
+                        const v = parseFloat(data.india_vix);
+                        if (v < 15) vixEl.className = 'stat-value positive';
+                        else if (v < 20) vixEl.className = 'stat-value neutral';
+                        else vixEl.className = 'stat-value negative';
+                    }
+                }
+
+                // ── Market Data: Trend ────────────────────────────────────────
+                if (data.trend) {
+                    const trendEl = document.getElementById('currentTrend');
+                    if (trendEl) {
+                        trendEl.textContent = data.trend;
+                        if (data.trend === 'BULLISH') trendEl.className = 'stat-value positive';
+                        else if (data.trend === 'BEARISH') trendEl.className = 'stat-value negative';
+                        else trendEl.className = 'stat-value neutral';
+                    }
                 }
 
                 // ── Straddle Summary ─────────────────────────────────────────
@@ -2418,21 +2658,36 @@
                 if (countEl) countEl.textContent = data.count || 0;
                 if (!data.trades || data.trades.length === 0) {
                     container.innerHTML = '<div style="color: var(--text-muted); font-size: 12px;">No trades today</div>';
+                    // Hide chart if no trades
+                    const wrap = document.getElementById('perfChartWrap');
+                    if (wrap) wrap.style.display = 'none';
                     return;
                 }
                 const pnlColor = data.total_pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
                 let html = `<div style="font-weight:700; margin-bottom:6px; color:${pnlColor};">Total P&L: ₹${data.total_pnl.toFixed(2)}</div>`;
                 data.trades.forEach(t => {
+                    const isPaper    = t.exchange === 'PAPER';
                     const statusColor = t.status === 'OPEN' ? 'var(--accent-cyan)' : (t.pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)');
-                    const statusLabel = t.status === 'OPEN' ? '🟢 OPEN' : '🔴 CLOSED';
+                    const exitLabel  = t.exit_reason ? t.exit_reason.replace(/_/g, ' ') : 'CLOSED';
+                    const statusLabel = t.status === 'OPEN'
+                        ? (isPaper ? '📋 PAPER OPEN' : '🟢 OPEN')
+                        : (isPaper ? `📋 ${exitLabel}` : '🔴 CLOSED');
+                    const pnlPrefix  = t.pnl >= 0 ? '+₹' : '-₹';
                     html += `<div style="border: 1px solid var(--border-color); border-radius: 6px; padding: 7px 9px; margin-bottom: 6px; background: var(--bg-secondary);">`;
                     html += `<div style="font-weight:600; color: var(--text-primary); margin-bottom:3px; word-break:break-all;">${escapeHtml(String(t.symbol || ''))}</div>`;
-                    html += `<div style="display:flex; justify-content:space-between; color:var(--text-secondary);"><span>${statusLabel}</span><span>Qty: ${t.buy_quantity}/${t.sell_quantity}</span></div>`;
-                    html += `<div style="display:flex; justify-content:space-between; margin-top:3px;"><span style="color:var(--text-muted);">Avg: ₹${t.average_price.toFixed(2)} | LTP: ₹${t.last_price.toFixed(2)}</span></div>`;
-                    html += `<div style="color:${statusColor}; font-weight:600; text-align:right; margin-top:3px;">P&L: ₹${t.pnl.toFixed(2)}</div>`;
+                    html += `<div style="display:flex; justify-content:space-between; color:var(--text-secondary);"><span style="color:${statusColor};">${statusLabel}</span><span>Avg: ₹${(t.average_price||0).toFixed(2)}</span></div>`;
+                    html += `<div style="display:flex; justify-content:space-between; margin-top:3px;"><span style="color:var(--text-muted);">LTP: ₹${(t.last_price||0).toFixed(2)}</span><span style="color:${statusColor}; font-weight:700;">${pnlPrefix}${Math.abs(t.pnl||0).toFixed(2)}</span></div>`;
                     html += `</div>`;
                 });
                 container.innerHTML = html;
+                // Update P&L chart with closed trades
+                const closed = data.trades.filter(t => t.status !== 'OPEN');
+                if (closed.length > 0) {
+                    const wrap = document.getElementById('perfChartWrap');
+                    if (wrap) wrap.style.display = '';
+                    if (!_perfChart) initPerfChart();
+                    updatePerfChart(closed);
+                }
             } catch (e) {
                 // On startup the bot may not be ready yet — show a soft retry message
                 container.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; cursor:pointer;" onclick="loadTrades()">⟳ Click to reload trades</div>';
@@ -2455,6 +2710,62 @@
             }
         }
 
+        // ── Performance chart (P&L over trades) ──────────────────────────
+        let _perfChart = null;
+        let _perfLabels = [];
+        let _perfData   = [];
+
+        function initPerfChart() {
+            const wrap = document.getElementById('perfChartWrap');
+            if (!wrap) return;
+            // Inject canvas if not present
+            if (!document.getElementById('perfChartCanvas')) {
+                wrap.innerHTML = '<canvas id="perfChartCanvas" height="160"></canvas>';
+            }
+            if (typeof Chart === 'undefined') return;
+            const ctx = document.getElementById('perfChartCanvas').getContext('2d');
+            _perfChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: _perfLabels, datasets: [{
+                    label: 'Cumulative P&L (₹)',
+                    data: _perfData,
+                    borderColor: '#00d4ff',
+                    backgroundColor: 'rgba(0,212,255,0.08)',
+                    borderWidth: 2,
+                    pointRadius: 4,
+                    pointBackgroundColor: '#00d4ff',
+                    tension: 0.4,
+                    fill: true
+                }]},
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { grid: { color: 'rgba(255,255,255,0.06)' }, ticks: { color: '#a0a0b0', callback: v => '₹'+v } },
+                        x: { grid: { color: 'rgba(255,255,255,0.06)' }, ticks: { color: '#a0a0b0', maxRotation: 0 } }
+                    }
+                }
+            });
+        }
+
+        function updatePerfChart(trades) {
+            if (!_perfChart) return;
+            _perfLabels = [];
+            _perfData   = [];
+            let cum = 0;
+            trades.forEach((t, i) => {
+                cum += (t.pnl || 0);
+                _perfLabels.push('T' + (i + 1));
+                _perfData.push(parseFloat(cum.toFixed(2)));
+            });
+            _perfChart.data.labels   = _perfLabels;
+            _perfChart.data.datasets[0].data = _perfData;
+            _perfChart.data.datasets[0].borderColor = cum >= 0 ? '#00ff88' : '#ff4466';
+            _perfChart.data.datasets[0].backgroundColor = cum >= 0 ? 'rgba(0,255,136,0.08)' : 'rgba(255,68,102,0.08)';
+            _perfChart.update('none');
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             updateMarketStatus();
             connectWebSocket();
@@ -2467,6 +2778,10 @@
             setInterval(fetchPnL, 5000);   // refresh P&L every 5 seconds (broker API with 5s cache)
             setInterval(loadTrades, 30000);
             setInterval(loadIndicesComparison, 60000);
+            // Init chart after Chart.js has loaded
+            setTimeout(initPerfChart, 500);
+            // Startup toast
+            setTimeout(() => showToast('Bot Dashboard Ready', 'Paper trading mode active', 'success', 3000), 800);
             
             // Auto-load all symbols on startup
             loadAllSymbols();

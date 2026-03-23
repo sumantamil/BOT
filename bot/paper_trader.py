@@ -39,9 +39,10 @@ _DEFAULT_TARGET_PCT  = 50.0   # matches TRADING_TARGET_PERCENTAGE
 _OPTION_LEVERAGE     = 2.5    # rough ATM option leverage (delta 0.5 × 5× index move)
 _PREMIUM_RATIO       = 0.008  # ATM premium ≈ 0.8% of index (NIFTY 22500 → ~180 pts)
 _SAVE_PATH           = "paper_trades.json"
+_CSV_PATH            = "paper_trades_export.csv"
 
-# Hard time‑stop: close positions entered before 13:00 when clock reaches 13:00
-_HARD_EXIT_HOUR   = 13
+# Hard time‑stop defaults (overridden per‑instance via configure())
+_HARD_EXIT_HOUR   = 13   # positions entered before this hour are closed when we reach it
 _MARKET_CLOSE_H   = 15
 _MARKET_CLOSE_M   = 27
 
@@ -55,8 +56,13 @@ class PaperTrader:
         self._total_pnl: float      = 0.0
 
         # Risk config — will be overridden by configure()
-        self._sl_pct:     float = _DEFAULT_SL_PCT
-        self._target_pct: float = _DEFAULT_TARGET_PCT
+        self._sl_pct:          float = _DEFAULT_SL_PCT
+        self._target_pct:      float = _DEFAULT_TARGET_PCT
+
+        # Smart time-exit config (overridden by configure())
+        self._hard_exit_hour:    int   = _HARD_EXIT_HOUR
+        self._exit_only_losers:  bool  = False   # if True, profitable trades skip soft exit
+        self._exit_min_profit:   float = 50.0    # ₹ threshold to classify a trade as "winning"
 
         # Optional async callback injected by engine: async def alert(msg, type)
         self._alert_cb: _AlertCallback = None
@@ -73,13 +79,23 @@ class PaperTrader:
         sl_pct: float,
         target_pct: float,
         alert_cb: _AlertCallback = None,
+        hard_time_exit_hour: int = _HARD_EXIT_HOUR,
+        time_exit_only_losers: bool = False,
+        time_exit_min_profit: float = 50.0,
     ) -> None:
-        """Sync SL / target percentages from .env at startup.
+        """Sync SL / target / time-exit settings from .env at startup.
         Optionally inject the engine's _send_telegram_alert coroutine."""
-        self._sl_pct     = sl_pct
-        self._target_pct = target_pct
-        self._alert_cb   = alert_cb
-        logger.debug(f"PaperTrader configured: SL={sl_pct}%  Target={target_pct}%")
+        self._sl_pct            = sl_pct
+        self._target_pct        = target_pct
+        self._alert_cb          = alert_cb
+        self._hard_exit_hour    = hard_time_exit_hour
+        self._exit_only_losers  = time_exit_only_losers
+        self._exit_min_profit   = time_exit_min_profit
+        logger.debug(
+            f"PaperTrader configured: SL={sl_pct}%  Target={target_pct}%  "
+            f"HardExit={hard_time_exit_hour}:00  "
+            f"OnlyLosers={time_exit_only_losers}  MinProfit=₹{time_exit_min_profit:.0f}"
+        )
 
     def paper_buy(
         self,
@@ -155,7 +171,7 @@ class PaperTrader:
         now = datetime.now().time()
         now_str = datetime.now().strftime("%H:%M:%S")
         market_close = dtime(_MARKET_CLOSE_H, _MARKET_CLOSE_M)
-        hard_exit    = dtime(_HARD_EXIT_HOUR, 0)
+        hard_exit    = dtime(self._hard_exit_hour, 0)
 
         for pos in list(self._positions):
             idx_name  = pos["index_name"]
@@ -178,6 +194,11 @@ class PaperTrader:
             # Cap: can't lose more than 100%, can gain up to 300%
             option_change_pct = max(-100.0, min(option_change_pct, 300.0))
 
+            # Store live unrealised P&L in the position dict so /api/pnl and
+            # /api/trades can serve current values without waiting for a close event.
+            pos["pnl"]     = round(pos["premium_entry"] * option_change_pct / 100, 2)
+            pos["pnl_pct"] = round(option_change_pct, 2)
+
             # Verbose live P&L trace — always shown while position is open
             logger.info(
                 f"📋 PAPER LIVE [{now_str}] #{pos['id']}: "
@@ -198,7 +219,16 @@ class PaperTrader:
             elif now >= hard_exit and pos["strategy"] not in ("EOD",):
                 entry_t = datetime.fromisoformat(pos["entry_time"]).time()
                 if entry_t < hard_exit:
-                    reason = "TIME_STOP_13:00"
+                    # Smart time exit: let profitable trades run toward target
+                    if self._exit_only_losers and pos["pnl"] >= self._exit_min_profit:
+                        logger.info(
+                            f"📋 PAPER HOLD [{now_str}] #{pos['id']}: "
+                            f"{pos['index_name']} {pos['option_type']} [{pos['strategy']}] "
+                            f"— profitable (₹{pos['pnl']:+.0f} ≥ ₹{self._exit_min_profit:.0f}), "
+                            f"skipping {self._hard_exit_hour:02d}:00 time stop — letting winner run 🏃"
+                        )
+                    else:
+                        reason = f"TIME_STOP_{self._hard_exit_hour:02d}:00"
 
             if reason:
                 self._close_position(pos, idx_price, option_change_pct, reason)
@@ -211,10 +241,13 @@ class PaperTrader:
         wins   = [t for t in all_trades if t["pnl"] > 0]
         losses = [t for t in all_trades if t["pnl"] <= 0]
         total  = len(all_trades)
+        unrealized_pnl = round(sum(p.get("pnl", 0.0) for p in self._positions), 2)
         return {
             "total_trades":   total,
             "open_positions": len(self._positions),
-            "total_pnl":      round(self._total_pnl, 2),
+            "total_pnl":      round(self._total_pnl + unrealized_pnl, 2),
+            "realized_pnl":   round(self._total_pnl, 2),
+            "unrealized_pnl": unrealized_pnl,
             "wins":           len(wins),
             "losses":         len(losses),
             "win_rate":       f"{len(wins) / total * 100:.1f}%" if total else "0%",
@@ -279,6 +312,56 @@ class PaperTrader:
                 json.dump(data, f, indent=2, default=str)
         except Exception as e:
             logger.warning(f"PaperTrader: could not save to {_SAVE_PATH}: {e}")
+        # Keep CSV in sync after every close
+        self.export_to_csv()
+
+    def export_to_csv(self, csv_path: str = _CSV_PATH) -> None:
+        """Export all closed trades to CSV for external analysis / spreadsheet review."""
+        import csv as _csv
+        if not self._trades:
+            return
+        fieldnames = [
+            "id", "date", "entry_time", "exit_time", "duration_mins",
+            "strategy", "index_name", "option_type",
+            "index_entry", "premium_entry", "index_exit",
+            "pnl", "pnl_pct", "exit_reason",
+        ]
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = _csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for t in self._trades:
+                    try:
+                        entry_dt = datetime.fromisoformat(t.get("entry_time", ""))
+                    except Exception:
+                        entry_dt = datetime.now()
+                    exit_str = t.get("exit_time", "")
+                    try:
+                        exit_dt: Optional[datetime] = datetime.fromisoformat(exit_str) if exit_str else None
+                    except Exception:
+                        exit_dt = None
+                    duration = round(
+                        (exit_dt - entry_dt).total_seconds() / 60, 1
+                    ) if exit_dt else 0.0
+                    w.writerow({
+                        "id":            t.get("id"),
+                        "date":          entry_dt.strftime("%Y-%m-%d"),
+                        "entry_time":    entry_dt.strftime("%H:%M:%S"),
+                        "exit_time":     exit_dt.strftime("%H:%M:%S") if exit_dt else "",
+                        "duration_mins": duration,
+                        "strategy":      t.get("strategy", ""),
+                        "index_name":    t.get("index_name", ""),
+                        "option_type":   t.get("option_type", ""),
+                        "index_entry":   t.get("index_entry", 0),
+                        "premium_entry": t.get("premium_entry", 0),
+                        "index_exit":    t.get("index_exit", 0),
+                        "pnl":           t.get("pnl", 0),
+                        "pnl_pct":       t.get("pnl_pct", 0),
+                        "exit_reason":   t.get("exit_reason", ""),
+                    })
+            logger.debug(f"PaperTrader: CSV updated → {csv_path} ({len(self._trades)} trades)")
+        except Exception as e:
+            logger.warning(f"PaperTrader: could not export CSV: {e}")
 
     def _load_from_file(self) -> None:
         """Reload closed trades from a previous session so totals are cumulative."""

@@ -15,6 +15,12 @@ python main.py
 
 Then open: **http://localhost:8000**
 
+> Before going live, run the pre-live health check:
+> ```powershell
+> python pre_live_checklist.py
+> ```
+> All critical checks must pass before setting `TRADING_AUTO_TRADE_ENABLED=true`.
+
 ---
 
 ## Installation (First Time Setup)
@@ -117,12 +123,17 @@ TRADING_CLOSE_ALL_BEFORE_MARKET_CLOSE=3
 # GAP=60min, ORB=45min, VWAP=30min, Auto=90min, EOD=15min, Manual/Rule=45min
 TRADING_TIME_STOP_MINUTES=45        # default; overridden per-strategy source
 
+# Smart time-based exit — only close LOSING positions at 13:00 IST
+# Profitable positions (pnl >= TIME_EXIT_MIN_PROFIT) are left to run toward target
+TRADING_TIME_EXIT_ONLY_LOSERS=true
+TRADING_TIME_EXIT_MIN_PROFIT=50      # ₹ threshold — positions above this skip the time stop
+
 # Hard cutoffs
 TRADING_HARD_TIME_EXIT_HOUR=13      # force-close positions entered before 13:00 at 13:00 IST
 
 # India VIX filter
 TRADING_VIX_FILTER_ENABLED=true
-TRADING_VIX_MAX=20                  # auto-entries blocked when India VIX > 20
+TRADING_VIX_MAX=27                  # auto-entries blocked when India VIX > 27
 
 # IV Percentile filter (strike-level — needs 5+ days of .iv_history.json before activating)
 TRADING_IV_FILTER_ENABLED=false     # enable after first week of live trading
@@ -169,7 +180,6 @@ VWAP_RSI_OVERBOUGHT=62        # for SHORT signal (default: 62)
 # EOD Closing Momentum (14:30–15:00 IST)
 EOD_ENABLED=true
 EOD_MIN_BODY_PCT=0.5          # 50% body minimum to avoid doji candles
-
 # ============ ENTRY FILTER & POSITION SIZER ============
 # Entry scoring — signals must score ≥70/100 to be accepted
 FILTER_ENABLED=true
@@ -587,6 +597,12 @@ nifty-trading-bot/
 ├── .env                        # Credentials & settings (never commit)
 ├── pytest.ini                  # asyncio_mode=auto
 ├── README.md
+├── pre_live_checklist.py       # ⭐ Go/no-go health check before enabling live trading (11 checks)
+├── analyze_paper_trades.py     # Paper trade analysis: stats, per-strategy, exit reasons, recommendations
+├── analyze_time_stop.py        # Time-stop opportunity-cost analysis (actual vs potential P&L)
+├── visualize_time_impact.py    # Charts: actual vs potential P&L by exit type (matplotlib + ASCII fallback)
+├── check_gap.py                # Gap strategy diagnostic: today's gaps, 8 scenario tests, 30-day history
+├── check_eod.py                # EOD strategy diagnostic: config, live candle check, win/loss history
 ├── bot/
 │   ├── engine.py               # Core orchestration: 6 strategies, 3-index scan, daily slots
 │   ├── trend_analyzer.py       # 15-indicator trend scoring with adaptive ATR threshold
@@ -647,6 +663,37 @@ Ctrl+C
 Or if running in background:
 ```powershell
 Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+### End-of-Day Analysis
+```powershell
+# Full paper trade report (overall stats, per-strategy, exit reasons, recommendations)
+python analyze_paper_trades.py
+
+# Check if time-stop is costing you potential profits
+python analyze_time_stop.py
+
+# Visual P&L comparison chart (saves time_stop_impact.png)
+python visualize_time_impact.py --ascii   # ASCII (no extra deps)
+python visualize_time_impact.py           # matplotlib charts
+```
+
+### Pre-Market Checks
+```powershell
+# Check today's opening gap for all 3 indices
+python check_gap.py
+
+# Verify all systems before going live
+python pre_live_checklist.py
+```
+
+### During 14:30–15:00 IST (EOD Window)
+```powershell
+# Live EOD candle monitor — re-checks every 60 seconds
+python check_eod.py --live
+
+# Check EOD win/loss history
+python check_eod.py --perf
 ```
 
 ### Zerodha — Daily Token Refresh (8:45 AM)
@@ -793,6 +840,8 @@ TRADING_MAX_DAILY_LOSS=2000
 | Theta drain warning every cycle | Normal — informational only. Adjust `TRADING_THETA_EXIT_THRESHOLD` or set `TRADING_THETA_EXIT_ENABLED=false` |
 | Trade blocked "potential loss would breach daily cap" | Expected after earlier losses — the pre-trade risk gate blocks trades that would exceed `TRADING_MAX_DAILY_LOSS` even before the SL fires. Either wait for tomorrow or lower quantity. |
 | EOD win rate warning in logs | After 20 EOD trades, check `iv status` for EOD win rate. Set `EOD_ENABLED=false` if below 55%. |
+| Winners closed early at 1 PM | Set `TRADING_TIME_EXIT_ONLY_LOSERS=true` and `TRADING_TIME_EXIT_MIN_PROFIT=50` in `.env`. Run `python analyze_time_stop.py` to quantify the impact. |
+| Time-stop has no effect on losers | Confirm `TRADING_HARD_TIME_EXIT_HOUR=13` and `TRADING_TIME_EXIT_ONLY_LOSERS=true` in `.env`. Restart the bot. |
 | P&L shows wrong value | Verify broker API connection (green badge in dashboard) |
 | `asyncio` test errors | `pip install pytest-asyncio` |
 | PowerShell script blocked | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
@@ -800,6 +849,66 @@ TRADING_MAX_DAILY_LOSS=2000
 ---
 
 ## Changelog
+
+### March 2026 — Session 7: Smart Time Exit · Paper Trade Analytics · Pre-Live Checklist
+
+**Smart time-based exit — winners let run:**
+- Previous behaviour: ALL positions entered before 13:00 IST were force-closed at 13:00 regardless of P&L
+- Analysis (`analyze_time_stop.py`) showed 4/6 paper trades closed by time stop with only ₹11.76 total profit — vs ₹2,062 potential (99.4% opportunity cost)
+- New behaviour: positions already profitable (P&L ≥ `TRADING_TIME_EXIT_MIN_PROFIT`) are **skipped** at the hard-exit boundary; only losing/breakeven positions are closed
+- Applies to both paper trading (`bot/paper_trader.py`) and live trading (`bot/engine.py`)
+- New `.env` settings:
+  ```env
+  TRADING_TIME_EXIT_ONLY_LOSERS=true   # only close losers at hard-exit time
+  TRADING_TIME_EXIT_MIN_PROFIT=50      # ₹ threshold — positions above this skip the time stop
+  ```
+- New `TradingConfig` fields: `time_exit_only_losers: bool` and `time_exit_min_profit: float`
+- `PaperTrader.configure()` now accepts these settings; engine passes them from config at startup
+
+**New analysis tool — `analyze_time_stop.py`:**
+- Reads `paper_trades.json` and shows per-trade actual P&L vs potential P&L (if held to target)
+- Calculates total opportunity cost from time-stop exits and severity classification (HIGH/MODERATE/LOW)
+- Detects whether smart time-exit is already applied in `.env` and shows ✅ / ❌ status
+- Usage: `python analyze_time_stop.py` (full report) or `--summary` (totals + recommendation)
+
+**New analysis tool — `visualize_time_impact.py`:**
+- Visual comparison: actual P&L vs potential P&L by exit type
+- Three charts: total P&L by exit type, average per-trade, and opportunity-cost waterfall
+- Saves PNG to `time_stop_impact.png`; falls back to ASCII bar chart if matplotlib not installed
+- Usage: `python visualize_time_impact.py` / `--ascii` (force ASCII) / `--save` (PNG only, no window)
+
+**New tool — `pre_live_checklist.py` — comprehensive go/no-go check:**
+- 11-section health check against the real codebase — no mock classes
+- Checks: configuration (capital, SL/target, R:R), broker credentials (Dhan JWT/Zerodha daily token), paper trading results (win rate, profit factor, per-strategy), risk management (trailing stop, profit tiers, VIX/IV/theta filters), time-exit rules, strategy enables/config, live market data (yfinance — NIFTY/BANKNIFTY/SENSEX/VIX), alerts (Telegram), files & storage, OrderManager import test, live system snapshot
+- Returns exit code 0 = READY, 1 = NOT READY (scriptable)
+- Usage: `python pre_live_checklist.py` (full, fetches live VIX) / `--fast` (skip yfinance)
+- Current result: **50 passed / 0 critical / 6 warnings**
+
+**New diagnostic scripts (from previous session):**
+- `check_gap.py` — gap strategy diagnostic using real `bot/gap_detector.py` API; includes 8 built-in scenario tests (`--scenarios`) and 30-day history (`--history`). All 8/8 scenarios pass.
+- `check_eod.py` — EOD strategy diagnostic; shows config, time window status, historical win/loss from `.eod_performance.json`, and live 15m candle check. `--live` loops every 60 s during 14:30–15:00 IST.
+- `analyze_paper_trades.py` — comprehensive paper trade analysis: overall stats, per-strategy breakdown, exit-reason analysis, time-of-day chart, CE vs PE breakdown, recommendations. Verified on 6 live trades (₹+2,023 P&L, 100% win rate).
+
+**Paper trading improvements:**
+- `PaperTrader.check_exits()` now stores live unrealised P&L back to `pos["pnl"]` every cycle (was always 0)
+- `PaperTrader.get_summary()` returns `realized_pnl`, `unrealized_pnl`, and combined `total_pnl`
+- `PaperTrader.export_to_csv()` auto-called after every closed trade → `paper_trades_export.csv`
+
+**Dashboard fixes (`web/app.py` + `web/static/index_v2.html`):**
+- Analysis loop always auto-starts in paper mode (was only starting when `auto_trade_enabled=true`)
+- `/api/status` now returns `regime`, `india_vix`, `trend` (were missing → dashboard showed "—")
+- `/api/pnl`, `/api/trades`, `/api/positions` all have paper-mode early returns serving real paper data
+- Dashboard: regime/VIX/trend DOM updates; Chart.js 4.4 P&L sparkline; toast notifications; theme toggle (🌙/☀️); live uptime badge; log-level colour coding; paper trade labels (📋 PAPER OPEN / TARGET HIT / SL HIT)
+- Fixed JS duplicate code bug: 18-line orphaned trade-rendering block removed
+
+**EOD enabled:**
+- `EOD_ENABLED=true` set in `.env` (was `false`)
+- EOD Closing Momentum now fires 14:30–15:00 IST on strong directional candles
+
+**VIX threshold raised:**
+- `TRADING_VIX_MAX`: 25 → **27** (India VIX was 25.03, previously blocking all entries)
+
+---
 
 ### March 2026 — Session 6: Architecture Review + Bug Fixes
 

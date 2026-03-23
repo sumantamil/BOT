@@ -260,6 +260,9 @@ class TradingBot:
             sl_pct=float(getattr(settings.trading, 'stop_loss_percentage', 20.0)),
             target_pct=float(getattr(settings.trading, 'target_percentage', 50.0)),
             alert_cb=self._send_telegram_alert,
+            hard_time_exit_hour=int(getattr(settings.trading, 'hard_time_exit_hour', 13)),
+            time_exit_only_losers=bool(getattr(settings.trading, 'time_exit_only_losers', True)),
+            time_exit_min_profit=float(getattr(settings.trading, 'time_exit_min_profit', 50.0)),
         )
         # Current prices per index — updated each analysis cycle for paper exit checks
         self._paper_index_prices: Dict[str, float] = {}
@@ -1217,7 +1220,10 @@ class TradingBot:
                 # ── Hard time exit: close pre-13:00 positions at 13:00 IST ──────────
                 # Theta accelerates sharply in the illiquid 13:00–14:30 window.
                 # EOD positions (entered 14:30+) are excluded by the timestamp check.
-                _hard_exit_h = getattr(settings.trading, 'hard_time_exit_hour', 0)
+                # When time_exit_only_losers=True, profitable positions are left to run.
+                _hard_exit_h   = getattr(settings.trading, 'hard_time_exit_hour', 0)
+                _only_losers   = getattr(settings.trading, 'time_exit_only_losers', False)
+                _min_profit_th = getattr(settings.trading, 'time_exit_min_profit', 50.0)
                 if _hard_exit_h > 0 and self.order_manager and now.weekday() <= 4:
                     _today_dt = now.date()
                     _theta_victims = [
@@ -1229,6 +1235,8 @@ class TradingBot:
                             and now.hour >= _hard_exit_h
                             # Minimum 15-minute hold: avoids closing a 12:59 entry 1 minute later
                             and (now - t.timestamp).total_seconds() >= 15 * 60
+                            # Smart exit: skip profitable positions when only_losers is on
+                            and not (_only_losers and (t.pnl or 0.0) >= _min_profit_th)
                         )
                     ]
                     if _theta_victims:

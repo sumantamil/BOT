@@ -122,6 +122,12 @@ class TradingConfig(BaseSettings):
     # Set 0 to disable.
     hard_time_exit_hour: int = Field(default=13, description="Close pre-13:00 positions at 13:00 IST to avoid theta (0=disabled)")
 
+    # Smart time-exit: only close LOSING trades at the hard-time-exit boundary.
+    # When True, positions already profitable (pnl ≥ time_exit_min_profit) are left
+    # to run toward their target and are only force-closed at market close.
+    time_exit_only_losers: bool = Field(default=True, description="Soft time exit: skip positions with P&L ≥ time_exit_min_profit so winners can reach their targets")
+    time_exit_min_profit: float = Field(default=50.0, description="Minimum unrealised P&L (₹) that lets a position survive the soft time exit")
+
     # India VIX filter: skip buying options when IV is inflated.
     # Sweet spot for option BUYING: VIX 12–20. Above 20 = premiums too expensive.
     vix_filter_enabled: bool = Field(default=True, description="Skip new auto-entries when India VIX > vix_max")
