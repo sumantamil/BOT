@@ -36,7 +36,11 @@ _AlertCallback = Optional[Callable[[str, str], Awaitable[None]]]
 # ---------------------------------------------------------------------------
 _DEFAULT_SL_PCT      = 20.0   # matches TRADING_STOP_LOSS_PERCENTAGE
 _DEFAULT_TARGET_PCT  = 50.0   # matches TRADING_TARGET_PERCENTAGE
-_OPTION_LEVERAGE     = 2.5    # rough ATM option leverage (delta 0.5 × 5× index move)
+# ATM option leverage: delta(≈0.5) / premium_ratio(0.8%) = 62.5.
+# We use 50 as a slightly conservative estimate for weekly options to account
+# for time-decay friction.  A 1% underlying move → ~50% option P&L change,
+# a 2% move → ~100%.  SL at 20% ≈ 0.4% adverse index move (≈90 NIFTY pts).
+_OPTION_LEVERAGE     = 50.0
 _PREMIUM_RATIO       = 0.008  # ATM premium ≈ 0.8% of index (NIFTY 22500 → ~180 pts)
 _SAVE_PATH           = "paper_trades.json"
 _CSV_PATH            = "paper_trades_export.csv"

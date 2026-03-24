@@ -205,6 +205,7 @@ class TradingBot:
         self._index_orb_triggered: Dict[str, Optional[date]] = {}
         self._index_vwap_triggered: Dict[str, Optional[date]] = {}
         self._index_gap_traded: Dict[str, bool] = {}
+        self._index_gap_direction: Dict[str, str] = {}   # "UP" / "DOWN" per index for today
         self._index_eod_triggered: Dict[str, Optional[date]] = {}
         self._index_trend_triggered: Dict[str, Optional[date]] = {}  # paper TREND 1/day guard
 
@@ -697,6 +698,7 @@ class TradingBot:
                 today = datetime.now().date()
                 if _last_loop_date != today:
                     self._index_gap_traded = {}    # reset all per-index gap flags each new day
+                    self._index_gap_direction = {}  # reset gap direction each new day
                     self._index_trend_triggered = {}  # reset paper TREND guard each new day
                     self._gift_nifty_predicted  = False  # reset Gift Nifty prediction each day
                     self._filter_blocks = {}            # reset filter block counters each new day
@@ -810,6 +812,13 @@ class TradingBot:
 
                 # ── Scan all three indices ─────────────────────────────────────
                 for idx_cfg in [NIFTY, BANKNIFTY, SENSEX]:
+                    # Outside Indian market hours (pre/post market) there is no live
+                    # price feed and yfinance data is stale.  Skip strategy analysis
+                    # to avoid phantom signals and distorted ATR calculations.
+                    # Paper exit checks still run below (outside this loop).
+                    if not _is_market_hrs:
+                        break
+
                     idx_name = idx_cfg.name
 
                     # Temporarily swap context to this index so every strategy
@@ -2062,6 +2071,11 @@ class TradingBot:
             if gap.gap_type == GapType.NEUTRAL:
                 return
 
+            # Record gap direction for this index so ORB won't fade the day's gap
+            self._index_gap_direction[self._active_index.name] = (
+                "UP" if gap.gap_pct > 0 else "DOWN"
+            )
+
             # ── Playbook path (enhanced strategy selection) ───────────────
             cfg     = settings.gap
             use_pb  = getattr(cfg, "use_playbook", True)
@@ -2155,7 +2169,8 @@ class TradingBot:
                         f"PAPER GAP [{strategy_chosen}]: Would enter {opt_direction} "
                         f"gap={gap.gap_pct:+.2f}% — paper mode"
                     )
-                    _gap_px = gap.prev_close or context.get("current_price", 0.0)
+                    # Use today's open price as paper entry (we'd enter at market open)
+                    _gap_px = gap.open_price or context.get("current_price", 0.0)
                     self.paper_trader.paper_buy(
                         index_name=self._active_index.name,
                         index_price=_gap_px,
@@ -2241,14 +2256,14 @@ class TradingBot:
                     )
                     await self._broadcast_message(note, "paper_trade")
                 else:
-                    _gap_px = gap.prev_close or 0.0
+                    _gap_px = gap.open_price or 0.0
                     logger.info(
                         f"PAPER GAP: Would enter {opt_type} on strong {gap.gap_type.value} "
                         f"gap {gap.gap_pct:+.2f}% — paper mode, no order placed"
                     )
                     await self._broadcast_message(
                         f"📋 PAPER GAP: Would enter {opt_type} | {gap.gap_type.value} "
-                        f"gap {gap.gap_pct:+.2f}% | prev_close {_gap_px:,.0f} — paper mode",
+                        f"gap {gap.gap_pct:+.2f}% | open {_gap_px:,.0f} — paper mode",
                         "paper_trade",
                     )
                     self.paper_trader.paper_buy(
@@ -2389,6 +2404,36 @@ class TradingBot:
                         "ORB: SHORT signal skipped — market trend is BULLISH", "alert"
                     )
                     self._filter_blocks["ORB_trend"] = self._filter_blocks.get("ORB_trend", 0) + 1
+                    return
+
+                # ── Guard 2b: Gap-day direction guard ─────────────────────────
+                # If a non-neutral gap was detected today, don't let ORB fade it.
+                # e.g. +1.5% gap-up day: even if 5m turns neutral, a SHORT ORB
+                # signal below the opening range is still fading the bullish gap.
+                _today_gap_dir = self._index_gap_direction.get(self._active_index.name, "")
+                if _today_gap_dir == "UP" and orb_signal.direction == "SHORT":
+                    logger.info(
+                        f"ORB: Skipping SHORT — gap-UP day "
+                        f"({self._active_index.name}), ORB counter-gap fade blocked"
+                    )
+                    await self._broadcast_message(
+                        f"ORB: PE signal skipped — today is a gap-UP day "
+                        f"({self._active_index.name}), no counter-gap short",
+                        "alert",
+                    )
+                    self._filter_blocks["ORB_gap_dir"] = self._filter_blocks.get("ORB_gap_dir", 0) + 1
+                    return
+                if _today_gap_dir == "DOWN" and orb_signal.direction == "LONG":
+                    logger.info(
+                        f"ORB: Skipping LONG — gap-DOWN day "
+                        f"({self._active_index.name}), ORB counter-gap fade blocked"
+                    )
+                    await self._broadcast_message(
+                        f"ORB: CE signal skipped — today is a gap-DOWN day "
+                        f"({self._active_index.name}), no counter-gap long",
+                        "alert",
+                    )
+                    self._filter_blocks["ORB_gap_dir"] = self._filter_blocks.get("ORB_gap_dir", 0) + 1
                     return
 
                 # ── Guard 3: Higher bar on NEUTRAL days ───────────────────────

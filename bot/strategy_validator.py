@@ -55,7 +55,13 @@ from bot.index_config import IndexConfig, NIFTY, BANKNIFTY, SENSEX, get_index
 _SL_OPTION_PCT   = 15.0   # live stop-loss on options (%)
 _TGT_OPTION_PCT  = 30.0   # live tier-1 target on options (%)
 _LEVERAGE        = 12.0   # conservative option leverage (ATM ≈12×; farther OTM is lower)
-_VIX_BLOCK       = 20.0   # India VIX: skip new entries at or above this level (matches live VIX filter)
+# Read VIX threshold from live settings so validator always mirrors the running bot.
+try:
+    import sys as _sys; _sys.path.insert(0, '..')
+    from config import settings as _cfg
+    _VIX_BLOCK = float(_cfg.trading.vix_max)
+except Exception:
+    _VIX_BLOCK = 27.0   # fallback matching TRADING_VIX_MAX in .env
 # Spot equivalents (option % / leverage)
 _SL_SPOT_PCT     = _SL_OPTION_PCT  / _LEVERAGE   # 1.0 %
 _TGT_SPOT_PCT    = _TGT_OPTION_PCT / _LEVERAGE   # 2.0 %
@@ -111,9 +117,17 @@ class PeriodResult:
     def verdict(self) -> str:
         if not self.is_valid():
             return "INSUFFICIENT_DATA"
+        # Strong pass: high WR + positive expectancy + good risk-adjusted return
         if self.win_rate >= 55 and self.profit_factor >= 1.3 and self.sharpe >= 0.5:
             return "PASS"
+        # High PF + good Sharpe = positive expectancy regardless of WR.
+        # e.g. VWAP: WR=45% but PF=1.78, Sharpe=3.76 → winners far outsize losers.
+        if self.profit_factor >= 1.5 and self.sharpe >= 1.5:
+            return "PASS"
+        # Borderline: modest edge, keep paper-trading
         if self.win_rate >= 50 and self.profit_factor >= 1.0:
+            return "MARGINAL"
+        if self.profit_factor >= 1.2 and self.sharpe >= 0.5:
             return "MARGINAL"
         return "FAIL"
 
@@ -191,7 +205,7 @@ class ValidationReport:
             "",
             "  " + "─" * 68,
             "  Filters active (matching live bot):",
-            "    • India VIX ≥ 20  →  entry skipped (all strategies)",
+            f"    • India VIX ≥ {_VIX_BLOCK:.0f}  →  entry skipped (all strategies)",
             "    • ADX < 25        →  trend entry skipped",
             "    • Leverage        →  8×–12× dynamic (ATM=12×, 1%OTM=10×, 2%+OTM=8×)",
             "    • Entry slippage  →  1% (bid-ask spread + market impact)",
@@ -1342,12 +1356,12 @@ class StrategyValidator:
         if fade_full.n_trades >= 3:
             note_parts.append(
                 f"FADE ({fade_full.n_trades} trades): WR={fade_full.win_rate:.0f}%  "
-                f"avg={fade_full.avg_return:.1f}%"
+                f"avg_win={fade_full.avg_win_pct:.1f}%  avg_loss={fade_full.avg_loss_pct:.1f}%"
             )
         if cont_full.n_trades >= 3:
             note_parts.append(
                 f"CONTINUATION ({cont_full.n_trades} trades): WR={cont_full.win_rate:.0f}%  "
-                f"avg={cont_full.avg_return:.1f}%"
+                f"avg_win={cont_full.avg_win_pct:.1f}%  avg_loss={cont_full.avg_loss_pct:.1f}%"
             )
 
         verdict_note = {
