@@ -208,6 +208,7 @@ class TradingBot:
         self._index_gap_direction: Dict[str, str] = {}   # "UP" / "DOWN" per index for today
         self._index_eod_triggered: Dict[str, Optional[date]] = {}
         self._index_trend_triggered: Dict[str, Optional[date]] = {}  # paper TREND 1/day guard
+        self._index_day_direction: Dict[str, str] = {}  # "CE" or "PE" — first direction fired today per index
 
         # Regime cache — per-index, re-fetch at most once per 30 min (daily data, expensive)
         self._index_regime_cache: Dict[str, object] = {}
@@ -700,6 +701,7 @@ class TradingBot:
                     self._index_gap_traded = {}    # reset all per-index gap flags each new day
                     self._index_gap_direction = {}  # reset gap direction each new day
                     self._index_trend_triggered = {}  # reset paper TREND guard each new day
+                    self._index_day_direction = {}   # reset same-day direction lock each new day
                     self._gift_nifty_predicted  = False  # reset Gift Nifty prediction each day
                     self._filter_blocks = {}            # reset filter block counters each new day
                     self._error_counts = {}             # reset error counters each new day
@@ -1047,23 +1049,44 @@ class TradingBot:
                             )
                         elif signal and signal.trend != Trend.NEUTRAL and not _trend_done:
                             _pt_opt = "CE" if signal.trend == Trend.BULLISH else "PE"
-                            logger.info(
-                                f"PAPER TREND [{idx_name}]: Would buy {_pt_opt} — "
-                                f"{signal.trend.value} {signal.strength}% — paper mode, no order placed"
-                            )
-                            await self._broadcast_message(
-                                f"📋 PAPER TREND [{idx_name}]: Would buy {_pt_opt} ATM "
-                                f"| {signal.trend.value} strength {signal.strength}% "
-                                f"| price {signal.current_price:,.0f} — paper mode",
-                                "paper_trade",
-                            )
-                            self.paper_trader.paper_buy(
-                                index_name=idx_name,
-                                index_price=signal.current_price,
-                                option_type=_pt_opt,
-                                strategy="TREND",
-                            )
-                            self._index_trend_triggered[idx_name] = datetime.now().date()
+                            # ── Regime-direction guard (mirrors VWAP guard) ──────────
+                            # Block CE entries on TRENDING DOWN days and PE on TRENDING UP.
+                            _trend_regime_blocked = False
+                            _cached_regime_tr = getattr(self, "_cached_regime", None)
+                            if _cached_regime_tr:
+                                _regime_val_tr = _cached_regime_tr.regime.value
+                                if _regime_val_tr == "TRENDING DOWN" and _pt_opt == "CE":
+                                    logger.info(
+                                        f"PAPER TREND [{idx_name}]: Skipping CE — regime is TRENDING DOWN (counter-trend)"
+                                    )
+                                    self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
+                                    _trend_regime_blocked = True
+                                elif _regime_val_tr == "TRENDING UP" and _pt_opt == "PE":
+                                    logger.info(
+                                        f"PAPER TREND [{idx_name}]: Skipping PE — regime is TRENDING UP (counter-trend)"
+                                    )
+                                    self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
+                                    _trend_regime_blocked = True
+                            if not _trend_regime_blocked:
+                                logger.info(
+                                    f"PAPER TREND [{idx_name}]: Would buy {_pt_opt} — "
+                                    f"{signal.trend.value} {signal.strength}% — paper mode, no order placed"
+                                )
+                                await self._broadcast_message(
+                                    f"📋 PAPER TREND [{idx_name}]: Would buy {_pt_opt} ATM "
+                                    f"| {signal.trend.value} strength {signal.strength}% "
+                                    f"| price {signal.current_price:,.0f} — paper mode",
+                                    "paper_trade",
+                                )
+                                self.paper_trader.paper_buy(
+                                    index_name=idx_name,
+                                    index_price=signal.current_price,
+                                    option_type=_pt_opt,
+                                    strategy="TREND",
+                                )
+                                self._index_trend_triggered[idx_name] = datetime.now().date()
+                                # Record today's direction so ORB won't trade against it
+                                self._index_day_direction[idx_name] = _pt_opt
 
                     # ── Step 4: EOD closing momentum (14:30–15:00 IST) ──────────────
                     _last_checked["EOD"] = datetime.now()
@@ -2178,6 +2201,8 @@ class TradingBot:
                         strategy=f"GAP_{strategy_chosen[:4]}",   # GAP_FADE / GAP_CONT
                     )
                     self._index_gap_traded[self._active_index.name] = True
+                    # Record today's direction so ORB won't trade against it
+                    self._index_day_direction[self._active_index.name] = opt_direction
                     return
 
                 # Live order
@@ -2353,6 +2378,14 @@ class TradingBot:
             logger.debug(f"ORB [{self._active_index.name}]: already triggered today — skipping")
             self._filter_blocks["ORB_daily_limit"] = self._filter_blocks.get("ORB_daily_limit", 0) + 1
             return
+        # ── Same-day direction lock ───────────────────────────────────────────
+        # If TREND or GAP already fired CE today, block ORB from entering PE (and vice versa).
+        # Prevents the bot from trading both sides on the same index in one day.
+        _idx_name_orb = self._active_index.name
+        _today_dir = self._index_day_direction.get(_idx_name_orb, "")
+        if _today_dir:
+            # We'll check after the signal is available — store for use below
+            pass
         try:
             orb_signal = self.orb.analyze()
             if not orb_signal:
@@ -2470,6 +2503,23 @@ class TradingBot:
                 self._last_signal = signal
 
             option_type = "CE" if orb_signal.direction == "LONG" else "PE"
+
+            # ── Guard 3b: Same-day direction lock ─────────────────────────────────
+            # If TREND or GAP already fired the opposite direction today on this index,
+            # block ORB to avoid trading both sides (Mar 24: GAP fired CE, ORB fired PE → both tiny losses)
+            _today_first_dir = self._index_day_direction.get(self._active_index.name, "")
+            if _today_first_dir and _today_first_dir != option_type:
+                logger.info(
+                    f"ORB [{self._active_index.name}]: Skipping {option_type} — "
+                    f"today's direction already locked to {_today_first_dir} (set by TREND/GAP)"
+                )
+                await self._broadcast_message(
+                    f"ORB: {option_type} blocked — today's direction locked to {_today_first_dir} "
+                    f"(prevents trading both sides on {self._active_index.name})",
+                    "alert",
+                )
+                self._filter_blocks["ORB_direction_lock"] = self._filter_blocks.get("ORB_direction_lock", 0) + 1
+                return
 
             # ── Guard 4: RSI quality filter (plan step 5) ───────────────────────────
             # CE: block when RSI ≥75 — market is already overbought, not a clean breakout
