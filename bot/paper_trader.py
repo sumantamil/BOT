@@ -50,6 +50,13 @@ _HARD_EXIT_HOUR   = 13   # positions entered before this hour are closed when we
 _MARKET_CLOSE_H   = 15
 _MARKET_CLOSE_M   = 27
 
+# Expected price ranges per index — used to catch cross-index price contamination
+_INDEX_PRICE_RANGES = {
+    "NIFTY":     (15_000,  35_000),
+    "BANKNIFTY": (30_000,  75_000),
+    "SENSEX":    (50_000, 110_000),
+}
+
 
 class PaperTrader:
     """Tracks paper trade entries, monitors exits, and calculates P&L."""
@@ -108,6 +115,7 @@ class PaperTrader:
         option_type:       str,   # "CE" or "PE"
         strategy:          str,   # "ORB" / "VWAP" / "TREND" / "EOD" / "GAP"
         estimated_premium: float = 0.0,
+        quantity:          int   = 1,   # number of units (use index lot_size for realistic P&L)
     ) -> Optional[dict]:
         """
         Record a paper entry.
@@ -116,6 +124,22 @@ class PaperTrader:
         index + strategy + option_type on the same day, to avoid double-counting).
         """
         today = datetime.now().date()
+
+        # ── Sanity-check: catch cross-index price contamination ───────────────
+        # If the supplied index_price is outside the expected range for this
+        # index (e.g. SENSEX price stored for NIFTY), drop the entry and log a
+        # warning so the bug is immediately visible in the logs.
+        _price_range = _INDEX_PRICE_RANGES.get(index_name.upper())
+        if _price_range and index_price > 0:
+            _lo, _hi = _price_range
+            if not (_lo <= index_price <= _hi):
+                logger.error(
+                    f"PaperTrader: REJECTED paper_buy — {index_name} index_price={index_price:,.0f} "
+                    f"is OUTSIDE expected range [{_lo:,}–{_hi:,}]. "
+                    f"Probable cross-index price contamination. "
+                    f"strategy={strategy} option={option_type}"
+                )
+                return None
 
         # Deduplicate: one entry per (index, strategy, option_type) per day
         for p in self._positions:
@@ -134,13 +158,17 @@ class PaperTrader:
         if estimated_premium <= 0:
             estimated_premium = round(index_price * _PREMIUM_RATIO)
 
+        # Use timestamp-based ID to avoid duplicates when trades and positions
+        # share the same sequential count (e.g. after a restart clears positions).
+        _ts_id = int(datetime.now().timestamp() * 1000) % 1_000_000  # last 6 digits of ms timestamp
         trade = {
-            "id":            len(self._trades) + len(self._positions) + 1,
+            "id":            _ts_id,
             "index_name":    index_name,
             "option_type":   option_type,
             "strategy":      strategy,
             "index_entry":   index_price,
             "premium_entry": estimated_premium,
+            "quantity":      max(1, quantity),
             "entry_time":    datetime.now().isoformat(),
             "status":        "OPEN",
             "pnl":           0.0,
@@ -150,7 +178,8 @@ class PaperTrader:
         self._positions.append(trade)
         logger.info(
             f"📋 PAPER ENTRY #{trade['id']}: {index_name} {option_type} "
-            f"[{strategy}] | index={index_price:,.0f} | est.premium=₹{estimated_premium:.0f}"
+            f"[{strategy}] | index={index_price:,.0f} | est.premium=₹{estimated_premium:.0f} "
+            f"| qty={trade['quantity']}"
         )
         if self._alert_cb:
             import asyncio
@@ -158,7 +187,7 @@ class PaperTrader:
                 f"📋 *PAPER ENTRY* #{trade['id']}\n"
                 f"Index: {index_name} {option_type}\n"
                 f"Strategy: {strategy}\n"
-                f"Index @ {index_price:,.0f} | Est premium \u20b9{estimated_premium:.0f}\n"
+                f"Index @ {index_price:,.0f} | Est premium \u20b9{estimated_premium:.0f} × {trade['quantity']} units\n"
                 f"SL: -{self._sl_pct}% | Target: +{self._target_pct}%"
             )
             asyncio.create_task(self._alert_cb(msg, "paper_entry"))
@@ -200,7 +229,8 @@ class PaperTrader:
 
             # Store live unrealised P&L in the position dict so /api/pnl and
             # /api/trades can serve current values without waiting for a close event.
-            pos["pnl"]     = round(pos["premium_entry"] * option_change_pct / 100, 2)
+            _qty = pos.get("quantity", 1)
+            pos["pnl"]     = round(pos["premium_entry"] * option_change_pct / 100 * _qty, 2)
             pos["pnl_pct"] = round(option_change_pct, 2)
 
             # Verbose live P&L trace — always shown while position is open
@@ -271,7 +301,8 @@ class PaperTrader:
         pnl_pct:   float,
         reason:    str,
     ) -> float:
-        pnl = pos["premium_entry"] * pnl_pct / 100
+        _qty = pos.get("quantity", 1)
+        pnl = pos["premium_entry"] * pnl_pct / 100 * _qty
 
         pos["index_exit"]  = idx_price
         pos["exit_time"]   = datetime.now().isoformat()
@@ -327,7 +358,7 @@ class PaperTrader:
         fieldnames = [
             "id", "date", "entry_time", "exit_time", "duration_mins",
             "strategy", "index_name", "option_type",
-            "index_entry", "premium_entry", "index_exit",
+            "index_entry", "premium_entry", "quantity", "index_exit",
             "pnl", "pnl_pct", "exit_reason",
         ]
         try:
@@ -358,6 +389,7 @@ class PaperTrader:
                         "option_type":   t.get("option_type", ""),
                         "index_entry":   t.get("index_entry", 0),
                         "premium_entry": t.get("premium_entry", 0),
+                        "quantity":      t.get("quantity", 1),
                         "index_exit":    t.get("index_exit", 0),
                         "pnl":           t.get("pnl", 0),
                         "pnl_pct":       t.get("pnl_pct", 0),

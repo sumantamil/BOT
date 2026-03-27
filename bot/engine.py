@@ -210,6 +210,14 @@ class TradingBot:
         self._index_trend_triggered: Dict[str, Optional[date]] = {}  # paper TREND 1/day guard
         self._index_day_direction: Dict[str, str] = {}  # "CE" or "PE" — first direction fired today per index
 
+        # Path for persisting daily trigger flags across same-day restarts
+        self._daily_state_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "daily_trade_state.json"
+        )
+        # Restore triggers from previous run on same day (prevents re-firing already-used slots)
+        self._restore_daily_state()
+
         # Regime cache — per-index, re-fetch at most once per 30 min (daily data, expensive)
         self._index_regime_cache: Dict[str, object] = {}
         self._index_regime_time: Dict[str, Optional[datetime]] = {}
@@ -440,6 +448,83 @@ class TradingBot:
             logger.error(error_msg)
             await self._broadcast_message(error_msg, "error")
             raise
+
+    # ------------------------------------------------------------------
+    # Daily state persistence (survives same-day bot restarts)
+    # ------------------------------------------------------------------
+
+    def _save_daily_state(self) -> None:
+        """Write per-index one-trade-per-day trigger flags to disk."""
+        import json as _j
+        today_str = str(datetime.now().date())
+        data = {
+            "date": today_str,
+            "orb":   {k: str(v) for k, v in self._index_orb_triggered.items()  if v},
+            "vwap":  {k: str(v) for k, v in self._index_vwap_triggered.items() if v},
+            "trend": {k: str(v) for k, v in self._index_trend_triggered.items() if v},
+            "eod":   {k: str(v) for k, v in self._index_eod_triggered.items()  if v},
+            "gap":   {k: v for k, v in self._index_gap_traded.items() if v},
+            "day_direction": dict(self._index_day_direction),
+        }
+        try:
+            with open(self._daily_state_path, "w") as f:
+                _j.dump(data, f)
+        except Exception as e:
+            logger.debug(f"Daily state save failed (non-fatal): {e}")
+
+    def _restore_daily_state(self) -> None:
+        """Re-load today's trigger flags from disk after a same-day restart."""
+        import json as _j
+        if not os.path.exists(self._daily_state_path):
+            return
+        try:
+            with open(self._daily_state_path) as f:
+                data = _j.load(f)
+            today_str = str(datetime.now().date())
+            if data.get("date") != today_str:
+                # File is from a previous day — ignore it
+                return
+            today = datetime.now().date()
+            for k, v in data.get("orb", {}).items():
+                try:
+                    if str(date.fromisoformat(v)) == today_str:
+                        self._index_orb_triggered[k] = today
+                except Exception:
+                    pass
+            for k, v in data.get("vwap", {}).items():
+                try:
+                    if str(date.fromisoformat(v)) == today_str:
+                        self._index_vwap_triggered[k] = today
+                except Exception:
+                    pass
+            for k, v in data.get("trend", {}).items():
+                try:
+                    if str(date.fromisoformat(v)) == today_str:
+                        self._index_trend_triggered[k] = today
+                except Exception:
+                    pass
+            for k, v in data.get("eod", {}).items():
+                try:
+                    if str(date.fromisoformat(v)) == today_str:
+                        self._index_eod_triggered[k] = today
+                except Exception:
+                    pass
+            self._index_gap_traded    = {k: bool(v) for k, v in data.get("gap", {}).items()}
+            self._index_day_direction = data.get("day_direction", {})
+            restored = (
+                list(self._index_orb_triggered.keys()) +
+                list(self._index_vwap_triggered.keys()) +
+                list(self._index_trend_triggered.keys())
+            )
+            if restored:
+                logger.info(
+                    f"Daily state restored from previous run: "
+                    f"ORB={list(self._index_orb_triggered.keys())} "
+                    f"VWAP={list(self._index_vwap_triggered.keys())} "
+                    f"TREND={list(self._index_trend_triggered.keys())}"
+                )
+        except Exception as e:
+            logger.debug(f"Daily state restore failed (non-fatal): {e}")
 
     def _validate_command_handlers(self) -> list:
         """
@@ -705,6 +790,8 @@ class TradingBot:
                     self._gift_nifty_predicted  = False  # reset Gift Nifty prediction each day
                     self._filter_blocks = {}            # reset filter block counters each new day
                     self._error_counts = {}             # reset error counters each new day
+                    # Clear persisted daily state for the new day
+                    self._save_daily_state()
                     if self.order_manager:
                         self.order_manager._reset_daily_stats_if_needed()
                     _last_loop_date = today
@@ -1083,10 +1170,12 @@ class TradingBot:
                                     index_price=signal.current_price,
                                     option_type=_pt_opt,
                                     strategy="TREND",
+                                    quantity=idx_cfg.lot_size,
                                 )
                                 self._index_trend_triggered[idx_name] = datetime.now().date()
                                 # Record today's direction so ORB won't trade against it
                                 self._index_day_direction[idx_name] = _pt_opt
+                                self._save_daily_state()
 
                     # ── Step 4: EOD closing momentum (14:30–15:00 IST) ──────────────
                     _last_checked["EOD"] = datetime.now()
@@ -2199,6 +2288,7 @@ class TradingBot:
                         index_price=_gap_px,
                         option_type=opt_direction,
                         strategy=f"GAP_{strategy_chosen[:4]}",   # GAP_FADE / GAP_CONT
+                        quantity=self._active_index.lot_size,
                     )
                     self._index_gap_traded[self._active_index.name] = True
                     # Record today's direction so ORB won't trade against it
@@ -2296,6 +2386,7 @@ class TradingBot:
                         index_price=_gap_px,
                         option_type=opt_type,
                         strategy="GAP",
+                        quantity=self._active_index.lot_size,
                     )
                 self._index_gap_traded[self._active_index.name] = True
                 return
@@ -2592,8 +2683,10 @@ class TradingBot:
                     index_price=self._last_signal.current_price if self._last_signal else 0.0,
                     option_type=option_type,
                     strategy="ORB",
+                    quantity=self._active_index.lot_size,
                 )
                 self._index_orb_triggered[self._active_index.name] = datetime.now().date()
+                self._save_daily_state()
                 return
 
             # Fast-path: place ORB trade directly at ATM — skip slow research
@@ -2606,6 +2699,7 @@ class TradingBot:
 
             if order_ok:
                 self._index_orb_triggered[self._active_index.name] = datetime.now().date()
+                self._save_daily_state()
 
         except Exception as e:
             logger.error(f"ORB signal check error: {e}")
@@ -2724,8 +2818,10 @@ class TradingBot:
                     index_price=vwap_signal.current_price,
                     option_type=option_type,
                     strategy="VWAP",
+                    quantity=self._active_index.lot_size,
                 )
                 self._index_vwap_triggered[self._active_index.name] = datetime.now().date()
+                self._save_daily_state()
                 return
 
             order_ok = await self._execute_option_with_research(
@@ -2738,6 +2834,7 @@ class TradingBot:
 
             if order_ok:
                 self._index_vwap_triggered[self._active_index.name] = datetime.now().date()
+                self._save_daily_state()
                 tg_msg = (
                     f"VWAP REVERSION {vwap_signal.direction}\n"
                     f"Entry: {vwap_signal.current_price:.2f}\n"
@@ -2870,6 +2967,7 @@ class TradingBot:
                         "EOD: CE signal skipped — overall 5m trend is BEARISH", "alert"
                     )
                     self._index_eod_triggered[_idx] = _today  # don't retry
+                    self._save_daily_state()
                     return
                 if option_type == "PE" and trend == "BULLISH":
                     logger.info("EOD: PE skipped — overall 5m trend is BULLISH")
@@ -2877,6 +2975,7 @@ class TradingBot:
                         "EOD: PE signal skipped — overall 5m trend is BULLISH", "alert"
                     )
                     self._index_eod_triggered[_idx] = _today
+                    self._save_daily_state()
                     return
 
             report = (
@@ -2902,8 +3001,7 @@ class TradingBot:
 
             # Mark triggered BEFORE placing to prevent double-fire on concurrent cycles
             self._index_eod_triggered[_idx] = _today
-
-            # Paper mode: log signal but skip order placement
+            self._save_daily_state()
             if not self._auto_trade:
                 logger.info(
                     f"PAPER EOD: Would buy {option_type} ATM — "
@@ -2921,6 +3019,7 @@ class TradingBot:
                     index_price=candle_close,
                     option_type=option_type,
                     strategy="EOD",
+                    quantity=self._active_index.lot_size,
                 )
                 return
 
@@ -3119,11 +3218,13 @@ class TradingBot:
             # (5% of index price is a rough ATM option proxy for paper mode)
             synthetic_ltp = round(current_price * 0.002, 2)
             self.late_day_strat.register_position(signal, synthetic_ltp)
+            from bot.index_config import NIFTY as _NIFTY_CFG
             self.paper_trader.paper_buy(
                 index_name  = "NIFTY",
                 index_price = current_price,
                 option_type = signal.direction,
                 strategy    = "LATE_DAY",
+                quantity    = _NIFTY_CFG.lot_size,
             )
             return
 
