@@ -37,10 +37,16 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Trade Journals & Data
+# Trade Journals & Data (NEVER COMMIT — contains real trade details)
 journals/
 *.json
 data/
+paper_trades.json
+paper_trades_export.csv
+daily_trade_state.json
+signal_log.txt
+validation_nifty.json
+install_log.txt
 
 # Backup files
 *.bak
