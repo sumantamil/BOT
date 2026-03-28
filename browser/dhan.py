@@ -265,6 +265,8 @@ class DhanBroker:
                     logger.error("Dhan access token is INVALID or EXPIRED. "
                                  "Generate a new token at https://web.dhan.co and update DHAN_ACCESS_TOKEN in .env")
                     await self._alert_token_expired()
+                elif (resp or {}).get("data", {}).get("errorType") == "FUND_LIMIT_ERROR":
+                    logger.debug(f"Dhan get_fund_limits: FUND_LIMIT_ERROR (normal outside market hours)")
                 else:
                     logger.warning(f"Dhan get_fund_limits failed: {resp}")
                 return {"available_balance": 0.0, "used_margin": 0.0, "available_margin": 0.0}
@@ -282,7 +284,11 @@ class DhanBroker:
                 "available_margin": round(max(0, available_margin), 2)
             }
         except Exception as e:
-            logger.warning(f"Dhan get_fund_limits failed: {e}")
+            _e_str = str(e)
+            if "FUND_LIMIT_ERROR" in _e_str:
+                logger.debug(f"Dhan get_fund_limits: FUND_LIMIT_ERROR (normal outside market hours)")
+            else:
+                logger.warning(f"Dhan get_fund_limits failed: {e}")
             return {"available_balance": 0.0, "used_margin": 0.0, "available_margin": 0.0}
 
     # ── AMO window detection ─────────────────────────────────────────────────
@@ -780,6 +786,47 @@ class DhanBroker:
                 pnl_percentage=round(pnl_pct, 2),
             ))
         return result
+
+    # ── Trade history ────────────────────────────────────────────────────────
+
+    async def get_trade_book(self) -> List[Dict]:
+        """Fetch today's executed trades from Dhan trade book."""
+        if not self._client:
+            return []
+        try:
+            resp = await asyncio.to_thread(self._client.get_trade_book)
+            rows = resp.get("data") if isinstance(resp, dict) else resp
+            return rows if isinstance(rows, list) else []
+        except Exception as e:
+            logger.warning(f"Dhan get_trade_book failed: {e}")
+            return []
+
+    async def get_trade_history(self, from_date: str, to_date: str) -> List[Dict]:
+        """
+        Fetch executed trades from Dhan for a date range.
+        from_date / to_date: "YYYY-MM-DD"
+        Returns a list of trade dicts from the Dhan API.
+        Automatically handles pagination (page 0, 1, 2…).
+        """
+        if not self._client:
+            return []
+        all_trades: List[Dict] = []
+        page = 0
+        try:
+            while True:
+                resp = await asyncio.to_thread(
+                    self._client.get_trade_history, from_date, to_date, page
+                )
+                rows = resp.get("data") if isinstance(resp, dict) else resp
+                if not isinstance(rows, list) or not rows:
+                    break
+                all_trades.extend(rows)
+                if len(rows) < 50:   # Dhan returns ≤50 per page; fewer = last page
+                    break
+                page += 1
+        except Exception as e:
+            logger.warning(f"Dhan get_trade_history failed (page={page}): {e}")
+        return all_trades
 
     # ── Close position ───────────────────────────────────────────────────────
 

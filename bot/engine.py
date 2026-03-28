@@ -445,6 +445,10 @@ class TradingBot:
             self._state = BotState.RUNNING
             await self._broadcast_message("Bot initialized successfully!", "success")
             logger.info("Bot initialization complete")
+
+            # Back-fill any missed EOD settlements (runs if bot was down at 3:30 PM)
+            asyncio.create_task(self._catchup_missed_settlements())
+
             await self._send_telegram_alert("✅ NIFTY Trading Bot started successfully!", "startup")
             
         except Exception as e:
@@ -453,6 +457,89 @@ class TradingBot:
             logger.error(error_msg)
             await self._broadcast_message(error_msg, "error")
             raise
+
+    # ------------------------------------------------------------------
+    # Startup catch-up: back-fill missed EOD settlements
+    # ------------------------------------------------------------------
+
+    async def _catchup_missed_settlements(self) -> None:
+        """
+        On startup, scan the last 10 trading days for Dhan settlements that
+        were not recorded in profit_tracking.csv (e.g. bot was down at 3:30 PM).
+        For each missing day, record P&L from Dhan settlement and sync Google Sheets.
+        Runs as a background task 30 s after init to avoid slowing startup.
+        """
+        await asyncio.sleep(30)   # Give the bot time to fully settle before hitting Dhan API
+
+        try:
+            from config import settings as _cfg
+            if str(_cfg.broker).lower() != "dhan":
+                return
+
+            from datetime import date as _date, timedelta as _td
+            import bot.profit_tracker as _pt
+
+            # Load already-recorded dates from CSV
+            existing_rows = _pt._read_csv_rows()
+            recorded_dates = {r["date"] for r in existing_rows if r.get("date")}
+
+            # Pull last 10 trading days from Dhan ledger settlements
+            from_dt = (_date.today() - _td(days=14)).isoformat()
+            to_dt   = (_date.today() - _td(days=1)).isoformat()  # exclude today (not settled yet)
+
+            from dhanhq import dhanhq as _dhan
+            _dc = _dhan(_cfg.dhan.client_id, _cfg.dhan.access_token)
+            lr = await asyncio.to_thread(_dc.ledger_report, from_dt, to_dt)
+
+            missed = []
+            for row in (lr.get("data") or []):
+                if row.get("narration") != "Trades Executed":
+                    continue
+                vdate = row.get("voucherdate", "")   # "Mar 16, 2026"
+                try:
+                    day = datetime.strptime(vdate, "%b %d, %Y").date()
+                except Exception:
+                    continue
+                if day.weekday() >= 5:   # skip weekends
+                    continue
+                day_str = day.isoformat()
+                if day_str in recorded_dates:
+                    continue   # already recorded — skip
+
+                credit = float(row.get("credit") or 0)
+                debit  = float(row.get("debit")  or 0)
+                net    = round(credit - debit, 2)
+                missed.append((day, day_str, net))
+
+            if not missed:
+                logger.debug("Startup catch-up: no missed settlements found")
+                return
+
+            logger.info(f"Startup catch-up: {len(missed)} missed day(s) to back-fill from Dhan settlements")
+
+            for day, day_str, net in sorted(missed):
+                try:
+                    _pt.record_daily_pnl(
+                        gross_pnl=net,
+                        total_trades=0,   # trade count not available from settlement alone
+                        wins=0,
+                        losses=0,
+                        trade_date=day,
+                        notes=f"Back-filled from Dhan settlement (bot was down at EOD)",
+                    )
+                    logger.info(f"Catch-up: recorded {day_str} — ₹{net:,.2f} from Dhan settlement")
+                except Exception as e:
+                    logger.warning(f"Catch-up: failed to record {day_str}: {e}")
+
+            # Sync to Google Sheets after all back-fills
+            try:
+                _pt.sync_to_google_sheets()
+                logger.info("Catch-up: Google Sheets synced ✅")
+            except Exception as e:
+                logger.warning(f"Catch-up: Sheets sync failed: {e}")
+
+        except Exception as e:
+            logger.debug(f"Startup catch-up failed (non-fatal): {e}")
 
     # ------------------------------------------------------------------
     # Daily state persistence (survives same-day bot restarts)
@@ -1446,32 +1533,120 @@ class TradingBot:
                     if now.hour == 15 and now.minute >= 30 and _profit_recorded_date != now.date():
                         _profit_recorded_date = now.date()
                         try:
-                            if self.order_manager:
-                                summary = self.order_manager.get_summary()
-                                gross   = float(summary.get("total_pnl", 0))
-                                trades  = int(summary.get("total_trades", 0))
-                                wins    = int(summary.get("wins", 0))
-                                losses  = int(summary.get("losses", 0))
-                            elif hasattr(self, '_paper_trader') and self._paper_trader:
-                                summary = self._paper_trader.get_summary()
-                                gross   = float(summary.get("total_pnl", 0))
-                                trades  = int(summary.get("total_trades", 0))
-                                wins    = int(summary.get("wins", 0))
-                                losses  = int(summary.get("losses", 0))
+                            # ── Source 1: Dhan settlement (most accurate) ─────
+                            # Uses the actual settled amount from Dhan ledger —
+                            # works even if bot was restarted mid-day.
+                            gross = None
+                            _settle_note = ""
+                            try:
+                                from config import settings as _cfg2
+                                if str(_cfg2.broker).lower() == "dhan":
+                                    from dhanhq import dhanhq as _dhan2
+                                    _dc2 = _dhan2(_cfg2.dhan.client_id, _cfg2.dhan.access_token)
+                                    today_iso = now.date().isoformat()
+                                    lr = await asyncio.to_thread(
+                                        _dc2.ledger_report, today_iso, today_iso
+                                    )
+                                    for row in (lr.get("data") or []):
+                                        if row.get("narration") == "Trades Executed":
+                                            credit = float(row.get("credit") or 0)
+                                            debit  = float(row.get("debit")  or 0)
+                                            gross  = round(credit - debit, 2)
+                                            _settle_note = "Dhan settlement"
+                                            break
+                            except Exception as _sl_err:
+                                logger.debug(f"EOD settlement fetch failed: {_sl_err}")
+
+                            # ── Source 2: in-memory order_manager (fallback) ──
+                            if gross is None:
+                                if self.order_manager:
+                                    summary = self.order_manager.get_summary()
+                                    gross   = float(summary.get("total_pnl", 0))
+                                    trades  = int(summary.get("total_trades", 0))
+                                    wins    = int(summary.get("wins", 0))
+                                    losses  = int(summary.get("losses", 0))
+                                    _settle_note = "in-memory"
+                                elif hasattr(self, '_paper_trader') and self._paper_trader:
+                                    summary = self._paper_trader.get_summary()
+                                    gross   = float(summary.get("total_pnl", 0))
+                                    trades  = int(summary.get("total_trades", 0))
+                                    wins    = int(summary.get("wins", 0))
+                                    losses  = int(summary.get("losses", 0))
+                                    _settle_note = "paper_trader"
+                                else:
+                                    gross, trades, wins, losses = 0.0, 0, 0, 0
+                                    _settle_note = "no source"
                             else:
-                                gross, trades, wins, losses = 0.0, 0, 0, 0
+                                # Dhan settlement has the gross; get trade counts
+                                # from order_manager for win/loss stats
+                                if self.order_manager:
+                                    summary = self.order_manager.get_summary()
+                                    trades  = int(summary.get("total_trades", 0))
+                                    wins    = int(summary.get("wins", 0))
+                                    losses  = int(summary.get("losses", 0))
+                                else:
+                                    trades, wins, losses = 0, 0, 0
+
+                            logger.info(f"EOD P&L source: {_settle_note} | gross ₹{gross:,.2f}")
                             profit_tracker.record_daily_pnl(
                                 gross_pnl=gross,
                                 total_trades=trades,
                                 wins=wins,
                                 losses=losses,
-                                notes="Auto-recorded at 15:30",
+                                notes=f"Auto-recorded at 15:30 ({_settle_note})",
                             )
                             await self._broadcast_message(
                                 f"📊 EOD profit recorded — gross ₹{gross:,.2f} | {trades} trades",
                                 "system"
                             )
                             logger.info(f"EOD profit recorded: gross ₹{gross:,.2f}, trades {trades}")
+                            # Sync today's ledger rows (with P&L) to Google Sheets
+                            try:
+                                from datetime import date as _date
+                                import os as _os, json as _json
+                                today_str = _date.today().isoformat()
+                                journal_dir = _os.path.join(
+                                    _os.path.dirname(_os.path.dirname(__file__)), "journals"
+                                )
+                                sheet_rows = []
+                                fname = f"journal_{today_str}.json"
+                                fpath = _os.path.join(journal_dir, fname)
+                                if _os.path.exists(fpath):
+                                    with open(fpath) as _jf:
+                                        entries = _json.load(_jf)
+                                    for e in entries:
+                                        if e.get("event_type") != "TRADE":
+                                            continue
+                                        d = e.get("details", {})
+                                        action = d.get("action", "")
+                                        if action not in ("SELL", "BUY"):
+                                            continue
+                                        sym = d.get("symbol", "") or d.get("customSymbol", "")
+                                        if not sym:
+                                            sym = e.get("direction", "") or "—"
+                                        price = float(d.get("price") or d.get("premium") or d.get("tradedPrice") or 0)
+                                        pnl_val = None
+                                        if action == "SELL":
+                                            pnl_val = d.get("net_pnl") or d.get("gross_pnl") or d.get("pnl")
+                                            if pnl_val is not None:
+                                                pnl_val = float(pnl_val)
+                                        opt = "CE" if "CE" in sym or "CALL" in sym else ("PE" if "PE" in sym or "PUT" in sym else "")
+                                        sheet_rows.append({
+                                            "date":        today_str,
+                                            "time":        e.get("timestamp", "")[:19].replace("T", " "),
+                                            "symbol":      sym,
+                                            "strike":      float(d.get("strike") or d.get("drvStrikePrice") or 0),
+                                            "option_type": opt,
+                                            "action":      action,
+                                            "premium":     price,
+                                            "quantity":    int(d.get("quantity") or d.get("tradedQuantity") or 0),
+                                            "pnl":         pnl_val,
+                                            "source":      "journal_eod",
+                                        })
+                                if sheet_rows:
+                                    profit_tracker.sync_trades_to_google_sheets(sheet_rows)
+                            except Exception as _ts_err:
+                                logger.warning(f"EOD trade sync to Sheets failed: {_ts_err}")
                             # Send EOD summary to Telegram
                             _eod_sign = "📈" if gross >= 0 else "📉"
                             _wr_str   = f"{wins}/{trades}" if trades else "0/0"

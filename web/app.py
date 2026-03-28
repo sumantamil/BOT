@@ -730,6 +730,35 @@ async def get_ledger(days: int = 30):
     }
 
 
+@app.post("/api/ledger/sync")
+async def sync_ledger_to_sheets(days: int = 30):
+    """
+    Sync the ledger (with P&L from journals + Dhan settlements) to Google Sheets.
+    Reuses the exact same records shown in the Ledger tab — P&L is always populated.
+    Requires GSHEET_SPREADSHEET_ID and GSHEET_CREDENTIALS_PATH in .env.
+    """
+    from bot import profit_tracker
+
+    # Reuse the full ledger logic — it already has P&L from journals + Dhan settlements
+    ledger_data = await get_ledger(days=days)
+    trade_records = ledger_data.get("records", [])
+
+    # Sort ascending for the sheet (get_ledger returns descending)
+    trade_records = sorted(trade_records, key=lambda x: x.get("time", ""))
+
+    ok = profit_tracker.sync_trades_to_google_sheets(trade_records)
+
+    from datetime import date, timedelta
+    cutoff = date.today() - timedelta(days=days)
+    return {
+        "success":       ok,
+        "trades_synced": len(trade_records),
+        "date_range":    f"{cutoff.isoformat()} → {date.today().isoformat()}",
+        "message":       "Trades synced to Google Sheets ✅" if ok else
+                         "Google Sheets not configured — check GSHEET_SPREADSHEET_ID in .env",
+    }
+
+
 @app.get("/api/symbols")
 async def list_symbols(
     query: str = Query(default="", description="Filter by symbol or name"),

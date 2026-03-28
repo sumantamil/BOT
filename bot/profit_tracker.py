@@ -26,7 +26,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from dotenv import load_dotenv
 from loguru import logger
+
+_ROOT = Path(__file__).parent.parent  # d:\...\BOT\
+load_dotenv(_ROOT / ".env")  # ensure GSHEET_* vars are in os.environ
 
 _ROOT = Path(__file__).parent.parent  # d:\...\BOT\
 CONFIG_FILE = _ROOT / "profit_share_config.json"
@@ -306,6 +310,7 @@ def update_config(new_config: Dict[str, Any]) -> Dict[str, Any]:
 _TAB_TRACKING = "Profit Tracking"
 _TAB_CONFIG   = "Config"
 _TAB_SUMMARY  = "Summary"
+_TAB_TRADES   = "Trades"
 
 # Friendly display headers for the Tracking sheet
 _DISPLAY_HEADERS = [
@@ -489,6 +494,71 @@ def _sync_summary_sheet(spreadsheet, config: Dict[str, Any], all_rows: List[Dict
         ws.format("A12:B12", {"textFormat": {"bold": True}})
     except Exception:
         pass
+
+
+def _sync_trades_sheet(spreadsheet, trades: List[Dict]) -> None:
+    """
+    Write all individual trade rows to the Trades tab.
+    Each row = one executed trade from Dhan trade history.
+    """
+    ws = _get_or_create_tab(spreadsheet, _TAB_TRADES, rows=5000, cols=15)
+
+    headers = [
+        "Date", "Time", "Symbol", "Strike", "CE/PE",
+        "Action", "Premium (₹)", "Qty", "P&L (₹)", "Source",
+    ]
+
+    data = [headers]
+    for t in trades:
+        data.append([
+            t.get("date", ""),
+            t.get("time", ""),
+            t.get("symbol", ""),
+            t.get("strike", ""),
+            t.get("option_type", ""),
+            t.get("action", ""),
+            t.get("premium", ""),
+            t.get("quantity", ""),
+            t.get("pnl", ""),
+            t.get("source", ""),
+        ])
+
+    ws.clear()
+    ws.update(data, value_input_option="USER_ENTERED")
+
+    try:
+        ws.format("1:1", {"textFormat": {"bold": True}})
+        # Colour P&L column: green for profit, red for loss
+        from gspread.utils import rowcol_to_a1
+        for i, t in enumerate(trades, start=2):
+            pnl = t.get("pnl")
+            if pnl is None:
+                continue
+            cell = f"I{i}"
+            colour = {"red": 0.85, "green": 1.0, "blue": 0.85} if float(pnl) >= 0 else {"red": 1.0, "green": 0.8, "blue": 0.8}
+            ws.format(cell, {"backgroundColor": colour})
+    except Exception:
+        pass  # formatting is best-effort
+
+
+def sync_trades_to_google_sheets(trades: List[Dict]) -> bool:
+    """
+    Sync individual trade rows to the "Trades" tab in Google Sheets.
+    trades: list of dicts with keys date, time, symbol, strike, option_type,
+            action, premium, quantity, pnl, source.
+    Returns True on success, False if Sheets not configured or error.
+    """
+    _, spreadsheet = _get_gsheet_client()
+    if spreadsheet is None:
+        return False
+
+    try:
+        _sync_trades_sheet(spreadsheet, trades)
+        logger.info(f"Google Sheets Trades tab synced: {len(trades)} rows ✅")
+        return True
+    except Exception as e:
+        logger.error(f"Google Sheets Trades sync failed: {e}")
+        return False
 
 
 def sync_to_google_sheets(all_rows: Optional[List[Dict]] = None) -> bool:
