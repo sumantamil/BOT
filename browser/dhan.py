@@ -113,6 +113,9 @@ class DhanBroker:
         self.dhan_config  = settings.dhan
         self.trading_config = settings.trading
         self._active_index: IndexConfig = NIFTY
+        # Optional callback set by engine: async fn(message) → called when token expires
+        self._token_expired_cb = None
+        self._token_expired_alerted = False   # alert only once per session
 
         # dhanhq client
         self._client = None
@@ -154,10 +157,92 @@ class DhanBroker:
 
     # ── Lifecycle (no browser; just to match interface) ──────────────────────
 
+    async def _alert_token_expired(self) -> None:
+        """Fire a Telegram alert (once per session) when the Dhan token expires."""
+        if self._token_expired_alerted:
+            return
+        self._token_expired_alerted = True
+        msg = (
+            "🔴 *Dhan Token Expired!*\n"
+            "Your DHAN\\_ACCESS\\_TOKEN has expired.\n\n"
+            "1. Go to https://web.dhan.co\n"
+            "2. Login → Profile → API\n"
+            "3. Copy the new Access Token\n"
+            "4. Update DHAN\\_ACCESS\\_TOKEN in your .env file\n"
+            "5. Restart the bot\n\n"
+            "⚠️ Bot is NOT trading until token is refreshed."
+        )
+        if callable(self._token_expired_cb):
+            try:
+                await self._token_expired_cb(msg)
+            except Exception as e:
+                logger.error(f"Token expired alert callback failed: {e}")
+
     async def initialize(self, headless: bool = False):
         """No browser to start; load instrument master cache."""
         await self._ensure_instruments_loaded()
         logger.info("DhanBroker ready")
+
+    async def reinit_client(self, new_token: str) -> bool:
+        """
+        Hot-swap the Dhan access token without restarting the bot.
+        Updates the .env file and reinitializes the dhanhq client in memory.
+        Returns True if the new token is valid.
+        """
+        import re as _re
+        new_token = new_token.strip()
+        if not new_token:
+            return False
+
+        cid = self.dhan_config.client_id
+        if not cid:
+            logger.error("reinit_client: DHAN_CLIENT_ID not set")
+            return False
+
+        # 1. Update .env file on disk
+        try:
+            env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+            with open(env_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "DHAN_ACCESS_TOKEN" in content:
+                content = _re.sub(
+                    r"^DHAN_ACCESS_TOKEN\s*=.*$",
+                    f"DHAN_ACCESS_TOKEN={new_token}",
+                    content,
+                    flags=_re.MULTILINE,
+                )
+            else:
+                content += f"\nDHAN_ACCESS_TOKEN={new_token}\n"
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info("reinit_client: .env updated with new token")
+        except Exception as e:
+            logger.error(f"reinit_client: failed to update .env: {e}")
+            return False
+
+        # 2. Update in-memory config and reinitialize dhanhq client
+        try:
+            self.dhan_config.access_token = new_token
+            self._client = dhanhq(cid, new_token)
+            logger.info(f"reinit_client: dhanhq client reinitialized for client_id={cid}")
+        except Exception as e:
+            logger.error(f"reinit_client: dhanhq init failed: {e}")
+            return False
+
+        # 3. Verify the new token works
+        try:
+            resp = await asyncio.to_thread(self._client.get_fund_limits)
+            if resp and resp.get("status") == "success":
+                self._token_expired_alerted = False   # reset alert flag
+                logger.info("reinit_client: new token verified OK")
+                return True
+            else:
+                err = (resp.get("data", {}) or {}).get("errorCode", "") if resp else ""
+                logger.error(f"reinit_client: token verification failed (err={err})")
+                return False
+        except Exception as e:
+            logger.error(f"reinit_client: verification API call failed: {e}")
+            return False
 
     async def close(self):
         logger.info("DhanBroker: nothing to close")
@@ -179,6 +264,7 @@ class DhanBroker:
                 if err_code == "DH-901":
                     logger.error("Dhan access token is INVALID or EXPIRED. "
                                  "Generate a new token at https://web.dhan.co and update DHAN_ACCESS_TOKEN in .env")
+                    await self._alert_token_expired()
                 else:
                     logger.warning(f"Dhan get_fund_limits failed: {resp}")
                 return {"available_balance": 0.0, "used_margin": 0.0, "available_margin": 0.0}
@@ -622,6 +708,7 @@ class DhanBroker:
                 if err_code == "DH-901":
                     logger.error("Dhan access token is INVALID or EXPIRED. "
                                  "Generate a new token at https://web.dhan.co and update DHAN_ACCESS_TOKEN in .env")
+                    await self._alert_token_expired()
                 return {"day": [], "net": [], "total_pnl": 0.0}
             raw = resp.get("data", [])
             positions = raw if isinstance(raw, list) else []

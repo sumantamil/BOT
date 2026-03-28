@@ -48,6 +48,7 @@ from bot.theta_clock import theta_clock
 from bot.multi_timeframe import mtf_engine
 from bot.trade_journal import trade_journal
 from bot.index_config import IndexConfig, NIFTY, BANKNIFTY, SENSEX, get_index, list_indices
+from bot import profit_tracker
 from bot.orb_strategy import ORBStrategy, ORBSignal
 from bot.vwap_strategy import VWAPStrategy, VWAPSignal
 from bot.gap_detector import (
@@ -355,7 +356,7 @@ class TradingBot:
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
                         url,
-                        json={"chat_id": chat_id, "text": message},
+                        json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
                         timeout=10,
                     )
                 if response.status_code != 200:
@@ -397,7 +398,11 @@ class TradingBot:
         try:
             # Initialize browser
             await self.kite.initialize(headless=False)
-            
+
+            # Wire Dhan token-expired Telegram alert
+            if hasattr(self.kite, '_token_expired_cb'):
+                self.kite._token_expired_cb = self._send_telegram_alert
+
             # Initialize order manager
             self.order_manager = OrderManager(self.kite)
 
@@ -1264,6 +1269,7 @@ class TradingBot:
         check_interval = 15
         pnl_broadcast_count = 0
         _expiry_alert_sent_date: Optional[date] = None  # track so alert fires once per day
+        _profit_recorded_date: Optional[date] = None   # track EOD profit recording
         # Snapshot of the user's index — stable reference immune to analysis-loop swaps
         _usr_idx = self._user_selected_index
 
@@ -1333,8 +1339,11 @@ class TradingBot:
                             f"Daily loss auto-close: {ok}/{len(results)} positions closed.",
                             "system"
                         )
+                        _day_pnl = self.order_manager._daily_pnl
+                        _day_sign = "📈" if _day_pnl >= 0 else "📉"
                         await self._send_telegram_alert(
-                            f"🛑 Daily loss limit hit — {ok}/{len(results)} positions closed.",
+                            f"🛑 Daily loss limit hit — {ok}/{len(results)} positions closed.\n"
+                            f"{_day_sign} Day P&L: ₹{_day_pnl:,.2f}",
                             "trade_exit"
                         )
 
@@ -1377,9 +1386,12 @@ class TradingBot:
                             )
                             if _vt_res.success:
                                 _pnl_s = f"₹{_vt.pnl:,.2f}" if _vt.pnl is not None else "N/A"
+                                _day_pnl = self.order_manager._daily_pnl
+                                _day_sign = "📈" if _day_pnl >= 0 else "📉"
                                 await self._send_telegram_alert(
                                     f"⏱️ Hard time exit at {_hard_exit_h}:00\n"
-                                    f"{_vt.symbol} | P&L: {_pnl_s}",
+                                    f"{_vt.symbol} | Trade P&L: {_pnl_s}\n"
+                                    f"{_day_sign} Day P&L: ₹{_day_pnl:,.2f}",
                                     "trade_exit"
                                 )
                             else:
@@ -1421,10 +1433,58 @@ class TradingBot:
                         await self._broadcast_message(
                             f"Auto-close: {ok}/{len(results)} positions closed.", "system"
                         )
+                        _day_pnl = self.order_manager._daily_pnl
+                        _day_sign = "📈" if _day_pnl >= 0 else "📉"
                         await self._send_telegram_alert(
-                            f"⏰ Market-close auto-exit: {ok}/{len(results)} positions closed.",
+                            f"⏰ Market-close auto-exit: {ok}/{len(results)} positions closed.\n"
+                            f"{_day_sign} Day P&L: ₹{_day_pnl:,.2f}",
                             "trade_exit"
                         )
+
+                # ── EOD profit recording: snapshot P&L at 15:30 IST ─────────────
+                if now.weekday() <= 4:  # Mon–Fri only
+                    if now.hour == 15 and now.minute >= 30 and _profit_recorded_date != now.date():
+                        _profit_recorded_date = now.date()
+                        try:
+                            if self.order_manager:
+                                summary = self.order_manager.get_summary()
+                                gross   = float(summary.get("total_pnl", 0))
+                                trades  = int(summary.get("total_trades", 0))
+                                wins    = int(summary.get("wins", 0))
+                                losses  = int(summary.get("losses", 0))
+                            elif hasattr(self, '_paper_trader') and self._paper_trader:
+                                summary = self._paper_trader.get_summary()
+                                gross   = float(summary.get("total_pnl", 0))
+                                trades  = int(summary.get("total_trades", 0))
+                                wins    = int(summary.get("wins", 0))
+                                losses  = int(summary.get("losses", 0))
+                            else:
+                                gross, trades, wins, losses = 0.0, 0, 0, 0
+                            profit_tracker.record_daily_pnl(
+                                gross_pnl=gross,
+                                total_trades=trades,
+                                wins=wins,
+                                losses=losses,
+                                notes="Auto-recorded at 15:30",
+                            )
+                            await self._broadcast_message(
+                                f"📊 EOD profit recorded — gross ₹{gross:,.2f} | {trades} trades",
+                                "system"
+                            )
+                            logger.info(f"EOD profit recorded: gross ₹{gross:,.2f}, trades {trades}")
+                            # Send EOD summary to Telegram
+                            _eod_sign = "📈" if gross >= 0 else "📉"
+                            _wr_str   = f"{wins}/{trades}" if trades else "0/0"
+                            _eod_tg = (
+                                f"{_eod_sign} *End of Day Summary*\n"
+                                f"Date: {now.strftime('%d %b %Y')}\n"
+                                f"Total P&L: ₹{gross:,.2f}\n"
+                                f"Trades: {trades} (W: {wins} / L: {losses})\n"
+                                f"Win Rate: {int(wins/trades*100) if trades else 0}%"
+                            )
+                            await self._send_telegram_alert(_eod_tg, "system")
+                        except Exception as _pt_err:
+                            logger.error(f"EOD profit recording failed: {_pt_err}")
 
                 # Check if we have open positions
                 if not self.order_manager or not self.order_manager._positions:
@@ -1519,13 +1579,16 @@ class TradingBot:
                                 trade_ref.tier2_exited = True
                             locked_pct = settings.trading.take_profit_tier_1_percent if tier_label == "TIER1" \
                                 else settings.trading.take_profit_tier_2_percent
+                            _day_pnl = self.order_manager._daily_pnl
+                            _day_sign = "📈" if _day_pnl >= 0 else "📉"
                             msg = (
                                 f"💰 {tier_label} profit exit: {trade_ref.symbol} "
                                 f"— sold {tier_qty} units @ {locked_pct:.0f}% gain | "
                                 f"₹{exit_price:.2f}"
                             )
+                            tg_tier_msg = f"{msg}\n{_day_sign} Day P&L: ₹{_day_pnl:,.2f}"
                             await self._broadcast_message(msg, "trade_success")
-                            await self._send_telegram_alert(msg, "trade_exit")
+                            await self._send_telegram_alert(tg_tier_msg, "trade_exit")
                             logger.info(f"{tier_label} partial exit for {tier_id}: qty={tier_qty}")
                             try:
                                 _strike = trade_ref.strike or 0
@@ -1563,10 +1626,13 @@ class TradingBot:
                                     "trade_success"
                                 )
                                 pnl_display = f"₹{trade_ref.pnl:,.2f}" if trade_ref and trade_ref.pnl is not None else "N/A"
+                                _day_pnl = self.order_manager._daily_pnl
+                                _day_sign = "📈" if _day_pnl >= 0 else "📉"
                                 tg_message = (
                                     f"✅ *Position Closed*\n"
                                     f"{trade_ref.symbol if trade_ref else trade_id}\n"
-                                    f"P&L: {pnl_display}\n{result.message}"
+                                    f"Trade P&L: {pnl_display}\n{result.message}\n"
+                                    f"{_day_sign} Day P&L: ₹{_day_pnl:,.2f}"
                                 )
                                 await self._send_telegram_alert(tg_message, "trade_exit")
                                 logger.info(f"Auto-closed position {trade_id}: {result.message}")

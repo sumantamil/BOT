@@ -58,6 +58,8 @@ class TelegramCommandHandler:
         self._offset     = 0        # last processed update_id + 1
         self._error_count = 0
         self._base_url   = f"https://api.telegram.org/bot{self._token}"
+        self._stop_confirm_pending = False    # /stop confirmation guard
+        self._stop_confirm_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,6 +132,19 @@ class TelegramCommandHandler:
         except Exception as exc:
             logger.debug(f"TelegramCommandHandler _send error: {exc}")
 
+    async def _delete_message(self, message_id: int) -> None:
+        """Delete a specific message from the chat (used to hide sensitive tokens)."""
+        if not self._chat_id or not self._token or not message_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{self._base_url}/deleteMessage",
+                    json={"chat_id": self._chat_id, "message_id": message_id},
+                )
+        except Exception as exc:
+            logger.debug(f"TelegramCommandHandler _delete_message error: {exc}")
+
     # ------------------------------------------------------------------
     # Command dispatcher
     # ------------------------------------------------------------------
@@ -138,6 +153,7 @@ class TelegramCommandHandler:
         msg = update.get("message") or {}
         text = (msg.get("text") or "").strip()
         sender_chat = str(msg.get("chat", {}).get("id", ""))
+        message_id  = msg.get("message_id", 0)
 
         if not text.startswith("/"):
             return
@@ -151,7 +167,9 @@ class TelegramCommandHandler:
         cmd   = parts[0].lower().split("@")[0]  # strip @botname suffix
         args  = parts[1:]
 
-        logger.info(f"Telegram command received: {cmd} {args}")
+        # Mask token in logs — never log the actual token value
+        safe_args = [f"{'*' * min(len(a), 8)}..." if cmd == "/settoken" and a else a for a in args]
+        logger.info(f"Telegram command received: {cmd} {safe_args}")
 
         handlers = {
             "/status":        self._cmd_status,
@@ -164,11 +182,19 @@ class TelegramCommandHandler:
             "/set_target":    self._cmd_set_target,
             "/regime":        self._cmd_regime,
             "/vix":           self._cmd_vix,
+            "/pnl":           self._cmd_pnl,
+            "/today":         self._cmd_today,
+            "/stop":          self._cmd_stop,
+            "/settoken":      self._cmd_settoken,
             "/help":          self._cmd_help,
         }
         handler = handlers.get(cmd)
         if handler:
-            await handler(args)
+            # Pass message_id as extra kwarg only to commands that need it
+            if cmd == "/settoken":
+                await handler(args, message_id=message_id)
+            else:
+                await handler(args)
         else:
             await self._send(f"Unknown command: `{cmd}`\nSend /help for the command list.")
 
@@ -313,17 +339,140 @@ class TelegramCommandHandler:
         except Exception as exc:
             await self._send(f"VIX fetch error: {exc}")
 
+    async def _cmd_pnl(self, _args: list) -> None:
+        e = self._engine
+        if e.order_manager:
+            daily = e.order_manager._daily_pnl
+            open_pnl = sum(
+                (e._current_prices.get(t.symbol, t.price) - t.price) * t.quantity
+                for t in e.order_manager._positions.values()
+                if t.status == "OPEN" and t.symbol in e._current_prices
+            ) if hasattr(e, '_current_prices') else 0.0
+            total = daily + open_pnl
+            sign = "📈" if total >= 0 else "📉"
+            msg = (
+                f"{sign} *Live P&L*\n"
+                f"Realized: ₹{daily:+,.2f}\n"
+                f"Unrealized: ₹{open_pnl:+,.2f}\n"
+                f"Total: ₹{total:+,.2f}"
+            )
+        else:
+            msg = "No broker connected — use /paper\_summary for paper P&L"
+        await self._send(msg)
+
+    async def _cmd_today(self, _args: list) -> None:
+        e = self._engine
+        lines = [f"📅 *Today's Summary ({datetime.now().strftime('%d %b %Y')})*"]
+        # Live trades
+        if e.order_manager:
+            s = e.order_manager.get_summary()
+            daily = e.order_manager._daily_pnl
+            sign = "📈" if daily >= 0 else "📉"
+            lines.append(
+                f"\n*Live Trading*\n"
+                f"Trades: {s.get('total_trades', 0)} | W: {s.get('wins', 0)} L: {s.get('losses', 0)}\n"
+                f"{sign} P&L: ₹{daily:+,.2f}"
+            )
+        # Paper trades
+        ps = e.paper_trader.get_summary()
+        if ps.get('total_trades', 0) > 0:
+            p_sign = "📈" if ps['total_pnl'] >= 0 else "📉"
+            lines.append(
+                f"\n*Paper Trading*\n"
+                f"Trades: {ps['total_trades']} | WR: {ps['win_rate']}\n"
+                f"{p_sign} P&L: ₹{ps['total_pnl']:+,.2f}"
+            )
+            if ps.get('best_trade'):
+                b = ps['best_trade']
+                lines.append(f"Best: {b.get('index_name','')} {b.get('option_type','')} ₹{b['pnl']:+.0f}")
+            if ps.get('worst_trade'):
+                w = ps['worst_trade']
+                lines.append(f"Worst: {w.get('index_name','')} {w.get('option_type','')} ₹{w['pnl']:+.0f}")
+        await self._send("\n".join(lines))
+
+    async def _cmd_settoken(self, args: list) -> None:
+        if not args:
+            await self._send(
+                "Usage: `/settoken <your_new_dhan_token>`\n\n"
+                "Get your token from:\n"
+                "web.dhan.co → Profile → API"
+            )
+            return
+        new_token = args[0].strip()
+        broker = self._engine.kite
+        if not hasattr(broker, 'reinit_client'):
+            await self._send("⚠️ Token update is only supported for Dhan broker")
+            return
+        await self._send("⏳ Verifying new token...")
+        ok = await broker.reinit_client(new_token)
+        if ok:
+            await self._send(
+                "✅ *Dhan token updated successfully!*\n"
+                "Bot is now trading with the new token.\n"
+                ".env file has also been updated."
+            )
+        else:
+            await self._send(
+                "❌ *Token update failed!*\n"
+                "The token you sent is invalid or expired.\n"
+                "Please get a fresh token from web.dhan.co → Profile → API"
+            )
+
+    async def _cancel_stop_confirm(self) -> None:
+        """Auto-cancel the /stop confirmation after 30 seconds."""
+        await asyncio.sleep(30)
+        if self._stop_confirm_pending:
+            self._stop_confirm_pending = False
+            await self._send("\u23f0 /stop confirmation expired. Bot continues running.")
+
+    async def _cmd_stop(self, _args: list) -> None:
+        # Check if this is the confirmation step
+        if _args and _args[0].lower() == "confirm":
+            if not self._stop_confirm_pending:
+                await self._send("No pending /stop request. Send /stop first.")
+                return
+            # Cancel the timeout task
+            if self._stop_confirm_task and not self._stop_confirm_task.done():
+                self._stop_confirm_task.cancel()
+            self._stop_confirm_pending = False
+            await self._send("\ud83d\uded1 *Stopping bot* \u2014 closing all positions first...")
+            try:
+                e = self._engine
+                if e.order_manager:
+                    results = await e.order_manager.close_all_positions()
+                    ok = sum(1 for r in results if r.success)
+                    await self._send(f"\u2705 {ok}/{len(results)} positions closed")
+                self._running = False
+                await e.stop()
+            except Exception as exc:
+                await self._send(f"\u26a0\ufe0f Stop error: {exc}")
+            return
+
+        # First /stop — ask for confirmation
+        self._stop_confirm_pending = True
+        if self._stop_confirm_task and not self._stop_confirm_task.done():
+            self._stop_confirm_task.cancel()
+        self._stop_confirm_task = asyncio.create_task(self._cancel_stop_confirm())
+        await self._send(
+            "\u26a0\ufe0f *Are you sure?*\n"
+            "This will close ALL open positions and shut down the bot.\n\n"
+            "Reply `/stop confirm` within *30 seconds* to proceed.\n"
+            "Do nothing to cancel automatically."
+        )
+
     async def _cmd_help(self, _args: list) -> None:
         await self._send(
             "*📋 Bot Commands*\n\n"
             "/status — Bot state, positions, P&L\n"
+            "/pnl — Real-time live P&L\n"
+            "/today — Full day summary\n"
             "/pause — Pause auto-trading\n"
             "/resume — Resume auto-trading\n"
             "/positions — Open positions with P&L\n"
-            "/close\\_all — Emergency close all positions\n"
-            "/paper\\_summary — Paper trading results\n"
-            "/set\\_sl 20 — Set paper SL to 20%%\n"
-            "/set\\_target 50 — Set paper target to 50%%\n"
+            "/close\_all — Emergency close all positions\n"
+            "/paper\_summary — Paper trading results\n"
+            "/set\_sl 20 — Set paper SL to 20%%\n"
+            "/set\_target 50 — Set paper target to 50%%\n"
             "/regime — Current market regime\n"
-            "/vix — Current India VIX"
+            "/vix — Current India VIX\n"            "/settoken <token> — Update Dhan token (no restart!)\n"            "/stop — Gracefully stop the bot"
         )

@@ -25,6 +25,7 @@ from bot.engine import TradingBot, create_bot
 from bot.market_research import market_research
 from bot.index_config import NIFTY, BANKNIFTY, SENSEX
 from web.websocket import websocket_endpoint, chat_handler, manager
+from bot import profit_tracker
 
 
 # Global bot instance
@@ -881,6 +882,70 @@ async def health_check():
         "bot_initialized": bot is not None,
         "connections": manager.get_connection_count()
     }
+
+
+# ─────────────────────────── Profit Tracker ──────────────────────────────────
+
+@app.get("/api/profit-tracker")
+async def get_profit_tracker():
+    """Return all daily rows + cumulative totals + current config."""
+    try:
+        return profit_tracker.get_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/profit-tracker/config")
+async def update_profit_tracker_config(body: dict):
+    """
+    Update investor config (names, capital amounts, operator fee %).
+    Body: { operator_fee_pct, brokerage_per_trade,
+            investors: [{name, capital}, ...] }
+    """
+    try:
+        saved = profit_tracker.update_config(body)
+        return {"ok": True, "config": saved}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/profit-tracker/record")
+async def manual_record_profit(body: dict):
+    """
+    Manually record (or re-record) a day's P&L.
+    Body: { gross_pnl, total_trades, wins, losses, notes?, date? (YYYY-MM-DD) }
+    """
+    from datetime import date as _date
+    try:
+        trade_date = None
+        if body.get("date"):
+            trade_date = _date.fromisoformat(body["date"])
+        row = profit_tracker.record_daily_pnl(
+            gross_pnl=float(body.get("gross_pnl", 0)),
+            total_trades=int(body.get("total_trades", 0)),
+            wins=int(body.get("wins", 0)),
+            losses=int(body.get("losses", 0)),
+            notes=str(body.get("notes", "Manual entry")),
+            trade_date=trade_date,
+        )
+        return {"ok": True, "row": row}
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/profit-tracker/sync")
+async def sync_profit_tracker_to_sheets():
+    """Force an immediate Google Sheets sync."""
+    try:
+        ok = profit_tracker.sync_to_google_sheets()
+        if ok:
+            return {"ok": True, "message": "Google Sheets synced successfully"}
+        else:
+            return {"ok": False, "message": "Google Sheets not configured or sync failed — check GSHEET_SPREADSHEET_ID and GSHEET_CREDENTIALS_PATH in .env"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============== Factory Function ==============

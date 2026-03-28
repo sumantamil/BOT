@@ -48,6 +48,11 @@ signal_log.txt
 validation_nifty.json
 install_log.txt
 
+# Profit sharing data (private — contains capital amounts and investor details)
+profit_tracking.csv
+profit_share_config.json
+google_credentials.json
+
 # Backup files
 *.bak
 *.backup
