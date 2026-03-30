@@ -979,10 +979,10 @@ class GapPlaybook:
 
         logger.debug(f"GapPlaybook: fade={fade_score:.0f} cont={cont_score:.0f}")
 
-        if max(fade_score, cont_score) < 50:
+        if max(fade_score, cont_score) < 40:
             return {
                 "strategy": "SKIP", "confidence": 0,
-                "reasoning": ["Neither fade nor continuation scored ≥ 50"],
+                "reasoning": ["Neither fade nor continuation scored ≥ 40"],
                 "risk_reward": 0.0, "historical_win_rate": 0.0,
             }
 

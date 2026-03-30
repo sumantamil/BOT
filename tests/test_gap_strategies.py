@@ -498,10 +498,18 @@ class TestGapPlaybook:
     # ── Pre-flight blocks ─────────────────────────────────────────────────────
 
     def test_block_on_monday(self):
+        """Monday block is disabled (GAP_BLOCK_ON_MONDAY=false in .env).
+        A valid BREAKAWAY gap on Monday should still trade."""
+        from unittest.mock import patch
         ctx = {**self._context_normal(), "weekday": 0}
+        # When block_on_monday is explicitly re-enabled (e.g. for testing), SKIP expected
+        with patch.object(self.playbook, "_skip_monday", True):
+            rec = self.playbook.select_strategy(self._breakaway_gap(), ctx)
+            assert rec["strategy"] == "SKIP"
+            assert any("Monday" in r for r in rec["reasoning"])
+        # Default config (block_on_monday=false): Monday gap should trade
         rec = self.playbook.select_strategy(self._breakaway_gap(), ctx)
-        assert rec["strategy"] == "SKIP"
-        assert any("Monday" in r for r in rec["reasoning"])
+        assert rec["strategy"] != "SKIP"
 
     def test_block_high_vix(self):
         ctx = {**self._context_normal(), "vix": 30.0}

@@ -79,7 +79,11 @@ class TelegramCommandHandler:
             try:
                 updates = await self._get_updates()
                 for update in updates:
-                    await self._dispatch(update)
+                    try:
+                        await self._dispatch(update)
+                    except Exception as cmd_exc:
+                        logger.warning(f"TelegramCommandHandler command error: {cmd_exc}")
+                        await self._send(f"⚠️ Command failed: `{cmd_exc}`")
                 self._error_count = 0
             except asyncio.CancelledError:
                 break
@@ -204,7 +208,8 @@ class TelegramCommandHandler:
 
     async def _cmd_status(self, _args: list) -> None:
         e = self._engine
-        state = e.state.value if hasattr(e.state, "value") else str(e.state)
+        _st = e._state
+        state = _st.value if hasattr(_st, "value") else str(_st)
         mode  = "🔴 LIVE" if e._auto_trade else "📋 PAPER"
         positions = len(getattr(e.order_manager, "_positions", [])) if e.order_manager else 0
         paper_sum = e.paper_trader.get_summary()
@@ -365,12 +370,12 @@ class TelegramCommandHandler:
         lines = [f"📅 *Today's Summary ({datetime.now().strftime('%d %b %Y')})*"]
         # Live trades
         if e.order_manager:
-            s = e.order_manager.get_summary()
+            ds = e.order_manager._daily_stats
             daily = e.order_manager._daily_pnl
             sign = "📈" if daily >= 0 else "📉"
             lines.append(
                 f"\n*Live Trading*\n"
-                f"Trades: {s.get('total_trades', 0)} | W: {s.get('wins', 0)} L: {s.get('losses', 0)}\n"
+                f"Trades: {ds.total_trades} | W: {ds.winning_trades} L: {ds.losing_trades}\n"
                 f"{sign} P&L: ₹{daily:+,.2f}"
             )
         # Paper trades

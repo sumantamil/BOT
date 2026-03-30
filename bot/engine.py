@@ -2462,8 +2462,8 @@ class TradingBot:
                 }
                 # Try to get VIX from cache
                 try:
-                    if hasattr(self, "_vix_cache") and self._vix_cache:
-                        context["vix"] = self._vix_cache
+                    if self._cached_vix > 0:
+                        context["vix"] = self._cached_vix
                 except Exception:
                     pass
                 # Try to get live trend direction
