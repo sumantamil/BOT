@@ -1025,7 +1025,7 @@ class GapPlaybook:
 
         # Gap size
         if cat == "EXHAUSTION":
-            score += 30
+            score += 40
             notes.append(f"Exhaustion gap ({abs_pct:.1f}%) strongly favours fade")
         elif cat == "RUNAWAY":
             score += 15

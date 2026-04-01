@@ -117,6 +117,11 @@ class DhanBroker:
         self._token_expired_cb = None
         self._token_expired_alerted = False   # alert only once per session
 
+        # Order failure circuit breaker: count consecutive DH-905 / DH-901 errors.
+        # After 3 failures with the same error code, alert + pause auto-trading.
+        self._consec_order_failures: int = 0
+        self._ip_block_alerted: bool = False   # only alert once per session
+
         # dhanhq client
         self._client = None
         if DHANHQ_AVAILABLE:
@@ -156,6 +161,27 @@ class DhanBroker:
         logger.info(f"DhanBroker: active index → {index_config.display_name}")
 
     # ── Lifecycle (no browser; just to match interface) ──────────────────────
+
+    async def _alert_ip_blocked(self) -> None:
+        """Fire an urgent Telegram alert (once per session) when DH-905 blocks all orders."""
+        if self._ip_block_alerted:
+            return
+        self._ip_block_alerted = True
+        msg = (
+            "🚨 *DH-905 INVALID IP — TRADING BLOCKED!*\n"
+            "All orders are failing with DH-905 (Invalid IP).\n\n"
+            "Fix now:\n"
+            "1. Go to https://developer.dhanhq.co\n"
+            "2. Click your App → Edit → add your current IP\n"
+            "3. Also check https://web.dhan.co → DhanHQ Trading APIs → Manage Token → IP Whitelist\n"
+            "4. Restart the bot after whitelisting.\n\n"
+            "⚠️ Auto-trading is PAUSED until IP is whitelisted."
+        )
+        if callable(self._token_expired_cb):
+            try:
+                await self._token_expired_cb(msg)
+            except Exception as e:
+                logger.error(f"IP blocked alert callback failed: {e}")
 
     async def _alert_token_expired(self) -> None:
         """Fire a Telegram alert (once per session) when the Dhan token expires."""
@@ -230,16 +256,28 @@ class DhanBroker:
             return False
 
         # 3. Verify the new token works
+        # Note: outside market hours Dhan returns FUND_LIMIT_ERROR (not "success") even
+        # for a perfectly valid token.  We treat that as OK — it just means no live data.
+        # Only hard auth errors (401 / DH-904 / invalid-token) count as failures.
+        _AUTH_ERROR_CODES = {"DH-904", "DH-903", "invalid_access_token", "INVALID_TOKEN"}
         try:
             resp = await asyncio.to_thread(self._client.get_fund_limits)
             if resp and resp.get("status") == "success":
                 self._token_expired_alerted = False   # reset alert flag
-                logger.info("reinit_client: new token verified OK")
+                logger.info("reinit_client: new token verified OK (market-hours response)")
                 return True
-            else:
-                err = (resp.get("data", {}) or {}).get("errorCode", "") if resp else ""
-                logger.error(f"reinit_client: token verification failed (err={err})")
-                return False
+            # Check if it's a benign outside-market-hours error
+            err_type = (resp or {}).get("data", {}).get("errorType", "") if resp else ""
+            err_code = (resp or {}).get("data", {}).get("errorCode", "") if resp else ""
+            if err_type == "FUND_LIMIT_ERROR" or (resp and resp.get("status") == "failure"
+                                                   and err_code not in _AUTH_ERROR_CODES):
+                # Connected to Dhan API fine — just outside market hours or non-auth error
+                self._token_expired_alerted = False
+                logger.info(f"reinit_client: new token accepted (non-market-hours, err_type={err_type})")
+                return True
+            # Hard auth failure
+            logger.error(f"reinit_client: token verification failed (err_code={err_code}, err_type={err_type})")
+            return False
         except Exception as e:
             logger.error(f"reinit_client: verification API call failed: {e}")
             return False
@@ -513,12 +551,28 @@ class DhanBroker:
                 # always use the EXACT same contract (right expiry guaranteed).
                 sym_key = f"{index.name}{strike}{option_type.value}".upper()
                 self._position_security_ids[sym_key] = sec_id
+                # Success — reset circuit-breaker counter
+                self._consec_order_failures = 0
+                self._ip_block_alerted = False
                 return OrderResult(True, oid,
                     f"Dhan {order_type.value} {index.name}{strike}{option_type.value} x{quantity}",
                     datetime.now())
             else:
                 msg = f"Dhan order failed: {response}"
                 logger.error(msg)
+                # Circuit breaker: count consecutive DH-905 (Invalid IP) / DH-901 errors
+                _err_code = ((response or {}).get("data", {}) or {}).get("errorCode", "")
+                if _err_code in ("DH-905", "DH-901"):
+                    self._consec_order_failures += 1
+                    if self._consec_order_failures >= 3:
+                        if _err_code == "DH-905":
+                            import asyncio as _asyncio
+                            _asyncio.ensure_future(self._alert_ip_blocked())
+                        elif _err_code == "DH-901":
+                            import asyncio as _asyncio
+                            _asyncio.ensure_future(self._alert_token_expired())
+                else:
+                    self._consec_order_failures = 0
                 return OrderResult(False, None, msg, datetime.now())
         except Exception as e:
             msg = f"Dhan place_order exception: {e}"
@@ -916,13 +970,13 @@ class DhanBroker:
         trigger_price = round(entry_price * (1 - stop_loss_pct / 100), 1)
         limit_price   = round(trigger_price * 0.98, 1)
         dhan_exchange = _EXCHANGE_BSE_FO if "BSE" in exchange.upper() else _EXCHANGE_NSE_FNO
-        # Forever Orders (GTT equivalent) must use CNC for NSE_FNO and MARGIN for BSE_FNO.
-        # INTRADAY is rejected by Dhan with DH-906 because a GTT stop-loss
-        # is designed to persist beyond intraday — it cannot be INTRADAY.
+        # Forever Orders on BSE_FNO (SENSEX/BANKEX) require MARGIN.
+        # For NSE_FNO INTRADAY options, Dhan Forever Orders use INTRADAY product —
+        # the order triggers intraday and is scoped to the same session.
         if dhan_exchange == _EXCHANGE_BSE_FO:
             product = _PRODUCT_MARGIN
         else:
-            product = _PRODUCT_CNC
+            product = _PRODUCT_INTRADAY
 
         try:
             resp = await asyncio.to_thread(
@@ -935,6 +989,7 @@ class DhanBroker:
                 product_type=product,
                 price=limit_price,
                 trigger_Price=trigger_price,
+                symbol=symbol,          # tradingSymbol required by Dhan API
             )
             if resp and resp.get("status") == "success":
                 oid = resp.get("data", {}).get("orderId")

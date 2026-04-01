@@ -207,6 +207,7 @@ class TradingBot:
         self._index_vwap_triggered: Dict[str, Optional[date]] = {}
         self._index_gap_traded: Dict[str, bool] = {}
         self._index_gap_direction: Dict[str, str] = {}   # "UP" / "DOWN" per index for today
+        self._index_gap_fail_count: Dict[str, int] = {}  # consecutive order failures per index
         self._index_eod_triggered: Dict[str, Optional[date]] = {}
         self._index_trend_triggered: Dict[str, Optional[date]] = {}  # paper TREND 1/day guard
         self._index_day_direction: Dict[str, str] = {}  # "CE" or "PE" — first direction fired today per index
@@ -350,13 +351,21 @@ class TradingBot:
     
     async def _send_telegram_alert(self, message: str, alert_type: str = "info"):
         """Send alert to primary (and optional secondary) Telegram channel"""
+        # For error/warning messages that may contain raw API responses (curly braces,
+        # underscores, etc.) switch to plain text to avoid Markdown parse failures.
+        _md_safe_types = {"info", "trade_entry", "trade_exit", "gap_analysis", "paper_trade", "system"}
+        _parse_mode = "Markdown" if alert_type in _md_safe_types else None
+
         async def _post(bot_token: str, chat_id: str, label: str) -> None:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload: dict = {"chat_id": chat_id, "text": message}
+            if _parse_mode:
+                payload["parse_mode"] = _parse_mode
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
                         url,
-                        json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+                        json=payload,
                         timeout=10,
                     )
                 if response.status_code != 200:
@@ -877,6 +886,7 @@ class TradingBot:
                 if _last_loop_date != today:
                     self._index_gap_traded = {}    # reset all per-index gap flags each new day
                     self._index_gap_direction = {}  # reset gap direction each new day
+                    self._index_gap_fail_count = {}  # reset gap failure counters each new day
                     self._index_trend_triggered = {}  # reset paper TREND guard each new day
                     self._index_day_direction = {}   # reset same-day direction lock each new day
                     self._gift_nifty_predicted  = False  # reset Gift Nifty prediction each day
@@ -1836,6 +1846,14 @@ class TradingBot:
                                     "trade_error"
                                 )
                                 logger.error(f"Failed to close {trade_id}: {result.message}")
+                                _symbol = trade_ref.symbol if trade_ref and hasattr(trade_ref, 'symbol') else trade_id
+                                await self._send_telegram_alert(
+                                    f"🚨 EXIT ORDER FAILED — MANUAL ACTION NEEDED!\n"
+                                    f"Symbol: {_symbol}\n"
+                                    f"Error: {result.message}\n"
+                                    f"⚠️ Position may be OPEN beyond SL — close manually on Dhan app!",
+                                    "system"
+                                )
                         except Exception as e:
                             logger.error(f"Error closing position {trade_id}: {e}")
                             await self._broadcast_message(
@@ -2420,8 +2438,9 @@ class TradingBot:
             await self._send_telegram_alert(report, "gap_analysis")
             logger.info(f"Gap analysis done: {gap.gap_type.value} {gap.gap_pct:+.2f}%")
 
-            # No trade needed for neutral gaps
+            # No trade needed for neutral gaps — mark as done so we don't re-send every cycle
             if gap.gap_type == GapType.NEUTRAL:
+                self._index_gap_traded[self._active_index.name] = True
                 return
 
             # Record gap direction for this index so ORB won't fade the day's gap
@@ -2599,6 +2618,17 @@ class TradingBot:
                     await self._broadcast_message(
                         f"❌ Gap trade failed: {result.message}", "trade_error"
                     )
+                    _idx_f = self._active_index.name
+                    self._index_gap_fail_count[_idx_f] = self._index_gap_fail_count.get(_idx_f, 0) + 1
+                    if self._index_gap_fail_count[_idx_f] >= 3:
+                        logger.warning(f"Gap [{_idx_f}]: 3 consecutive order failures — stopping retries")
+                        self._index_gap_traded[_idx_f] = True
+                        self._save_daily_state()
+                        await self._send_telegram_alert(
+                            f"⚠️ Gap trade for {_idx_f} failed 3 times — retries stopped.\n"
+                            f"Check DH-905 IP whitelist or DH-901 token expiry.",
+                            "system"
+                        )
                 return   # ← end of playbook path
 
             # ── Legacy path (use_playbook=False or no rich info) ──────────
@@ -2699,6 +2729,17 @@ class TradingBot:
             else:
                 logger.error(f"Gap trade failed: {result.message}")
                 await self._broadcast_message(f"❌ Gap trade failed: {result.message}", "trade_error")
+                _idx_f = self._active_index.name
+                self._index_gap_fail_count[_idx_f] = self._index_gap_fail_count.get(_idx_f, 0) + 1
+                if self._index_gap_fail_count[_idx_f] >= 3:
+                    logger.warning(f"Gap [{_idx_f}]: 3 consecutive order failures — stopping retries")
+                    self._index_gap_traded[_idx_f] = True
+                    self._save_daily_state()
+                    await self._send_telegram_alert(
+                        f"⚠️ Gap trade for {_idx_f} failed 3 times — retries stopped.\n"
+                        f"Check DH-905 IP whitelist or DH-901 token expiry.",
+                        "system"
+                    )
 
         except Exception as e:
             logger.error(f"Gap signal check error: {e}")
