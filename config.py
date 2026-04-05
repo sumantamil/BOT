@@ -715,6 +715,26 @@ TRADING_AVOID_LOW_VOLUME_HOURS=false
 
 # Logging
 LOG_LEVEL=INFO
+
+# ============ LOCAL AI — OLLAMA (100% FREE, runs on your machine) ============
+# Setup: 1) Install Ollama: https://ollama.com/download
+#         2) Pull model:     ollama pull llama3.2
+#         3) Start server:   ollama serve
+#         4) Set AI_ENABLED=true below
+# OR use LM Studio (port 1234): change AI_BASE_URL=http://localhost:1234
+AI_ENABLED=false
+AI_BASE_URL=http://localhost:11434
+AI_MODEL=llama3.2
+AI_TIMEOUT_SECONDS=60
+AI_MIN_CONFIDENCE=60
+# Per-prompt toggles ─ disable individual prompts for testing/speed
+AI_USE_AI_SIGNAL_VALIDATION=true
+AI_USE_AI_SENTIMENT=true
+AI_USE_AI_PATTERN_RECOGNITION=true
+AI_USE_AI_RISK_ASSESSMENT=true
+# Confidence multipliers applied when the AI adjusts signal strength
+AI_CONFIDENCE_BOOST=1.4
+AI_CONFIDENCE_REDUCE=0.65
 """
 
 

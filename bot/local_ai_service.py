@@ -332,7 +332,7 @@ class LocalAIService:
         t0 = asyncio.get_event_loop().time()
         try:
             raw = await asyncio.wait_for(
-                self._call_llm(prompt, max_tokens=512),
+                self._call_llm(prompt, max_tokens=1024),
                 timeout=self.timeout,
             )
             elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000
@@ -398,7 +398,7 @@ class LocalAIService:
         t0 = asyncio.get_event_loop().time()
         try:
             raw = await asyncio.wait_for(
-                self._call_llm(prompt, max_tokens=512),
+                self._call_llm(prompt, max_tokens=768),
                 timeout=self.timeout,
             )
             elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000

@@ -1,6 +1,6 @@
 # NIFTY Options Trading Bot
 
-A sophisticated automated trading bot for NIFTY, BANKNIFTY, and SENSEX options with **multi-broker support (Dhan + Zerodha)**, **6 intraday strategies**, **real-time P&L tracking**, **Kelly-based position sizing**, **performance analytics**, and **Telegram alerts**.
+A sophisticated automated trading bot for NIFTY, BANKNIFTY, and SENSEX options with **multi-broker support (Dhan + Zerodha)**, **6 intraday strategies**, **local AI validation (4-prompt Ollama system)**, **real-time P&L tracking**, **Kelly-based position sizing**, **performance analytics**, and **Telegram alerts**.
 
 ---
 
@@ -20,6 +20,27 @@ Then open: **http://localhost:8000**
 > python pre_live_checklist.py
 > ```
 > All critical checks must pass before setting `TRADING_AUTO_TRADE_ENABLED=true`.
+
+---
+
+## Pre-Flight Checklist (Every Morning)
+
+- [ ] **Ollama running** — `ollama serve` (or auto-started via `start_bot_background.ps1`)
+- [ ] **Model present** — `ollama pull llama3.2` (one-time; verify with `ollama list`)
+- [ ] **AI enabled** — `AI_ENABLED=true` in `.env` (set `false` to trade without AI validation)
+- [ ] **Broker credentials** — `DHAN_CLIENT_ID` + `DHAN_ACCESS_TOKEN` (or Zerodha) in `.env`
+- [ ] **Account balance set** — `TRADING_ACCOUNT_BALANCE=100000` in `.env`
+- [ ] **Risk limits set** — `TRADING_MAX_DAILY_LOSS`, `TRADING_MAX_LOSS_PER_TRADE` in `.env`
+- [ ] **Run bot** — `python main.py`
+
+On startup you should see:
+```
+[LocalAI] Ollama ready ✔  model=llama3.2  (1 model(s) available)
+[LocalAI] Background warmup scheduled
+```
+Web dashboard: **http://localhost:8000**
+
+> **httpx** is already in `requirements.txt` — no extra `pip install` needed.
 
 ---
 
@@ -855,6 +876,93 @@ TRADING_MAX_DAILY_LOSS=2000
 ---
 
 ## Changelog
+
+### April 2026 — Session 10: Local AI Integration (4-Prompt Validation System)
+
+Complete local AI validation layer using **Ollama + llama3.2** — 100% free, runs on your machine, no API key required. The AI acts as a final approval gate before every auto-trade order is placed, running 4 independent prompts in sequence.
+
+#### Setup (one-time)
+
+```powershell
+# 1. Install Ollama (https://ollama.com/download)
+# 2. Pull the model
+ollama pull llama3.2
+# 3. Start the server (auto-starts via start_bot_background.ps1)
+ollama serve
+```
+
+Set in `.env`:
+```env
+AI_ENABLED=true
+AI_MODEL=llama3.2
+AI_TIMEOUT_SECONDS=60
+```
+
+#### New file: `bot/local_ai_service.py`
+
+Core AI service — singleton accessed via `get_ai_service()`. Supports Ollama (`localhost:11434`) and LM Studio (`localhost:1234`) out of the box.
+
+**4 Prompt system (run in sequence before every auto-trade):**
+
+| # | Prompt | Purpose | Token budget | Blocks trade on |
+|---|--------|---------|-------------|-----------------|
+| 1 | Signal Validation | Checks RSI, MACD, VWAP, EMA confluence, time-of-day, R:R, loss fatigue | 256 | `SKIP` or `WAIT` |
+| 2 | Macro Sentiment | Session-level market conditions, VIX regime — refreshed at session boundary | 256 | `UNFAVORABLE` → Telegram alert (advisory only) |
+| 3 | Chart Pattern Recognition | Identifies 6 pattern types from last 10 five-minute candles | 1024 | `AVOID`, or direction mismatch ≥ 60% confidence |
+| 4 | Pre-Trade Risk Assessment | R:R ratio, account exposure %, consecutive-loss psychology, timing check | 768 | `REJECT` / recommendation=`SKIP` |
+
+**Dataclasses added:**
+- `AIValidationResult` — PROMPT 1 response (action, confidence, confluence, reasoning)
+- `MarketSentimentResult` — PROMPT 2 response (sentiment, VIX regime, trading conditions)
+- `PatternMatch` + `PatternRecognitionResult` — PROMPT 3 response (patterns, direction, entry/SL/target)
+- `RiskAssessmentResult` — PROMPT 4 response (assessment, risk level, checklist flags, size adjustment)
+
+**Engine integration (`bot/engine.py`):**
+- `TradingBot.initialize()`: schedules background `warmup()` task — model loads into RAM at bot startup so first real signal doesn't pay the 45-60s cold-start penalty
+- `TradingBot._analysis_loop()`: PROMPT 2 sentiment refreshed once per session boundary (Morning/Midday/Afternoon/Close) as a background task
+- `TradingBot._execute_auto_trade()`: PROMMPTs 1 → 3 → 4 run in sequence; any block returns immediately without placing the order
+- `TradingBot._build_chart_data(signal)`: fetches last 10 five-minute candles from yfinance + calculates classic pivot/R1/S1 for PROMPT 3
+- PROMPT 1 EXECUTE branch: `signal.strength` boosted by `AI_CONFIDENCE_BOOST` (×1.4 default)
+
+**Config additions (`config.py` — `AIConfig` class):**
+```env
+AI_ENABLED=false                    # Master switch
+AI_BASE_URL=http://localhost:11434  # Ollama (or localhost:1234 for LM Studio)
+AI_MODEL=llama3.2
+AI_TIMEOUT_SECONDS=60
+AI_MIN_CONFIDENCE=60
+# Per-prompt toggles
+AI_USE_AI_SIGNAL_VALIDATION=true
+AI_USE_AI_SENTIMENT=true
+AI_USE_AI_PATTERN_RECOGNITION=true
+AI_USE_AI_RISK_ASSESSMENT=true
+# Confidence modifiers
+AI_CONFIDENCE_BOOST=1.4
+AI_CONFIDENCE_REDUCE=0.65
+```
+
+**Startup health check (`main.py`):**
+- On startup, pings `/api/tags` to verify Ollama is running
+- Checks that the configured model is actually present in Ollama's model list
+- Warns with `ollama pull <model>` command if model is missing
+- Non-fatal: bot starts and trades normally if Ollama is unavailable (AI falls back to EXECUTE)
+
+**Test results (all 11/11 checks passed):**
+```
+PROMPT 1 — Signal Validation   : EXECUTE · 85% conf · 4/4 confluence · 44s
+PROMPT 2 — Macro Sentiment     : NEUTRAL · 50% · NORMAL VIX          · 45s
+PROMPT 3 — Chart Patterns      : BUY_CE · Engulfing 90% conf          · 115s
+PROMPT 4 — Risk Assessment     : APPROVE · LOW risk · EXECUTE          · 70s
+```
+
+Run the regression test anytime:
+```powershell
+.venv\Scripts\python.exe _test_ai_all_prompts.py
+```
+
+**`start_bot_background.ps1`:** auto-starts `ollama serve` before the bot if `AI_ENABLED=true` and the process isn't already running.
+
+---
 
 ### April 2026 — Session 9: Live Trading Bug Fixes + Performance Improvements
 

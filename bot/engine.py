@@ -3808,10 +3808,16 @@ class TradingBot:
                     await self._broadcast_message(wait_msg, "alert")
                     return
                 else:
+                    # AI agrees — boost signal strength so downstream confidence
+                    # thresholds are met more easily on high-quality setups.
+                    _boost = getattr(settings.ai, "confidence_boost", 1.4)
+                    _old_str = signal.strength
+                    signal.strength = min(100.0, signal.strength * _boost)
                     logger.info(
                         f"[LocalAI] EXECUTE approved — confidence={_ai_result.confidence:.0f}% "
                         f"confluence={_ai_result.confluence_count}/4 "
-                        f"sentiment={_ai_result.market_sentiment}"
+                        f"sentiment={_ai_result.market_sentiment} | "
+                        f"strength boosted {_old_str:.0f}% → {signal.strength:.0f}% (×{_boost})"
                     )
         except Exception as _ai_exc:
             logger.warning(f"[LocalAI] Validation skipped due to error: {_ai_exc}")

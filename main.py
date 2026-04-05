@@ -56,6 +56,34 @@ def run_server():
     logger.info("Starting NIFTY Trading Bot Web Server...")
     logger.info(f"Open http://{settings.web.host}:{settings.web.port} in your browser")
 
+    # ── Ollama health check ────────────────────────────────────────────────
+    # If AI is enabled, verify the local LLM server is reachable before the
+    # bot starts; warn (but don't exit) if it isn't so paper-trading still works.
+    if settings.ai.enabled:
+        import httpx as _httpx
+        try:
+            _r = _httpx.get(f"{settings.ai.base_url}/api/tags", timeout=5)
+            _models = [m.get("name", "") for m in _r.json().get("models", [])]
+            _model_found = any(settings.ai.model in m for m in _models)
+            if _model_found:
+                logger.info(
+                    f"[LocalAI] Ollama ready \u2714  model={settings.ai.model}  "
+                    f"({len(_models)} model(s) available)"
+                )
+            else:
+                logger.warning(
+                    f"[LocalAI] Ollama running but model '{settings.ai.model}' not found.\n"
+                    f"  Available: {_models}\n"
+                    f"  Download with: ollama pull {settings.ai.model}"
+                )
+        except Exception as _ollama_err:
+            logger.warning(
+                f"[LocalAI] Ollama not reachable at {settings.ai.base_url} — "
+                f"AI validation will fall back to EXECUTE on every signal.\n"
+                f"  Start the server with: ollama serve\n"
+                f"  Error: {_ollama_err}"
+            )
+
     def _open_browser():
         try:
             webbrowser.open(f"http://{settings.web.host}:{settings.web.port}")
