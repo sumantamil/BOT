@@ -109,27 +109,27 @@ KITE_USE_KITE_API=true
 # ============ TRADING RISK SETTINGS (calibrated for ₹45,000 capital) ============
 TRADING_AUTO_TRADE_ENABLED=false     # Set true only after testing
 
-TRADING_MAX_POSITIONS=2
+TRADING_MAX_POSITIONS=3              # 1 per index: NIFTY + BANKNIFTY + SENSEX
 TRADING_MAX_LOSS_PER_TRADE=2250      # 5% of ₹45k capital
 TRADING_MAX_DAILY_LOSS=4500          # 10% of ₹45k capital
 TRADING_STOP_LOSS_PERCENTAGE=15
-TRADING_TARGET_PERCENTAGE=30
+TRADING_TARGET_PERCENTAGE=35
 TRADING_MAX_CONSECUTIVE_LOSSES=5
 TRADING_PAUSE_AFTER_LOSSES_MINUTES=60
-TRADING_MAX_TRADES_PER_DAY=3
+TRADING_MAX_TRADES_PER_DAY=5        # allows 1 per index even if restarts inflate counter
 TRADING_CLOSE_ALL_BEFORE_MARKET_CLOSE=3
 
 # Adaptive time-stops (automatically applied per strategy source)
-# GAP=60min, ORB=45min, VWAP=30min, Auto=90min, EOD=15min, Manual/Rule=45min
+# GAP=90min, ORB=45min, VWAP=30min, Auto=90min, EOD=15min, Manual/Rule=45min
 TRADING_TIME_STOP_MINUTES=45        # default; overridden per-strategy source
 
-# Smart time-based exit — only close LOSING positions at 13:00 IST
-# Profitable positions (pnl >= TIME_EXIT_MIN_PROFIT) are left to run toward target
+# Smart time-based exit — only close LOSING positions at 14:00 IST
+# Profitable positions (mark-to-market pnl >= TIME_EXIT_MIN_PROFIT) are left to run toward target
 TRADING_TIME_EXIT_ONLY_LOSERS=true
-TRADING_TIME_EXIT_MIN_PROFIT=50      # ₹ threshold — positions above this skip the time stop
+TRADING_TIME_EXIT_MIN_PROFIT=30      # ₹ threshold — positions above this skip the time stop
 
 # Hard cutoffs
-TRADING_HARD_TIME_EXIT_HOUR=13      # force-close positions entered before 13:00 at 13:00 IST
+TRADING_HARD_TIME_EXIT_HOUR=14      # force-close positions entered before 14:00 at 14:00 IST
 
 # India VIX filter
 TRADING_VIX_FILTER_ENABLED=true
@@ -147,7 +147,7 @@ TRADING_THETA_EXIT_THRESHOLD=-50    # ₹/day drain that triggers warning
 # Smart exits
 TRADING_USE_TRAILING_STOP_LOSS=true
 TRADING_TRAILING_STOP_PERCENTAGE=12
-TRADING_TRAILING_STOP_ACTIVATION_PCT=10
+TRADING_TRAILING_STOP_ACTIVATION_PCT=5   # arms after 5% gain (was 15% — never fired)
 TRADING_USE_PROFIT_TIERS=true
 TRADING_TAKE_PROFIT_TIER_1_PERCENT=30    # partial exit at +30% premium gain
 TRADING_TAKE_PROFIT_TIER_1_QUANTITY_PERCENT=50
@@ -169,8 +169,8 @@ TREND_ANALYSIS_INTERVAL_SECONDS=60
 GAP_ENABLED=true
 GAP_MIN_GAP_PCT=0.75
 GAP_STRONG_GAP_PCT=1.5
-GAP_STOP_LOSS_PCT=25
-GAP_TARGET_PCT=50
+GAP_STOP_LOSS_PCT=15             # matches TRADING_STOP_LOSS_PERCENTAGE
+GAP_TARGET_PCT=100               # gap trades target full 2× move
 
 # VWAP Mean Reversion (tightened to avoid noise)
 VWAP_DEVIATION_PCT=0.6        # % deviation from VWAP to trigger (default: 0.6)
@@ -252,8 +252,9 @@ TRADING_DEFAULT_QUANTITY=65    # NIFTY lot (30 for BANKNIFTY, 20 for SENSEX)
 | Time | Action |
 |------|--------|
 | **8:45 AM** | `python main.py` |
-| **9:15 AM** | Market opens — Gap strategy fires |
-| **9:15–9:30 AM** | Opening gap window |
+| **9:15 AM** | Market opens |
+| **9:20 AM** | Gap strategy fires (first 5 min skipped — see note below) |
+| **9:20–9:30 AM** | Opening gap window |
 | **9:30–11:30 AM** | ORB entry window |
 | **9:30 AM–2:00 PM** | Auto trend trades |
 | **9:30 AM–2:30 PM** | VWAP mean reversion active |
@@ -268,7 +269,7 @@ TRADING_DEFAULT_QUANTITY=65    # NIFTY lot (30 for BANKNIFTY, 20 for SENSEX)
 ## Strategies
 
 ### 1. Gap Up / Gap Down
-Fires once at market open (9:15–9:30 AM). Compares today's open to yesterday's close.
+Fires once per day per index. Gap window: **9:20–10:59 AM** (first 5 minutes after open are skipped — 9:15–9:19 has maximum uncertainty, widest spreads, and shakeout moves). Compares today's open to yesterday's close.
 
 | Gap % | Action |
 |-------|--------|
@@ -277,6 +278,8 @@ Fires once at market open (9:15–9:30 AM). Compares today's open to yesterday's
 | < ±0.75% | No gap trade — normal strategies |
 | 0.75–1.5% down | Wait for ORB confirmation |
 | > 1.5% down | Buy PE immediately |
+
+**On order failure (e.g. DH-905):** the gap trade is immediately marked as done for the day and saved to disk. Restarting the bot will NOT re-attempt the gap trade. This prevents duplicate orders from accumulating across restarts.
 
 ---
 
@@ -427,18 +430,18 @@ Five exit components fire in priority order for every open position:
 
 ### Position Limits
 
-- Max 2 open positions at any time (`TRADING_MAX_POSITIONS=2`)
+- Max **3 open positions** at any time (`TRADING_MAX_POSITIONS=3`) — 1 per index (NIFTY + BANKNIFTY + SENSEX)
 - Both ORB and VWAP slots tracked per-index per-day independently
 - Auto-trade consumes **both** slots on success — no double-entry after SL
-- Max **3 trades per day** total across all indices (calibrated for ₹45k capital)
+- Max **5 trades per day** (`TRADING_MAX_TRADES_PER_DAY=5`) — set higher than 3 to absorb restart-induced counter inflation without blocking valid trades
 
 ### Adaptive Time-Stops (Per Strategy)
 
-Positions that never move >2% into profit are closed automatically based on the strategy that opened them:
+Positions that never move >3% into profit are closed automatically based on the strategy that opened them (threshold raised from 2% → 3% — at VIX 25+, a 2% fluctuation is bid-ask noise):
 
 | Strategy | Time-Stop | Notes |
 |----------|-----------|-------|
-| GAP | 60 min | Entered at open — wider window |
+| GAP | 90 min | Raised from 60 min — gap trades need the full morning session |
 | ORB | 45 min | Standard breakout window |
 | VWAP | 30 min | Mean-reversion — resolves fast |
 | Auto/Trend | 90 min | Wider trend continuation window |
@@ -831,17 +834,20 @@ TRADING_MAX_DAILY_LOSS=2000
 | `ModuleNotFoundError` | `pip install -r requirements.txt` |
 | Port 8000 in use | `taskkill /F /IM python.exe /T` then restart |
 | Dhan 401 Unauthorized | Regenerate token at developer.dhanhq.co |
+| Dhan DH-905 Invalid IP | Add your current public IP in both developer.dhanhq.co (App -> Edit -> IP) and web.dhan.co (DhanHQ Trading APIs -> Manage Token -> IP Whitelist), then restart the bot |
 | Zerodha token expired | `python get_kite_token.py`, ensure `ZERODHA_PIN` is set |
 | Signal score too low | `perf recs` in console — shows which filters are blocking. Set `FILTER_MIN_CONFIDENCE_SCORE=60` temporarily to diagnose. |
 | No trades executing | Check `TRADING_AUTO_TRADE_ENABLED=true`, market hours, daily loss limit, RSI guard (ORB blocks CE<55 / PE>45 is now fixed ≥75/≤25) |
-| Gap trade not firing | Ensure `GAP_ENABLED=true`, check logs — fires only 9:15–9:30 AM |
+| Gap trade not firing | Ensure `GAP_ENABLED=true`, check logs — fires only **9:20–10:59 AM** (9:15–9:19 skipped intentionally) |
+| Gap trade fired multiple times on same day | Fixed in code — first order failure now marks gap as done and saves to disk. Verify `daily_trade_state.json` has today's date and `"gap": {"NIFTY": true}` after a failure. |
 | EOD trade not firing | Check `EOD_ENABLED=true`, ensure the 14:30 candle body ≥ 50% |
 | IV filter blocking all entries | Set `TRADING_IV_FILTER_ENABLED=false` until `.iv_history.json` has 5+ days of data |
 | Theta drain warning every cycle | Normal — informational only. Adjust `TRADING_THETA_EXIT_THRESHOLD` or set `TRADING_THETA_EXIT_ENABLED=false` |
 | Trade blocked "potential loss would breach daily cap" | Expected after earlier losses — the pre-trade risk gate blocks trades that would exceed `TRADING_MAX_DAILY_LOSS` even before the SL fires. Either wait for tomorrow or lower quantity. |
 | EOD win rate warning in logs | After 20 EOD trades, check `iv status` for EOD win rate. Set `EOD_ENABLED=false` if below 55%. |
-| Winners closed early at 1 PM | Set `TRADING_TIME_EXIT_ONLY_LOSERS=true` and `TRADING_TIME_EXIT_MIN_PROFIT=50` in `.env`. Run `python analyze_time_stop.py` to quantify the impact. |
-| Time-stop has no effect on losers | Confirm `TRADING_HARD_TIME_EXIT_HOUR=13` and `TRADING_TIME_EXIT_ONLY_LOSERS=true` in `.env`. Restart the bot. |
+| Winners closed early at time-stop hour | Set `TRADING_TIME_EXIT_ONLY_LOSERS=true`, `TRADING_TIME_EXIT_MIN_PROFIT=30`, and `TRADING_HARD_TIME_EXIT_HOUR=14` in `.env`. Run `python analyze_time_stop.py` to quantify the impact. |
+| Time-stop has no effect on losers | Confirm `TRADING_HARD_TIME_EXIT_HOUR=14` and `TRADING_TIME_EXIT_ONLY_LOSERS=true` in `.env`. Restart the bot. |
+| Trailing stop never arms | Was caused by `TRADING_TRAILING_STOP_ACTIVATION_PCT=15` — at ₹300 entry that required ₹2,925 profit before trail armed. Now `5` — arms after ~₹975 gain on a full NIFTY lot. |
 | P&L shows wrong value | Verify broker API connection (green badge in dashboard) |
 | `asyncio` test errors | `pip install pytest-asyncio` |
 | PowerShell script blocked | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
@@ -849,6 +855,72 @@ TRADING_MAX_DAILY_LOSS=2000
 ---
 
 ## Changelog
+
+### April 2026 — Session 9: Live Trading Bug Fixes + Performance Improvements
+
+All changes based on analysis of 11 completed live trades (27.3% win rate, -₹6,134 total from March 16 – April 2).
+
+**Bug fix — Gap trade duplicate orders on bot restart:**
+- **Root cause**: `_index_gap_fail_count` was in-memory only and reset to zero on every restart. The bot needed 3 consecutive failures before stopping retries — but each restart showed 0 failures, so it always retried.
+- **Impact**: On April 2, each of 3 restarts (caused by DH-905) placed a separate NIFTY gap order → 3× the intended position size with 3× the risk.
+- **Fix** (`bot/engine.py`): First order failure immediately marks `_index_gap_traded[idx] = True` and calls `_save_daily_state()`. Any subsequent restart reads the state file and skips the gap trade entirely.
+- **Before**: 3 failures needed → NIFTY gap fired 3 times on restart day
+- **After**: 1 failure → gap marked done → no more retries that day
+
+**Bug fix — Time-stop killing profitable positions:**
+- **Root cause**: `TRADING_TIME_EXIT_ONLY_LOSERS=true` checked `t.pnl` to decide if a position was profitable. But `t.pnl` is only set at close time — for an open position it is always `None`, which evaluates to `0 < ₹30 threshold` → every position got closed regardless of dashboard-visible profit.
+- **Impact**: April 2 — NIFTY PE showed ₹500+ profit on dashboard but was still closed at time-stop.
+- **Fix** (`bot/engine.py`): Uses `(current_price − entry_price) × quantity` (mark-to-market) for open positions. Falls back to `t.pnl` only when no live price is available.
+
+**Hard time exit: 13:00 → 14:00 IST** (`.env`):
+- 13:00 gave morning gap/ORB trades only 3.5 hours — not enough for moves to develop
+- The slow theta-bleed window is 13:00–14:30; cutting at 14:00 captures late continuation while avoiding the worst afternoon decay
+- Change: `TRADING_HARD_TIME_EXIT_HOUR=13` → **`14`**
+
+**Gap entry window: 9:15 → 9:20 AM** (`bot/engine.py`):
+- Data (3 weeks): entries at exactly 9:15 had more wrong-direction outcomes — first 5 minutes have maximum market-maker adjustment, bid-ask spread widening, and shakeout moves
+- Change: gap fires from **9:20 AM** (not 9:15)
+
+**GAP time-stop: 60 → 90 minutes** (`bot/order_manager.py`):
+- 60 min was cutting gap trades before they could develop. Apr02 NIFTY PE (156-min hold) would have been killed at 60 min
+- Change: `GAP: 60` → **`90`** in `_source_time_stops`
+
+**Stagnant-position threshold: 2% → 3%** (`bot/order_manager.py`):
+- At India VIX 25+, a 2% premium fluctuation is normal bid-ask noise, not a meaningful adverse move
+- Raising to 3% prevents time-stop from firing on positions that are simply oscillating near entry
+- Change: `trade.highest_price < entry * 1.02` → **`entry * 1.03`**
+
+**Trailing stop activation: 15% → 5%** (`.env`):
+- 15% required ₹2,925 gain on a ₹300-entry NIFTY lot before trail armed — trades showing ₹500–₹1,500 profit on dashboard never triggered trailing stop
+- Change: `TRADING_TRAILING_STOP_ACTIVATION_PCT=15` → **`5`**
+- At 5%, trail arms after ~₹975 gain on NIFTY, ~₹450 on BANKNIFTY, ~₹300 on SENSEX
+
+**MAX_POSITIONS: 2 → 3** (`.env`):
+- Allows 1 simultaneous position per index (NIFTY + BANKNIFTY + SENSEX)
+- Change: `TRADING_MAX_POSITIONS=2` → **`3`**
+
+**MAX_TRADES_PER_DAY: 3 → 5** (`.env`):
+- Counter restoration on restart includes closed broker positions — multiple restarts inflate count
+- Set to 5 so valid afternoon trades are not blocked by restart-inflated morning counts
+- Change: `TRADING_MAX_TRADES_PER_DAY=3` → **`5`**
+
+**BSE scraper warning silenced** (`bot/bse_scraper.py`):
+- BSE API returns a bot-detection HTML page from VPS IPs — was spamming `WARNING` every 2 minutes
+- Fixed: BSE warning → `logger.debug`; added `yfinance`-based `_build_estimate_chain()` fallback
+
+**Dashboard sound disabled** (`web/static/index_v2.html`):
+- `playAlertSound()` WebAudio oscillator removed from trade alert callback
+
+**Bot startup command (always use with log redirection):**
+```powershell
+Start-Process -FilePath ".venv\Scripts\python.exe" -ArgumentList "main.py" `
+  -NoNewWindow `
+  -RedirectStandardOutput "bot_stdout.log" `
+  -RedirectStandardError "bot_stderr.log"
+```
+Running without `-RedirectStandardOutput` creates an invisible bot — process exists but log file is never written.
+
+---
 
 ### March 2026 — Session 7: Smart Time Exit · Paper Trade Analytics · Pre-Live Checklist
 

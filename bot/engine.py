@@ -992,11 +992,15 @@ class TradingBot:
                     await self._check_gift_nifty_premarket()
 
                 # Gap-open window flag (shared across all index iterations below)
+                # Starts at 9:20 (not 9:15) — the first 5 minutes after open have maximum
+                # uncertainty: market-makers adjusting, algos rebalancing, shakeout moves.
+                # Data (3 weeks): entries at 9:15 had worse fills and more wrong-direction
+                # outcomes vs entries at 9:20+ when initial direction is clearer.
                 # Extended to 11:00 AM so a bot restart after 9:30 still catches the gap.
                 is_near_open = (
                     now_ts.weekday() <= 4  # Mon–Fri
                     and (
-                        (now_ts.hour == 9 and now_ts.minute >= 15)  # 9:15–9:59
+                        (now_ts.hour == 9 and now_ts.minute >= 20)  # 9:20–9:59 (skip first 5 min)
                         or now_ts.hour == 10                         # 10:00–10:59
                     )
                 )
@@ -1462,8 +1466,18 @@ class TradingBot:
                             and now.hour >= _hard_exit_h
                             # Minimum 15-minute hold: avoids closing a 12:59 entry 1 minute later
                             and (now - t.timestamp).total_seconds() >= 15 * 60
-                            # Smart exit: skip profitable positions when only_losers is on
-                            and not (_only_losers and (t.pnl or 0.0) >= _min_profit_th)
+                            # Smart exit: skip profitable positions when only_losers is on.
+                            # Use mark-to-market P&L (current_price - entry) * qty because
+                            # t.pnl is only set at close time — for open positions it is None/0,
+                            # which caused ALL positions to be closed regardless of profit.
+                            and not (
+                                _only_losers
+                                and (
+                                    (self._current_prices.get(t.symbol, 0.0) - t.price) * t.quantity
+                                    if self._current_prices.get(t.symbol, 0.0) > 0
+                                    else (t.pnl or 0.0)
+                                ) >= _min_profit_th
+                            )
                         )
                     ]
                     if _theta_victims:
@@ -2618,17 +2632,21 @@ class TradingBot:
                     await self._broadcast_message(
                         f"❌ Gap trade failed: {result.message}", "trade_error"
                     )
+                    # Mark gap as done immediately on any failure and persist to disk.
+                    # fail_count was in-memory only and reset on every restart, so the
+                    # old '3 failures' guard never fired — each restart re-attempted the
+                    # gap, creating duplicate orders.  If the order fails (DH-905, etc.)
+                    # it will fail on every retry; mark done and stop.
                     _idx_f = self._active_index.name
-                    self._index_gap_fail_count[_idx_f] = self._index_gap_fail_count.get(_idx_f, 0) + 1
-                    if self._index_gap_fail_count[_idx_f] >= 3:
-                        logger.warning(f"Gap [{_idx_f}]: 3 consecutive order failures — stopping retries")
-                        self._index_gap_traded[_idx_f] = True
-                        self._save_daily_state()
-                        await self._send_telegram_alert(
-                            f"⚠️ Gap trade for {_idx_f} failed 3 times — retries stopped.\n"
-                            f"Check DH-905 IP whitelist or DH-901 token expiry.",
-                            "system"
-                        )
+                    self._index_gap_traded[_idx_f] = True
+                    self._save_daily_state()
+                    logger.warning(f"Gap [{_idx_f}]: order failed — marked done for today to prevent restart duplicates")
+                    await self._send_telegram_alert(
+                        f"⚠️ Gap trade for {_idx_f} failed — retries stopped for today.\n"
+                        f"Error: {result.message}\n"
+                        f"Check DH-905 IP whitelist or DH-901 token expiry.",
+                        "system"
+                    )
                 return   # ← end of playbook path
 
             # ── Legacy path (use_playbook=False or no rich info) ──────────
@@ -2729,17 +2747,17 @@ class TradingBot:
             else:
                 logger.error(f"Gap trade failed: {result.message}")
                 await self._broadcast_message(f"❌ Gap trade failed: {result.message}", "trade_error")
+                # Mark gap as done immediately on any failure — same fix as playbook path.
                 _idx_f = self._active_index.name
-                self._index_gap_fail_count[_idx_f] = self._index_gap_fail_count.get(_idx_f, 0) + 1
-                if self._index_gap_fail_count[_idx_f] >= 3:
-                    logger.warning(f"Gap [{_idx_f}]: 3 consecutive order failures — stopping retries")
-                    self._index_gap_traded[_idx_f] = True
-                    self._save_daily_state()
-                    await self._send_telegram_alert(
-                        f"⚠️ Gap trade for {_idx_f} failed 3 times — retries stopped.\n"
-                        f"Check DH-905 IP whitelist or DH-901 token expiry.",
-                        "system"
-                    )
+                self._index_gap_traded[_idx_f] = True
+                self._save_daily_state()
+                logger.warning(f"Gap [{_idx_f}]: order failed — marked done for today to prevent restart duplicates")
+                await self._send_telegram_alert(
+                    f"⚠️ Gap trade for {_idx_f} failed — retries stopped for today.\n"
+                    f"Error: {result.message}\n"
+                    f"Check DH-905 IP whitelist or DH-901 token expiry.",
+                    "system"
+                )
 
         except Exception as e:
             logger.error(f"Gap signal check error: {e}")

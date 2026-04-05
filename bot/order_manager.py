@@ -836,14 +836,14 @@ class OrderManager:
 
             # ── Time-stop: exit if open > N minutes with no meaningful profit ──
             # Per-strategy adaptive limits reflect each strategy's natural hold time:
-            #   GAP=60 min  (gaps need time to develop or fill)
+            #   GAP=90 min  (gaps need the full morning session — 60 was cutting winners early)
             #   ORB=45 min  (standard breakout window)
             #   VWAP=30 min (mean-reversion is fast — works or doesn't within 30 min)
             #   Auto=90 min (trend-following needs time to play out)
             #   EOD=15 min  (sprint to close — no time to wait)
             #   Others=45 min (conservative default)
             _source_time_stops = {
-                "GAP":    60,
+                "GAP":    90,
                 "ORB":    45,
                 "VWAP":   30,
                 "Auto":   90,
@@ -858,8 +858,10 @@ class OrderManager:
             )
             if time_stop_mins > 0:
                 age_min = (datetime.now() - trade.timestamp).total_seconds() / 60
-                # Trigger only if: old enough AND peak never exceeded entry by 2%
-                if age_min >= time_stop_mins and trade.highest_price < entry * 1.02:
+                # Trigger only if: old enough AND peak never exceeded entry by 3%
+                # (raised from 2% → 3% based on 3-week data: at VIX 25+, options naturally
+                # fluctuate 2–3% just from bid-ask spread movement; 2% was misfiring.)
+                if age_min >= time_stop_mins and trade.highest_price < entry * 1.03:
                     logger.info(
                         f"TIME-STOP triggered for {trade.symbol}: "
                         f"{age_min:.0f} min open, "

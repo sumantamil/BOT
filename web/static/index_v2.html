@@ -2690,20 +2690,7 @@
         }
 
         function playAlertSound() {
-            try {
-                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                const oscillator = audioCtx.createOscillator();
-                const gainNode = audioCtx.createGain();
-                oscillator.connect(gainNode);
-                gainNode.connect(audioCtx.destination);
-                oscillator.frequency.value = 880;
-                oscillator.type = 'sine';
-                gainNode.gain.value = 0.2;
-                oscillator.start();
-                setTimeout(() => oscillator.stop(), 150);
-            } catch (e) {
-                console.log('Could not play alert sound');
-            }
+            // Sound disabled
         }
 
         async function loadTrades() {

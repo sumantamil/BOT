@@ -558,21 +558,34 @@ class DhanBroker:
                     f"Dhan {order_type.value} {index.name}{strike}{option_type.value} x{quantity}",
                     datetime.now())
             else:
-                msg = f"Dhan order failed: {response}"
-                logger.error(msg)
-                # Circuit breaker: count consecutive DH-905 (Invalid IP) / DH-901 errors
                 _err_code = ((response or {}).get("data", {}) or {}).get("errorCode", "")
+                msg = f"Dhan order failed: {response}"
+
+                if _err_code == "DH-905":
+                    msg += (
+                        " | DH-905 Invalid IP: whitelist your current public IP in "
+                        "developer.dhanhq.co (App -> Edit -> IP) and web.dhan.co "
+                        "(DhanHQ Trading APIs -> Manage Token -> IP Whitelist), then restart the bot."
+                    )
+                elif _err_code == "DH-901":
+                    msg += (
+                        " | DH-901 token invalid/expired: regenerate DHAN_ACCESS_TOKEN and restart the bot."
+                    )
+
+                logger.error(msg)
+
+                # Circuit breaker: count consecutive DH-905 (Invalid IP) / DH-901 errors.
+                # Also alert immediately on first occurrence so auto-trading doesn't fail silently.
                 if _err_code in ("DH-905", "DH-901"):
                     self._consec_order_failures += 1
-                    if self._consec_order_failures >= 3:
-                        if _err_code == "DH-905":
-                            import asyncio as _asyncio
-                            _asyncio.ensure_future(self._alert_ip_blocked())
-                        elif _err_code == "DH-901":
-                            import asyncio as _asyncio
-                            _asyncio.ensure_future(self._alert_token_expired())
+                    import asyncio as _asyncio
+                    if _err_code == "DH-905":
+                        _asyncio.ensure_future(self._alert_ip_blocked())
+                    elif _err_code == "DH-901":
+                        _asyncio.ensure_future(self._alert_token_expired())
                 else:
                     self._consec_order_failures = 0
+
                 return OrderResult(False, None, msg, datetime.now())
         except Exception as e:
             msg = f"Dhan place_order exception: {e}"
