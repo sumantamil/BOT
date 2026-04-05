@@ -556,6 +556,59 @@ class WebConfig(BaseSettings):
     )
 
 
+class AIConfig(BaseSettings):
+    """Local AI (Ollama / LM Studio) signal-validation service configuration."""
+
+    enabled: bool = Field(default=False, description="Enable local AI signal validation")
+    base_url: str = Field(
+        default="http://localhost:11434",
+        description="LLM server base URL (Ollama=11434, LM Studio=1234)",
+    )
+    model: str = Field(default="llama3.2", description="Model name to use for inference")
+    timeout_seconds: float = Field(
+        default=10.0,
+        description="Max seconds to wait for AI response before falling back",
+    )
+    min_confidence: float = Field(
+        default=60.0,
+        description="Minimum AI confidence (0-100) required to execute a trade",
+    )
+
+    # ── Per-prompt feature flags ──────────────────────────────────────────
+    use_ai_signal_validation: bool = Field(
+        default=True,
+        description="Enable PROMPT 1: per-signal validation (EXECUTE/SKIP/WAIT)",
+    )
+    use_ai_sentiment: bool = Field(
+        default=True,
+        description="Enable PROMPT 2: session macro-sentiment refresh",
+    )
+    use_ai_pattern_recognition: bool = Field(
+        default=True,
+        description="Enable PROMPT 3: chart pattern recognition before entry",
+    )
+    use_ai_risk_assessment: bool = Field(
+        default=True,
+        description="Enable PROMPT 4: pre-trade risk/R:R gate",
+    )
+
+    # ── Confidence modifiers ──────────────────────────────────────────────
+    confidence_boost: float = Field(
+        default=1.4,
+        description="Multiply AI confidence when signal is strong (used by callers)",
+    )
+    confidence_reduce: float = Field(
+        default=0.65,
+        description="Multiply AI confidence when conditions are weak (used by callers)",
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="AI_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+
 class Settings(BaseSettings):
     """Main settings class combining all configurations"""
 
@@ -574,6 +627,7 @@ class Settings(BaseSettings):
     position_sizer: PositionSizerConfig = PositionSizerConfig()
     web: WebConfig = WebConfig()
     alert: AlertConfig = AlertConfig()
+    ai: AIConfig = AIConfig()
     
     # Logging
     log_level: str = Field(default="INFO", description="Logging level")

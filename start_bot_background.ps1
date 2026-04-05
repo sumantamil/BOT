@@ -11,6 +11,30 @@ Write-Host "══════════════════════�
 # Change to bot directory
 Set-Location $PSScriptRoot
 
+# ── Auto-start Ollama AI server if installed and AI_ENABLED=true ────────────
+$ollamaExe = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+$aiEnabled = $false
+if (Test-Path .env) {
+    if ((Get-Content .env -Raw) -match 'AI_ENABLED\s*=\s*true') { $aiEnabled = $true }
+}
+if ($aiEnabled -and (Test-Path $ollamaExe)) {
+    $ollamaRunning = $false
+    try {
+        $r = Invoke-WebRequest -Uri "http://localhost:11434" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        if ($r.StatusCode -eq 200) { $ollamaRunning = $true }
+    } catch {}
+    if (-not $ollamaRunning) {
+        Write-Host "  🤖 Starting Ollama AI server..." -ForegroundColor Cyan
+        Start-Process $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
+        Start-Sleep -Seconds 3
+        Write-Host "  ✅ Ollama AI server running on http://localhost:11434" -ForegroundColor Green
+    } else {
+        Write-Host "  ✅ Ollama AI server already running" -ForegroundColor Green
+    }
+} elseif ($aiEnabled -and -not (Test-Path $ollamaExe)) {
+    Write-Host "  ⚠️  AI_ENABLED=true but Ollama not found — AI validation will be skipped" -ForegroundColor Yellow
+}
+
 # Get PC's IP address for mobile access
 $pcIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
     $_.InterfaceAlias -notlike '*Loopback*' -and 

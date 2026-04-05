@@ -327,6 +327,12 @@ class TradingBot:
         self._cached_vix: float = 0.0
         self._cached_vix_time: Optional[datetime] = None
 
+        # AI macro-sentiment cache (PROMPT 2) — refreshed once per trading session boundary.
+        # Sessions: Morning (9:15), Midday (11:30), Afternoon (13:00), Close (15:00).
+        # UNFAVORABLE result suppresses new auto-trade entries for that session.
+        self._ai_sentiment = None           # MarketSentimentResult
+        self._ai_sentiment_session: str = ""  # last session name that was assessed
+
         # Error counters — incremented each time a component raises an unexpected exception.
         # Displayed in [HEARTBEAT] logs so you immediately see if something is silently crashing.
         # Reset each new trading day alongside _filter_blocks.
@@ -459,6 +465,18 @@ class TradingBot:
             asyncio.create_task(self._catchup_missed_settlements())
 
             await self._send_telegram_alert("✅ NIFTY Trading Bot started successfully!", "startup")
+
+            # ── Local AI warmup: pre-load model into RAM in the background ─────
+            # This prevents the first real trading signal from paying the cold-start
+            # penalty (~60s on CPU). The warmup runs async so it doesn't delay startup.
+            try:
+                from bot.local_ai_service import get_ai_service
+                _ai = get_ai_service()
+                if _ai.enabled:
+                    asyncio.create_task(_ai.warmup())
+                    logger.info("[LocalAI] Background warmup scheduled")
+            except Exception:
+                pass
             
         except Exception as e:
             self._state = BotState.ERROR
@@ -990,6 +1008,51 @@ class TradingBot:
                     and now_ts.minute >= 45
                 ):
                     await self._check_gift_nifty_premarket()
+
+                # ── AI Macro Sentiment (PROMPT 2): refresh once per session boundary ─
+                # Sessions: Morning(9:15), Midday(11:30), Afternoon(13:00), Close(15:00)
+                # UNFAVORABLE result is logged so the per-signal PROMPT 1 can reference it.
+                # It does NOT block trades on its own — acts as an advisory layer only
+                # (PROMPT 1 already applies time/VIX/loss-fatigue rules per-signal).
+                if _is_market_hrs and now_ts.weekday() <= 4:
+                    try:
+                        from bot.local_ai_service import get_ai_service, LocalAIService
+                        _ai_svc = get_ai_service()
+                        if _ai_svc.enabled and settings.ai.use_ai_sentiment:
+                            _cur_session = LocalAIService._get_session(now_ts)
+                            if _cur_session != self._ai_sentiment_session:
+                                # Session changed — refresh sentiment in background
+                                # (fire-and-forget via create_task; doesn't block the loop)
+                                async def _refresh_sentiment(_session=_cur_session):
+                                    _ctx = {
+                                        "vix": self._cached_vix,
+                                        "macro_events": "None known",
+                                    }
+                                    _result = await _ai_svc.analyze_market_sentiment(_ctx)
+                                    self._ai_sentiment = _result
+                                    self._ai_sentiment_session = _session
+                                    _emoji = "✅" if _result.action == "FAVORABLE" else ("⚠️" if _result.action == "UNFAVORABLE" else "ℹ️")
+                                    _msg = (
+                                        f"{_emoji} AI Market Sentiment [{_session}]: "
+                                        f"{_result.market_sentiment} "
+                                        f"({_result.sentiment_strength:.0f}%) — "
+                                        f"{_result.trading_conditions} conditions — "
+                                        f"{_result.reasoning}"
+                                    )
+                                    logger.info(_msg)
+                                    await self._broadcast_message(_msg, "analysis")
+                                    if _result.action == "UNFAVORABLE" and not _result.fallback:
+                                        await self._send_telegram_alert(
+                                            f"⚠️ *AI Sentiment: UNFAVORABLE*\n"
+                                            f"Session: {_session}\n"
+                                            f"Conditions: {_result.trading_conditions}\n"
+                                            f"VIX regime: {_result.volatility_regime}\n"
+                                            f"{_result.reasoning}",
+                                            "system",
+                                        )
+                                asyncio.create_task(_refresh_sentiment())
+                    except Exception as _sent_exc:
+                        logger.debug(f"AI sentiment refresh skipped: {_sent_exc}")
 
                 # Gap-open window flag (shared across all index iterations below)
                 # Starts at 9:20 (not 9:15) — the first 5 minutes after open have maximum
@@ -3566,6 +3629,66 @@ class TradingBot:
                 "trade_entry",
             )
 
+    async def _build_chart_data(self, signal) -> dict:
+        """Build chart_data dict for PROMPT 3 (pattern recognition).
+
+        Fetches the last 10 five-minute candles for the active index via
+        yfinance and assembles them with the technical indicator values that
+        are already present in *signal* (a TrendSignal).  Used exclusively
+        by ``_execute_auto_trade`` before calling
+        ``LocalAIService.recognize_patterns()``.
+        """
+        import yfinance as yf
+
+        candles: list = []
+        pivot = r1 = s1 = 0.0
+
+        try:
+            ticker = yf.Ticker(self._active_index.yahoo_symbol)
+            df = await asyncio.to_thread(
+                lambda: ticker.history(period="1d", interval="5m")
+            )
+            if df is not None and not df.empty:
+                last10 = df.tail(10).reset_index()
+                for _, row in last10.iterrows():
+                    ts_val = row.get("Datetime", row.get("Date", ""))
+                    candles.append({
+                        "timestamp": str(ts_val)[:16],
+                        "open":   round(float(row["Open"]),  2),
+                        "high":   round(float(row["High"]),  2),
+                        "low":    round(float(row["Low"]),   2),
+                        "close":  round(float(row["Close"]), 2),
+                        "volume": int(row.get("Volume", 0)),
+                    })
+                # Classic pivot formula derived from today's full session range
+                ph = float(df["High"].max())
+                pl = float(df["Low"].min())
+                pc = float(df["Close"].iloc[-1])
+                pivot = (ph + pl + pc) / 3
+                r1 = 2 * pivot - pl
+                s1 = 2 * pivot - ph
+        except Exception as exc:
+            logger.debug(f"[_build_chart_data] yfinance fetch failed: {exc}")
+
+        boll_upper = getattr(signal, "bollinger_upper", 0.0) or 0.0
+        boll_mid   = getattr(signal, "bollinger_mid",   0.0) or 0.0
+        boll_lower = getattr(signal, "bollinger_lower", 0.0) or 0.0
+
+        return {
+            "candles": candles,
+            "rsi":     f"{signal.rsi:.1f}",
+            "macd":    f"{signal.macd:.4f} / signal={signal.macd_signal:.4f}",
+            "bollinger_bands": (
+                f"upper={boll_upper:.0f} mid={boll_mid:.0f} lower={boll_lower:.0f}"
+                if boll_upper > 0 else "N/A"
+            ),
+            "atr":    f"{getattr(signal, 'atr', 0.0) or 0.0:.1f}",
+            "volume": candles[-1]["volume"] if candles else 0,
+            "r1":    round(r1, 2),
+            "pivot": round(pivot, 2),
+            "s1":    round(s1, 2),
+        }
+
     def _format_vwap_signal(self, sig: VWAPSignal) -> str:
         """Format a VWAPSignal for display in the chat console."""
         side = "LONG  →  BUY CE" if sig.direction == "LONG" else "SHORT  →  BUY PE"
@@ -3631,7 +3754,198 @@ class TradingBot:
             option_type = "PE"
         else:
             return  # Don't trade on neutral
-        
+
+        # ── Local AI signal validation (PROMPT 1) ────────────────────────────
+        # Calls the locally-hosted LLM (Ollama / LM Studio) to validate confluence,
+        # time suitability, R:R, and loss-fatigue before placing the order.
+        # If AI is disabled (AI_ENABLED=false) or unreachable, falls back to EXECUTE.
+        try:
+            from bot.local_ai_service import get_ai_service
+            _ai = get_ai_service()
+            if _ai.enabled and settings.ai.use_ai_signal_validation:
+                _daily_stats = self.order_manager._daily_stats
+                _market_ctx = {
+                    "option_type":        option_type,
+                    "regime":             (
+                        self._cached_regime.regime.value
+                        if self._cached_regime else "UNKNOWN"
+                    ),
+                    "vix":                self._cached_vix,
+                    "consecutive_losses": getattr(_daily_stats, "consecutive_losses", 0),
+                    "trades_done_today":  getattr(_daily_stats, "total_trades", 0),
+                    "max_trades_per_day": getattr(settings.trading, "max_trades_per_day", 5),
+                    # Include macro sentiment from PROMPT 2 (advisory context)
+                    "macro_sentiment":    (
+                        self._ai_sentiment.market_sentiment
+                        if self._ai_sentiment and not self._ai_sentiment.fallback
+                        else "UNKNOWN"
+                    ),
+                    "macro_conditions":   (
+                        self._ai_sentiment.trading_conditions
+                        if self._ai_sentiment and not self._ai_sentiment.fallback
+                        else "Unknown"
+                    ),
+                }
+                _ai_result = await _ai.validate_signal(signal, _market_ctx)
+
+                if _ai_result.fallback:
+                    logger.info(
+                        f"[LocalAI] Fallback — {_ai_result.reasoning}"
+                    )
+                elif _ai_result.suggested_action == "SKIP":
+                    skip_msg = (
+                        f"🤖 AI SKIP [{option_type}] — confidence={_ai_result.confidence:.0f}% "
+                        f"confluence={_ai_result.confluence_count}/4 | {_ai_result.reasoning}"
+                    )
+                    logger.info(skip_msg)
+                    await self._broadcast_message(skip_msg, "alert")
+                    return
+                elif _ai_result.suggested_action == "WAIT":
+                    wait_msg = (
+                        f"🤖 AI WAIT [{option_type}] — {_ai_result.reasoning}"
+                    )
+                    logger.info(wait_msg)
+                    await self._broadcast_message(wait_msg, "alert")
+                    return
+                else:
+                    logger.info(
+                        f"[LocalAI] EXECUTE approved — confidence={_ai_result.confidence:.0f}% "
+                        f"confluence={_ai_result.confluence_count}/4 "
+                        f"sentiment={_ai_result.market_sentiment}"
+                    )
+        except Exception as _ai_exc:
+            logger.warning(f"[LocalAI] Validation skipped due to error: {_ai_exc}")
+
+        # ── PROMPT 3: Chart Pattern Recognition ──────────────────────────────
+        # Runs on every auto-trade entry attempt after PROMPT 1 approves.
+        # AVOID result stops the trade; BUY_CE/BUY_PE must agree with option_type.
+        try:
+            from bot.local_ai_service import get_ai_service
+            _ai3 = get_ai_service()
+            if _ai3.enabled and settings.ai.use_ai_pattern_recognition:
+                _chart_data = await self._build_chart_data(signal)
+                _p3 = await _ai3.recognize_patterns(_chart_data)
+
+                if not _p3.fallback:
+                    _p3_msg = (
+                        f"🔍 AI Patterns: {_p3.strongest_pattern or 'none'} | "
+                        f"{_p3.overall_assessment} | {_p3.recommended_action} | "
+                        f"{_p3.risk_assessment} | top conf={_p3.best_confidence:.0f}%"
+                    )
+                    logger.info(_p3_msg)
+                    await self._broadcast_message(_p3_msg, "analysis")
+
+                    if _p3.recommended_action == "AVOID":
+                        skip_msg = (
+                            f"🤖 AI Pattern AVOID — {_p3.risk_assessment} | "
+                            f"strongest: {_p3.strongest_pattern}"
+                        )
+                        logger.info(skip_msg)
+                        await self._broadcast_message(skip_msg, "alert")
+                        return
+
+                    # Direction mismatch: pattern says opposite side → skip
+                    _agrees = (
+                        (option_type == "CE" and _p3.recommended_action == "BUY_CE")
+                        or (option_type == "PE" and _p3.recommended_action == "BUY_PE")
+                        or _p3.recommended_action == "WAIT"   # WAIT = no opinion, let trade proceed
+                    )
+                    if not _agrees and _p3.best_confidence >= 60:
+                        skip_msg = (
+                            f"🤖 AI Pattern mismatch SKIP — pattern says {_p3.recommended_action} "
+                            f"but signal wants {option_type} (conf={_p3.best_confidence:.0f}%)"
+                        )
+                        logger.info(skip_msg)
+                        await self._broadcast_message(skip_msg, "alert")
+                        return
+        except Exception as _p3_exc:
+            logger.warning(f"[LocalAI] Pattern recognition skipped due to error: {_p3_exc}")
+
+        # ── PROMPT 4: Pre-Trade Risk Assessment ──────────────────────────────
+        # Final gate before order placement.
+        # REJECT / SKIP → abort;  REDUCE_SIZE → warn and proceed at normal sizing.
+        try:
+            from bot.local_ai_service import get_ai_service
+            _ai4 = get_ai_service()
+            if _ai4.enabled and settings.ai.use_ai_risk_assessment:
+                _p4_stats   = self.order_manager._daily_stats
+                _p4_acc_bal = float(
+                    (self.position_sizer.account_balance if self.position_sizer else None)
+                    or getattr(settings.trading, "account_balance", 100_000)
+                )
+                _p4_pnl      = self.order_manager._daily_pnl
+                _p4_max_loss = float(getattr(settings.trading, "max_daily_loss", 6000.0))
+                _p4_total_tr = _p4_stats.total_trades
+                _p4_win_rate = (
+                    (_p4_stats.winning_trades / _p4_total_tr * 100)
+                    if _p4_total_tr > 0 else 0.0
+                )
+                # Rough ATM option-price proxy: 0.2% of index + ATR contribution
+                _p4_atr       = getattr(signal, "atr", 0.0) or 0.0
+                _p4_entry     = round(signal.current_price * 0.002 + _p4_atr * 0.01, 2)
+                _p4_sl        = round(_p4_entry * 0.5, 2)
+                _p4_tgt       = round(_p4_entry * 2.0, 2)
+                # Count how many indicators agree with the trade direction
+                _p4_bullish = (option_type == "CE")
+                _p4_vwap    = getattr(signal, "vwap", 0.0) or 0.0
+                _p4_confl   = sum([
+                    (signal.rsi > 55) if _p4_bullish else (signal.rsi < 45),
+                    signal.macd > signal.macd_signal,
+                    (
+                        (_p4_vwap > 0 and signal.current_price > _p4_vwap)
+                        if _p4_bullish
+                        else (_p4_vwap > 0 and signal.current_price < _p4_vwap)
+                    ),
+                    getattr(signal, "supertrend_direction", "NEUTRAL") == (
+                        "BULLISH" if _p4_bullish else "BEARISH"
+                    ),
+                ])
+                _p4_entry_ctx = {
+                    "option_type":        option_type,
+                    "direction":          signal.trend.value,
+                    "strike":             0,          # ATM — not resolved yet
+                    "entry_price":        _p4_entry,
+                    "stop_loss":          _p4_sl,
+                    "target":             _p4_tgt,
+                    "quantity":           1,
+                    "account_balance":    _p4_acc_bal,
+                    "daily_pnl":          _p4_pnl,
+                    "max_daily_loss":     _p4_max_loss,
+                    "consecutive_losses": self.order_manager._consecutive_losses,
+                    "today_win_rate":     _p4_win_rate,
+                    "confluence_count":   _p4_confl,
+                }
+                _p4 = await _ai4.assess_trade_risk(signal, _p4_entry_ctx)
+
+                if not _p4.fallback:
+                    _p4_msg = (
+                        f"🛡 AI Risk: {_p4.overall_assessment} | "
+                        f"level={_p4.risk_level} | rec={_p4.recommendation} | "
+                        f"size_adj=×{_p4.suggested_size_adjustment:.2f} | "
+                        f"conf={_p4.confidence:.0f}%"
+                    )
+                    logger.info(_p4_msg)
+                    await self._broadcast_message(_p4_msg, "analysis")
+
+                    if _p4.overall_assessment == "REJECT" or _p4.recommendation == "SKIP":
+                        reject_msg = (
+                            f"🤖 AI Risk REJECT — {_p4.risk_level} | "
+                            + (_p4.final_notes or "risk criteria not met")
+                        )
+                        logger.info(reject_msg)
+                        await self._broadcast_message(reject_msg, "alert")
+                        return
+
+                    if _p4.recommendation == "REDUCE_SIZE":
+                        reduce_msg = (
+                            f"🤖 AI Risk REDUCE_SIZE ×{_p4.suggested_size_adjustment:.2f} — "
+                            + (_p4.final_notes or "proceed with caution")
+                        )
+                        logger.info(reduce_msg)
+                        await self._broadcast_message(reduce_msg, "alert")
+        except Exception as _p4_exc:
+            logger.warning(f"[LocalAI] Risk assessment skipped due to error: {_p4_exc}")
+
         # Execute with deep research
         await self._execute_option_with_research(
             signal=signal,
