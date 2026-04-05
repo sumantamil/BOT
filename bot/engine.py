@@ -2652,6 +2652,35 @@ class TradingBot:
                 qty = int(self._active_index.lot_size * getattr(cfg, "quantity_multiplier", 0.5))
                 qty = max(qty, self._active_index.lot_size)  # floor at one lot
 
+                # ── AI Gateway (PROMPT 1): final validation before any order ─────
+                if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                    from bot.ai_gateway import get_ai_gateway
+                    _gw = get_ai_gateway()
+                    _ds  = self.order_manager._daily_stats if self.order_manager else None
+                    _gw_ctx = {
+                        'option_type':        opt_direction,
+                        'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                        'vix':                self._cached_vix,
+                        'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                        'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                        'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                    }
+                    _gw_res = await _gw.validate_strategy_signal(signal_live, 'GAP', _gw_ctx)
+                    if not _gw_res['approved']:
+                        logger.info(f"GAP: AI gateway blocked — {_gw_res['reasoning']}")
+                        await self._broadcast_message(
+                            f"GAP: AI blocked — {_gw_res['reasoning']}", "alert"
+                        )
+                        self._filter_blocks["GAP_ai_gateway"] = self._filter_blocks.get("GAP_ai_gateway", 0) + 1
+                        return
+                    logger.info(
+                        f"✅ GAP AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                        f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+                    )
+                    _ai_conf_gap = _gw_res['confidence']
+                else:
+                    _ai_conf_gap = None
+
                 _orig_sl     = cfg.trading.stop_loss_percentage if hasattr(cfg, 'trading') else settings.trading.stop_loss_percentage
                 _orig_target = cfg.trading.target_percentage    if hasattr(cfg, 'trading') else settings.trading.target_percentage
                 _sl  = cfg.stop_loss_pct
@@ -2683,6 +2712,7 @@ class TradingBot:
                         f"  Gap: {gap.gap_pct:+.2f}% | Confidence: {confidence}%\n"
                         f"  Bought {opt.value} @ strike {atm_strike} × {qty} units\n"
                         f"  Order: {result.order_id}"
+                        + (f"\n🤖 AI Confidence: {_ai_conf_gap:.0f}%" if _ai_conf_gap is not None else "")
                     )
                     await self._broadcast_message(msg, "trade_success")
                     await self._send_telegram_alert(msg, "trade_entry")
@@ -2775,6 +2805,35 @@ class TradingBot:
             opt = OptionType.CE if gap.trade_direction == "CE" else OptionType.PE
             qty = int(self._active_index.lot_size * cfg.gap.quantity_multiplier)
 
+            # ── AI Gateway (PROMPT 1): final validation before any order ─────
+            if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                from bot.ai_gateway import get_ai_gateway
+                _gw = get_ai_gateway()
+                _ds  = self.order_manager._daily_stats if self.order_manager else None
+                _gw_ctx = {
+                    'option_type':        gap.trade_direction,
+                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                    'vix':                self._cached_vix,
+                    'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                    'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                }
+                _gw_res = await _gw.validate_strategy_signal(signal, 'GAP', _gw_ctx)
+                if not _gw_res['approved']:
+                    logger.info(f"GAP (legacy): AI gateway blocked — {_gw_res['reasoning']}")
+                    await self._broadcast_message(
+                        f"GAP: AI blocked — {_gw_res['reasoning']}", "alert"
+                    )
+                    self._filter_blocks["GAP_ai_gateway"] = self._filter_blocks.get("GAP_ai_gateway", 0) + 1
+                    return
+                logger.info(
+                    f"✅ GAP (legacy) AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                    f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+                )
+                _ai_conf_gap_leg = _gw_res['confidence']
+            else:
+                _ai_conf_gap_leg = None
+
             _orig_sl     = cfg.trading.stop_loss_percentage
             _orig_target = cfg.trading.target_percentage
             cfg.trading.stop_loss_percentage = cfg.gap.stop_loss_pct
@@ -2803,6 +2862,7 @@ class TradingBot:
                     f"  Gap: {gap.gap_type.value} ({gap.gap_pct:+.2f}%)\n"
                     f"  Bought {opt.value} @ strike {atm_strike} x {qty} units\n"
                     f"  Order: {result.order_id}"
+                    + (f"\n🤖 AI Confidence: {_ai_conf_gap_leg:.0f}%" if _ai_conf_gap_leg is not None else "")
                 )
                 await self._broadcast_message(msg, "trade_success")
                 await self._send_telegram_alert(msg, "trade_entry")
@@ -3052,6 +3112,39 @@ class TradingBot:
                 self._save_daily_state()
                 return
 
+            # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
+            if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                from bot.ai_gateway import get_ai_gateway
+                _gw = get_ai_gateway()
+                _ds  = self.order_manager._daily_stats if self.order_manager else None
+                _gw_ctx = {
+                    'option_type':        option_type,
+                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                    'vix':                self._cached_vix,
+                    'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                    'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                }
+                _gw_res = await _gw.validate_strategy_signal(self._last_signal, 'ORB', _gw_ctx)
+                if not _gw_res['approved']:
+                    logger.info(f"🤖 ORB SKIP (AI): {_gw_res['reasoning']}")
+                    await self._broadcast_message(
+                        f"🤖 AI SKIP [ORB]: {_gw_res['reasoning']}\n"
+                        f"Confidence: {_gw_res['confidence']:.0f}%",
+                        "alert"
+                    )
+                    self._filter_blocks["ORB_ai_gateway"] = self._filter_blocks.get("ORB_ai_gateway", 0) + 1
+                    return
+                logger.info(
+                    f"✅ ORB AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                    f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+                )
+                await self._broadcast_message(
+                    f"✅ AI-VALIDATED [ORB]: {_gw_res['reasoning']}\n"
+                    f"Confidence: {_gw_res['confidence']:.0f}%",
+                    "analysis"
+                )
+
             # Fast-path: place ORB trade directly at ATM — skip slow research
             # Research adds 10-15s latency; by then the breakout candle may reverse.
             order_ok = await self._execute_orb_direct(
@@ -3187,6 +3280,48 @@ class TradingBot:
                 self._save_daily_state()
                 return
 
+            # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
+            if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                from bot.ai_gateway import get_ai_gateway
+                _gw = get_ai_gateway()
+                _ds  = self.order_manager._daily_stats if self.order_manager else None
+                _gw_ctx = {
+                    'option_type':        option_type,
+                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                    'vix':                self._cached_vix,
+                    'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                    'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                }
+                _gw_res = await _gw.validate_strategy_signal(self._last_signal, 'VWAP', _gw_ctx)
+                if not _gw_res['approved']:
+                    logger.info(f"🤖 VWAP SKIP (AI): {_gw_res['reasoning']}")
+                    await self._broadcast_message(
+                        f"🤖 AI SKIP [VWAP]: {_gw_res['reasoning']}\n"
+                        f"Confidence: {_gw_res['confidence']:.0f}%",
+                        "alert"
+                    )
+                    self._filter_blocks["VWAP_ai_gateway"] = self._filter_blocks.get("VWAP_ai_gateway", 0) + 1
+                    return
+                logger.info(
+                    f"✅ VWAP AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                    f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+                )
+                await self._broadcast_message(
+                    f"✅ AI-VALIDATED [VWAP]: {_gw_res['reasoning']}\n"
+                    f"Confidence: {_gw_res['confidence']:.0f}%",
+                    "analysis"
+                )
+                # Boost signal strength when AI agrees
+                _orig_strength = vwap_signal.strength
+                vwap_signal.strength = _gw_res['boosted_strength']
+                logger.info(
+                    f"VWAP: strength boosted {_orig_strength:.0f}% → {vwap_signal.strength:.0f}%"
+                )
+                _ai_conf_for_tg = _gw_res['confidence']
+            else:
+                _ai_conf_for_tg = None
+
             order_ok = await self._execute_option_with_research(
                 signal=self._last_signal,
                 option_type=option_type,
@@ -3204,6 +3339,7 @@ class TradingBot:
                     f"VWAP: {vwap_signal.vwap:.2f}  Dev: {vwap_signal.deviation_pct:+.2f}%\n"
                     f"SL: {vwap_signal.stop_loss:.2f}  Target: {vwap_signal.target:.2f}\n"
                     f"RSI: {vwap_signal.rsi:.1f}  Strength: {vwap_signal.strength:.0f}%"
+                    + (f"\n🤖 AI Confidence: {_ai_conf_for_tg:.0f}%" if _ai_conf_for_tg is not None else "")
                 )
                 await self._send_telegram_alert(tg_msg, "trade_entry")
 
@@ -3386,6 +3522,44 @@ class TradingBot:
                 )
                 return
 
+            # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
+            if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                from bot.ai_gateway import get_ai_gateway
+                _gw = get_ai_gateway()
+                _ds  = self.order_manager._daily_stats if self.order_manager else None
+                _gw_ctx = {
+                    'option_type':        option_type,
+                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                    'vix':                self._cached_vix,
+                    'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                    'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                }
+                _gw_res = await _gw.validate_strategy_signal(self._last_signal, 'EOD', _gw_ctx)
+                if not _gw_res['approved']:
+                    logger.info(f"🤖 EOD SKIP (AI): {_gw_res['reasoning']}")
+                    await self._broadcast_message(
+                        f"🤖 AI SKIP [EOD]: {_gw_res['reasoning']}\n"
+                        f"Confidence: {_gw_res['confidence']:.0f}%",
+                        "alert"
+                    )
+                    self._filter_blocks["EOD_ai_gateway"] = self._filter_blocks.get("EOD_ai_gateway", 0) + 1
+                    # Reset triggered so next cycle can retry
+                    self._index_eod_triggered.pop(_idx, None)
+                    return
+                logger.info(
+                    f"✅ EOD AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                    f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+                )
+                await self._broadcast_message(
+                    f"✅ AI-VALIDATED [EOD]: {_gw_res['reasoning']}\n"
+                    f"Confidence: {_gw_res['confidence']:.0f}%",
+                    "analysis"
+                )
+                _ai_conf_eod = _gw_res['confidence']
+            else:
+                _ai_conf_eod = None
+
             logger.warning(
                 f"⚠️  EOD [{self._active_index.display_name}]: strategy is EXPERIMENTAL "
                 f"(validated <10 days). Monitor results — disable if win rate < 55% over 20+ days."
@@ -3409,7 +3583,8 @@ class TradingBot:
                     f"Last 15m: {dir_label}  (body {body_pct:.0%})\n"
                     f"Open→Close: {candle_open:,.0f}→{candle_close:,.0f}\n"
                     f"BUY {option_type} ATM  —  {self._active_index.display_name}\n"
-                    f"Exit: 15:27 IST",
+                    f"Exit: 15:27 IST"
+                    + (f"\n🤖 AI Confidence: {_ai_conf_eod:.0f}%" if _ai_conf_eod is not None else ""),
                     "trade_entry",
                 )
             else:
@@ -3606,6 +3781,41 @@ class TradingBot:
                 return
             self._last_signal = _s
 
+        # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
+        _ai_conf_lateday = None
+        if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+            from bot.ai_gateway import get_ai_gateway
+            _gw = get_ai_gateway()
+            _ds  = self.order_manager._daily_stats if self.order_manager else None
+            _gw_ctx = {
+                'option_type':        signal.direction,
+                'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                'vix':                self._cached_vix,
+                'consecutive_losses': getattr(self.order_manager, '_consecutive_losses', 0) if self.order_manager else 0,
+                'trades_done_today':  getattr(_ds, 'total_trades', 0),
+                'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+            }
+            _gw_res = await _gw.validate_strategy_signal(self._last_signal, 'LATE_DAY', _gw_ctx)
+            if not _gw_res['approved']:
+                logger.info(f"🤖 LATE_DAY SKIP (AI): {_gw_res['reasoning']}")
+                await self._broadcast_message(
+                    f"🤖 AI SKIP [LATE-DAY]: {_gw_res['reasoning']}\n"
+                    f"Confidence: {_gw_res['confidence']:.0f}%",
+                    "alert"
+                )
+                self._filter_blocks["LATEDAY_ai_gateway"] = self._filter_blocks.get("LATEDAY_ai_gateway", 0) + 1
+                return
+            logger.info(
+                f"✅ LATE_DAY AI-APPROVED: conf={_gw_res['confidence']:.0f}% "
+                f"action={_gw_res['action']} | {_gw_res['reasoning'][:80]}"
+            )
+            await self._broadcast_message(
+                f"✅ AI-VALIDATED [LATE-DAY]: {_gw_res['reasoning']}\n"
+                f"Confidence: {_gw_res['confidence']:.0f}%",
+                "analysis"
+            )
+            _ai_conf_lateday = _gw_res['confidence']
+
         order_ok = await self._execute_option_with_research(
             signal         = self._last_signal,
             option_type    = signal.direction,
@@ -3625,7 +3835,8 @@ class TradingBot:
                 f"Entry (index): {current_price:,.0f}\n"
                 f"Confidence: {signal.confidence}%\n"
                 f"Exit: {signal.exit_time} IST\n"
-                f"Qty: {trade_qty}",
+                f"Qty: {trade_qty}"
+                + (f"\n🤖 AI Confidence: {_ai_conf_lateday:.0f}%" if _ai_conf_lateday is not None else ""),
                 "trade_entry",
             )
 

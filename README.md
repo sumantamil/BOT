@@ -877,6 +877,38 @@ TRADING_MAX_DAILY_LOSS=2000
 
 ## Changelog
 
+### April 2026 — Session 11: Unified AI Gateway for All Strategies
+
+New file: **`bot/ai_gateway.py`** — `AIValidationGateway` singleton accessed via `get_ai_gateway()`.
+
+Runs PROMPT 1 (signal validation) before every live order across all 4 remaining strategies:
+
+| Strategy | Integration point | Blocks on |
+|----------|------------------|-----------|
+| **VWAP** | After direction/regime guards, before paper/live split | `SKIP` |
+| **EOD** | After trend-alignment check, before marking triggered | `SKIP` |
+| **ORB** | After all 5 guards (strength/trend/RSI/MTF), before paper/live split | `SKIP` |
+| **Gap (playbook)** | After qty calculation, before `manual_order` | `SKIP` |
+| **Gap (legacy)** | After qty calculation, before `manual_order` | `SKIP` |
+
+All 5 hooks are gated behind `AI_ENABLED=true` and `AI_USE_AI_SIGNAL_VALIDATION=true` — disabling either skips the check and auto-approves. Falls back to EXECUTE on exception (non-fatal).
+
+Filter block names added: `VWAP_ai_gateway`, `EOD_ai_gateway`, `ORB_ai_gateway`, `GAP_ai_gateway`.
+
+**AI coverage is now complete:**
+
+| Strategy | Before | After |
+|----------|--------|-------|
+| Auto/Trend | ✅ All 4 prompts | ✅ All 4 prompts |
+| VWAP | ❌ None | ✅ PROMPT 1 (gateway) |
+| EOD | ❌ None | ✅ PROMPT 1 (gateway) |
+| ORB | ❌ None | ✅ PROMPT 1 (gateway) |
+| Gap | ❌ None | ✅ PROMPT 1 (gateway) |
+
+Gap and ORB get PROMPT 1 only (not full 4-prompt chain) — model is warm by trade time (35+ min after startup warmup) so latency is ~5–15s, acceptable for both strategies.
+
+---
+
 ### April 2026 — Session 10: Local AI Integration (4-Prompt Validation System)
 
 Complete local AI validation layer using **Ollama + llama3.2** — 100% free, runs on your machine, no API key required. The AI acts as a final approval gate before every auto-trade order is placed, running 4 independent prompts in sequence.
