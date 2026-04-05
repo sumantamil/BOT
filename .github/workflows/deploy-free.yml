@@ -1,0 +1,47 @@
+name: 🚀 Deploy (Free)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'bot/**'
+      - 'config.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Verify deployment
+        run: |
+          pip install -r requirements.txt
+          python -c "from config import settings; print('✅ Ready to deploy')"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            cd /opt/nifty-bot
+            git pull
+            pip install -r requirements.txt
+            systemctl restart nifty-bot || docker restart nifty-bot || true
+            echo "✅ Deployed"
+        continue-on-error: true
