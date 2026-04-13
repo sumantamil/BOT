@@ -1305,46 +1305,104 @@ class TradingBot:
                             )
                         elif signal and signal.trend != Trend.NEUTRAL and not _trend_done:
                             _pt_opt = "CE" if signal.trend == Trend.BULLISH else "PE"
-                            # ── Regime-direction guard (mirrors VWAP guard) ──────────
-                            # Block CE entries on TRENDING DOWN days and PE on TRENDING UP.
-                            _trend_regime_blocked = False
-                            _cached_regime_tr = getattr(self, "_cached_regime", None)
-                            if _cached_regime_tr:
-                                _regime_val_tr = _cached_regime_tr.regime.value
-                                if _regime_val_tr == "TRENDING DOWN" and _pt_opt == "CE":
-                                    logger.info(
-                                        f"PAPER TREND [{idx_name}]: Skipping CE — regime is TRENDING DOWN (counter-trend)"
-                                    )
-                                    self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
-                                    _trend_regime_blocked = True
-                                elif _regime_val_tr == "TRENDING UP" and _pt_opt == "PE":
-                                    logger.info(
-                                        f"PAPER TREND [{idx_name}]: Skipping PE — regime is TRENDING UP (counter-trend)"
-                                    )
-                                    self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
-                                    _trend_regime_blocked = True
-                            if not _trend_regime_blocked:
+
+                            # ── Paper improvement 1: minimum strength ≥ 70 ───────────
+                            # Paper data: TIME_STOP trades (avg +2.5%) all had strength
+                            # 60–68%. Winners (avg +28%) all had strength ≥ 70%.
+                            # Raising threshold filters dead-weight entries.
+                            _paper_trend_skip = False
+                            _min_strength_pt = float(getattr(settings.trading, 'min_signal_strength', 70.0))
+                            if signal.strength < _min_strength_pt:
                                 logger.info(
-                                    f"PAPER TREND [{idx_name}]: Would buy {_pt_opt} — "
-                                    f"{signal.trend.value} {signal.strength}% — paper mode, no order placed"
+                                    f"PAPER TREND [{idx_name}]: skipping — "
+                                    f"strength {signal.strength:.0f}% < {_min_strength_pt:.0f}% minimum "
+                                    f"(paper filter from data analysis)"
                                 )
-                                await self._broadcast_message(
-                                    f"📋 PAPER TREND [{idx_name}]: Would buy {_pt_opt} ATM "
-                                    f"| {signal.trend.value} strength {signal.strength}% "
-                                    f"| price {signal.current_price:,.0f} — paper mode",
-                                    "paper_trade",
-                                )
-                                self.paper_trader.paper_buy(
-                                    index_name=idx_name,
-                                    index_price=signal.current_price,
-                                    option_type=_pt_opt,
-                                    strategy="TREND",
-                                    quantity=idx_cfg.lot_size,
-                                )
-                                self._index_trend_triggered[idx_name] = datetime.now().date()
-                                # Record today's direction so ORB won't trade against it
-                                self._index_day_direction[idx_name] = _pt_opt
-                                self._save_daily_state()
+                                self._filter_blocks["TREND_strength"] = self._filter_blocks.get("TREND_strength", 0) + 1
+                                _paper_trend_skip = True
+
+                            # ── Paper improvement 2: earliest entry 10:00 AM ────────
+                            # Paper data: 9:15–9:50 AM entries were noisy (1 SL_HIT
+                            # at -100%, multiple TIME_STOPs). Best winners entered
+                            # 12:40–12:49 PM after trend was confirmed. Gate at 10:00.
+                            if not _paper_trend_skip:
+                                from zoneinfo import ZoneInfo as _ZI
+                                if datetime.now(_ZI("Asia/Kolkata")).hour < 10:
+                                    logger.info(
+                                        f"PAPER TREND [{idx_name}]: skipping — "
+                                        f"before 10:00 IST. Open noise filter active."
+                                    )
+                                    self._filter_blocks["TREND_too_early"] = self._filter_blocks.get("TREND_too_early", 0) + 1
+                                    _paper_trend_skip = True
+
+                            if not _paper_trend_skip:
+                                # ── Regime-direction guard (mirrors VWAP guard) ──────────
+                                # Block CE entries on TRENDING DOWN days and PE on TRENDING UP.
+                                _trend_regime_blocked = False
+                                _cached_regime_tr = getattr(self, "_cached_regime", None)
+                                if _cached_regime_tr:
+                                    _regime_val_tr = _cached_regime_tr.regime.value
+                                    if _regime_val_tr == "TRENDING DOWN" and _pt_opt == "CE":
+                                        logger.info(
+                                            f"PAPER TREND [{idx_name}]: Skipping CE — regime is TRENDING DOWN (counter-trend)"
+                                        )
+                                        self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
+                                        _trend_regime_blocked = True
+                                    elif _regime_val_tr == "TRENDING UP" and _pt_opt == "PE":
+                                        logger.info(
+                                            f"PAPER TREND [{idx_name}]: Skipping PE — regime is TRENDING UP (counter-trend)"
+                                        )
+                                        self._filter_blocks["TREND_regime"] = self._filter_blocks.get("TREND_regime", 0) + 1
+                                        _trend_regime_blocked = True
+                                if not _trend_regime_blocked:
+                                    # ── AI validation in paper mode ──────────────────────
+                                    _paper_trend_ai_ok = True
+                                    if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                                        try:
+                                            from bot.ai_gateway import get_ai_gateway
+                                            _gw_pt = get_ai_gateway()
+                                            _gw_pt_ctx = {
+                                                'option_type':        _pt_opt,
+                                                'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                                                'vix':                self._cached_vix,
+                                                'consecutive_losses': 0,
+                                                'trades_done_today':  0,
+                                                'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                                            }
+                                            _gw_pt_res = await _gw_pt.validate_strategy_signal(signal, 'TREND', _gw_pt_ctx)
+                                            if not _gw_pt_res['approved']:
+                                                logger.info(f"PAPER TREND [{idx_name}]: AI blocked — {_gw_pt_res['reasoning']}")
+                                                await self._broadcast_message(
+                                                    f"🤖 PAPER TREND [{idx_name}]: AI blocked {_pt_opt} — {_gw_pt_res['reasoning']}",
+                                                    "paper_trade",
+                                                )
+                                                _paper_trend_ai_ok = False
+                                            else:
+                                                logger.info(f"PAPER TREND [{idx_name}]: AI approved conf={_gw_pt_res['confidence']:.0f}%")
+                                        except Exception as _ai_pt_err:
+                                            logger.warning(f"PAPER TREND [{idx_name}]: AI check failed ({_ai_pt_err}), proceeding")
+                                    if _paper_trend_ai_ok:
+                                        logger.info(
+                                            f"PAPER TREND [{idx_name}]: Would buy {_pt_opt} — "
+                                            f"{signal.trend.value} {signal.strength}% — paper mode, no order placed"
+                                        )
+                                        await self._broadcast_message(
+                                            f"📋 PAPER TREND [{idx_name}]: Would buy {_pt_opt} ATM "
+                                            f"| {signal.trend.value} strength {signal.strength}% "
+                                            f"| price {signal.current_price:,.0f} — paper mode",
+                                            "paper_trade",
+                                        )
+                                        self.paper_trader.paper_buy(
+                                            index_name=idx_name,
+                                            index_price=signal.current_price,
+                                            option_type=_pt_opt,
+                                            strategy="TREND",
+                                            quantity=idx_cfg.lot_size,
+                                        )
+                                        self._index_trend_triggered[idx_name] = datetime.now().date()
+                                        # Record today's direction so ORB won't trade against it
+                                        self._index_day_direction[idx_name] = _pt_opt
+                                        self._save_daily_state()
 
                     # ── Step 4: EOD closing momentum (14:30–15:00 IST) ──────────────
                     _last_checked["EOD"] = datetime.now()
@@ -1436,6 +1494,9 @@ class TradingBot:
         _profit_recorded_date: Optional[date] = None   # track EOD profit recording
         # Snapshot of the user's index — stable reference immune to analysis-loop swaps
         _usr_idx = self._user_selected_index
+        # Periodic broker sync: pick up manually-placed trades every 5 min
+        _last_broker_sync: Optional[datetime] = None
+        _broker_sync_interval_sec = 300  # 5 minutes
 
         while True:
             try:
@@ -1443,7 +1504,87 @@ class TradingBot:
                 _usr_idx = self._user_selected_index
                 now = datetime.now()
 
-                # ── Expiry day alert: warn 45 min before close if today is expiry ─────
+                # ── Periodic broker sync: detect manually-placed trades ───────────────
+                # Runs every 5 minutes during market hours. Any open position on Dhan
+                # that is NOT already tracked by the bot gets added as a RECOVERED trade
+                # so SL/target/trail monitoring applies automatically.
+                _market_open_dt  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+                _market_close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                _in_market_hours = _market_open_dt <= now <= _market_close_dt and now.weekday() <= 4
+                if (
+                    _in_market_hours
+                    and self.order_manager
+                    and (
+                        _last_broker_sync is None
+                        or (now - _last_broker_sync).total_seconds() >= _broker_sync_interval_sec
+                    )
+                ):
+                    _last_broker_sync = now
+                    try:
+                        pos_data = await self.kite.get_kite_positions()
+                        _synced = 0
+                        for _bp in pos_data.get("day", []):
+                            _bqty = _bp.get("quantity", 0)
+                            if _bqty <= 0:
+                                continue
+                            _bsym = _bp.get("tradingsymbol", "")
+                            if not _bsym:
+                                continue
+                            # Skip if already tracked (any trade_id mentioning this symbol)
+                            _sym_norm = _bsym.upper().replace("-", "").replace(" ", "")
+                            _already = any(
+                                t.symbol.upper().replace("-", "").replace(" ", "") == _sym_norm
+                                and t.status == "OPEN"
+                                for t in self.order_manager._positions.values()
+                            )
+                            if _already:
+                                continue
+                            # New manual position — add it
+                            _bavg = float(_bp.get("average_price") or _bp.get("buy_price") or 0)
+                            if _bavg <= 0:
+                                continue
+                            from browser.dhan import OptionType, OrderType
+                            from bot.order_manager import TradeRecord
+                            import re as _re
+                            _opt = OptionType.CE if _bsym.upper().endswith("CE") else OptionType.PE
+                            _sm  = _re.search(r'-(\d+)-(CE|PE)$', _bsym, _re.IGNORECASE)
+                            _strike = int(_sm.group(1)) if _sm else 0
+                            _tid = f"RECOVERED_{_bsym}"
+                            _tr = TradeRecord(
+                                trade_id=_tid,
+                                symbol=_bsym,
+                                option_type=_opt,
+                                strike=_strike,
+                                order_type=OrderType.BUY,
+                                quantity=abs(_bqty),
+                                price=_bavg,
+                                timestamp=datetime.now(),
+                                status="OPEN",
+                                highest_price=_bavg,
+                            )
+                            self.order_manager._positions[_tid] = _tr
+                            _sec_id = _bp.get("security_id", "")
+                            if _sec_id and hasattr(self.kite, '_position_security_ids'):
+                                self.kite._position_security_ids[_bsym.upper()] = str(_sec_id)
+                            _synced += 1
+                            logger.info(
+                                f"📥 Broker sync: added manual position {_bsym} "
+                                f"x{abs(_bqty)} @ ₹{_bavg:.2f} — SL/target monitoring active"
+                            )
+                            await self._broadcast_message(
+                                f"📥 Manual trade detected: {_bsym} x{abs(_bqty)} @ ₹{_bavg:.2f} "
+                                f"— SL/target monitoring now active",
+                                "system"
+                            )
+                        if _synced:
+                            await self._send_telegram_alert(
+                                f"📥 {_synced} manual position(s) picked up — bot is now managing SL/target.",
+                                "system"
+                            )
+                    except Exception as _sync_err:
+                        logger.debug(f"Broker sync error (non-critical): {_sync_err}")
+
+
                 if now.weekday() <= 4:  # Mon–Fri only
                     today_date = now.date()
                     active_expiry_weekday = _usr_idx.expiry_weekday  # use stable user-index ref
@@ -1647,11 +1788,11 @@ class TradingBot:
                             # ── Source 2: in-memory order_manager (fallback) ──
                             if gross is None:
                                 if self.order_manager:
-                                    summary = self.order_manager.get_summary()
-                                    gross   = float(summary.get("total_pnl", 0))
-                                    trades  = int(summary.get("total_trades", 0))
-                                    wins    = int(summary.get("wins", 0))
-                                    losses  = int(summary.get("losses", 0))
+                                    _s     = self.order_manager._daily_stats
+                                    gross  = float(self.order_manager._daily_pnl)
+                                    trades = int(_s.total_trades)
+                                    wins   = int(_s.winning_trades)
+                                    losses = int(_s.losing_trades)
                                     _settle_note = "in-memory"
                                 elif hasattr(self, '_paper_trader') and self._paper_trader:
                                     summary = self._paper_trader.get_summary()
@@ -1667,10 +1808,10 @@ class TradingBot:
                                 # Dhan settlement has the gross; get trade counts
                                 # from order_manager for win/loss stats
                                 if self.order_manager:
-                                    summary = self.order_manager.get_summary()
-                                    trades  = int(summary.get("total_trades", 0))
-                                    wins    = int(summary.get("wins", 0))
-                                    losses  = int(summary.get("losses", 0))
+                                    _s     = self.order_manager._daily_stats
+                                    trades = int(_s.total_trades)
+                                    wins   = int(_s.winning_trades)
+                                    losses = int(_s.losing_trades)
                                 else:
                                     trades, wins, losses = 0, 0, 0
 
@@ -1771,16 +1912,32 @@ class TradingBot:
                             price = await self.kite.get_instrument_price(trade.symbol)
                             if price and price > 0:
                                 current_prices[trade.symbol] = price
+                                # Cache last-known good price on the trade so we can
+                                # fall back to it when LTP feed is temporarily unavailable.
+                                trade._last_known_price = price
                             else:
-                                # No LTP available — skip SL/target check this cycle.
-                                # Never use the index price as a proxy for an option premium
-                                # because that causes catastrophically false target triggers.
-                                logger.debug(
-                                    f"LTP unavailable for {trade.symbol} — "
-                                    f"skipping SL/target check this cycle"
-                                )
+                                # LTP unavailable this cycle — fall back to last known price
+                                # so SL/target checks continue instead of silently skipping.
+                                _fallback = getattr(trade, '_last_known_price', 0.0)
+                                if _fallback > 0:
+                                    current_prices[trade.symbol] = _fallback
+                                    logger.debug(
+                                        f"LTP unavailable for {trade.symbol} — "
+                                        f"using last known price ₹{_fallback:.2f}"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"LTP unavailable for {trade.symbol} and no cached price — "
+                                        f"skipping SL/target check this cycle"
+                                    )
                         except Exception as e:
-                            logger.debug(f"Could not fetch price for {trade.symbol}: {e}")
+                            # On broker connection error, fall back to last known price
+                            _fallback = getattr(trade, '_last_known_price', 0.0)
+                            if _fallback > 0:
+                                current_prices[trade.symbol] = _fallback
+                                logger.debug(f"Broker error for {trade.symbol}, using cached ₹{_fallback:.2f}: {e}")
+                            else:
+                                logger.debug(f"Could not fetch price for {trade.symbol}: {e}")
                 
                 # Cache prices for get_status()
                 self._current_prices = current_prices
@@ -1877,12 +2034,48 @@ class TradingBot:
                             # Capture exit price BEFORE closing (position is still in dict)
                             trade_ref = self.order_manager._positions.get(trade_id)
                             exit_price = current_prices.get(trade_ref.symbol, 0.0) if trade_ref else 0.0
+                            _pnl_at_attempt = ((exit_price - trade_ref.price) * trade_ref.quantity
+                                               if trade_ref and trade_ref.price > 0 else 0.0)
 
-                            result = await self.order_manager.close_position(
-                                trade_id=trade_id, exit_price=exit_price
-                            )
+                            # Retry close up to 3 times on transient broker errors (e.g. DH-905 Invalid IP).
+                            # Each retry waits 2s to allow IP/session to recover.
+                            # IMPORTANT: before each retry verify position still exists — if a previous
+                            # attempt succeeded on Dhan but returned a timeout, we must NOT sell again
+                            # (that would create a naked short position).
+                            _max_close_attempts = 3
+                            result = None
+                            for _attempt in range(1, _max_close_attempts + 1):
+                                # Guard: if position was already removed by a previous attempt, stop.
+                                if trade_id not in self.order_manager._positions:
+                                    logger.info(f"Close retry {_attempt}: position {trade_id} already closed — skipping")
+                                    result = None
+                                    break
+                                result = await self.order_manager.close_position(
+                                    trade_id=trade_id, exit_price=exit_price
+                                )
+                                if result.success:
+                                    break
+                                _is_transient = any(
+                                    kw in (result.message or "")
+                                    for kw in ("Invalid IP", "DH-905", "timeout", "connection", "network")
+                                )
+                                if _is_transient and _attempt < _max_close_attempts:
+                                    logger.warning(
+                                        f"Close attempt {_attempt}/{_max_close_attempts} failed for {trade_id} "
+                                        f"(transient error: {result.message[:60]}) — retrying in 2s"
+                                    )
+                                    await asyncio.sleep(2)
+                                    # Refresh exit price in case premium moved during retry window
+                                    try:
+                                        _fresh = await self.kite.get_instrument_price(trade_ref.symbol)
+                                        if _fresh and _fresh > 0:
+                                            exit_price = _fresh
+                                    except Exception:
+                                        pass
+                                else:
+                                    break  # permanent error or max retries — stop
 
-                            if result.success:
+                            if result and result.success:
                                 await self._broadcast_message(
                                     f"✅ Position auto-closed: {result.message}",
                                     "trade_success"
@@ -1924,12 +2117,32 @@ class TradingBot:
                                 )
                                 logger.error(f"Failed to close {trade_id}: {result.message}")
                                 _symbol = trade_ref.symbol if trade_ref and hasattr(trade_ref, 'symbol') else trade_id
+                                _pnl_str = f"₹{trade_ref.pnl:+,.0f}" if trade_ref and trade_ref.pnl else "unknown"
+                                # ── Profit Protection: close failed while in profit ────────────────────
+                                # Tighten the trailing stop to 3% from peak so the NEXT
+                                # monitoring cycle exits near the high instead of bleeding
+                                # all the way to SL while waiting for IP to recover.
+                                if trade_ref and _pnl_at_attempt > 0:
+                                    trade_ref.profit_protection = True
+                                    logger.warning(
+                                        f"⚠️ Profit protection activated for {_symbol}: "
+                                        f"close failed at ₹{_pnl_at_attempt:+,.0f} profit — "
+                                        f"trail tightened to 3% from peak"
+                                    )
+                                    await self._broadcast_message(
+                                        f"⚠️ PROFIT PROTECTION ON: {_symbol} — "
+                                        f"close failed at ₹{_pnl_at_attempt:+,.0f}, "
+                                        f"trail locked 3% from peak. Close manually if needed!",
+                                        "trade_error"
+                                    )
                                 await self._send_telegram_alert(
-                                    f"🚨 EXIT ORDER FAILED — MANUAL ACTION NEEDED!\n"
-                                    f"Symbol: {_symbol}\n"
-                                    f"Error: {result.message}\n"
-                                    f"⚠️ Position may be OPEN beyond SL — close manually on Dhan app!",
-                                    "system"
+                                    f"🚨 URGENT — EXIT ORDER FAILED ({_max_close_attempts} attempts)\n"
+                                    f"Symbol : {_symbol}\n"
+                                    f"P&L    : {_pnl_str}\n"
+                                    f"Error  : {(result.message or '')[:80]}\n"
+                                    f"Profit Protection: {'ON — trail at 3%' if (trade_ref and trade_ref.profit_protection) else 'OFF'}\n"
+                                    f"➡️ CLOSE MANUALLY on Dhan app NOW!",
+                                    "trade_error"
                                 )
                         except Exception as e:
                             logger.error(f"Error closing position {trade_id}: {e}")
@@ -2226,6 +2439,23 @@ class TradingBot:
             except Exception as _iv_err:
                 logger.debug(f"IV percentile check skipped: {_iv_err}")
 
+        # ── Spot price sanity check ────────────────────────────────────────────
+        # If yfinance returns bad/stale data for ^BSESN the signal.current_price
+        # can come back as NIFTY's price (~22900), producing an impossible SENSEX
+        # strike that is never in the instrument master → perpetual DH-905 loop.
+        # strike_range is defined in IndexConfig for all three indices.
+        _smin, _smax = self._active_index.strike_range
+        if not (_smin <= signal.current_price <= _smax):
+            _price_err = (
+                f"[{source}] {self._active_index.name} {option_type} aborted — "
+                f"spot price {signal.current_price:,.0f} is outside valid range "
+                f"{_smin:,}–{_smax:,}. Likely stale/wrong yfinance data for "
+                f"{self._active_index.yahoo_symbol}. Skipping this cycle."
+            )
+            logger.error(_price_err)
+            await self._broadcast_message(_price_err, "error")
+            return False
+
         # Step 1: Perform deep research
         await self._broadcast_message(
             f"🔍 Performing deep research before {option_type} trade...",
@@ -2347,6 +2577,9 @@ class TradingBot:
                     self._index_orb_triggered[_idx] = _today
                     self._index_vwap_triggered[_idx] = _today
                     logger.info(f"Auto trade consumed both ORB + VWAP slots for {_idx} today")
+                    # Lock day direction so ORB won't trade opposite side after TREND fires
+                    self._index_day_direction[_idx] = option_type
+                    logger.info(f"Auto [{_idx}]: day direction locked to {option_type}")
                 else:
                     if self._index_orb_triggered.get(_idx) != _today:
                         self._index_orb_triggered[_idx] = _today
@@ -2562,10 +2795,12 @@ class TradingBot:
                         context["vix"] = self._cached_vix
                 except Exception:
                     pass
-                # Try to get live trend direction
+                # Try to get live trend direction; keep reference for AI validation + RSI check
+                _gap_live_sig = None
                 try:
                     sig_live = self.analyzer.analyze()
                     if sig_live:
+                        _gap_live_sig = sig_live
                         context["current_price"] = sig_live.current_price
                         context["trend_direction"] = sig_live.trend.value
                         trend_val = sig_live.trend.value
@@ -2608,28 +2843,59 @@ class TradingBot:
                     opt_direction = "CE" if gap_dir == "UP" else "PE"
 
                 if not self._auto_trade:
-                    note = (
-                        f"📊 PAPER GAP [{strategy_chosen}]: "
-                        f"{gap.gap_pct:+.2f}%  {gap_info_dict.get('category','?')} gap — "
-                        f"would enter {opt_direction}  confidence={confidence}%"
-                    )
-                    await self._broadcast_message(note, "paper_trade")
-                    logger.info(
-                        f"PAPER GAP [{strategy_chosen}]: Would enter {opt_direction} "
-                        f"gap={gap.gap_pct:+.2f}% — paper mode"
-                    )
-                    # Use today's open price as paper entry (we'd enter at market open)
-                    _gap_px = gap.open_price or context.get("current_price", 0.0)
-                    self.paper_trader.paper_buy(
-                        index_name=self._active_index.name,
-                        index_price=_gap_px,
-                        option_type=opt_direction,
-                        strategy=f"GAP_{strategy_chosen[:4]}",   # GAP_FADE / GAP_CONT
-                        quantity=self._active_index.lot_size,
-                    )
-                    self._index_gap_traded[self._active_index.name] = True
-                    # Record today's direction so ORB won't trade against it
-                    self._index_day_direction[self._active_index.name] = opt_direction
+                    # ── AI validation in paper mode ──────────────────────
+                    _paper_gap_ai_ok = True
+                    if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                        try:
+                            from bot.ai_gateway import get_ai_gateway
+                            _gw_pg = get_ai_gateway()
+                            _fake_sig_pg = self.analyzer.analyze()
+                            if _fake_sig_pg:
+                                _gw_pg_ctx = {
+                                    'option_type':        opt_direction,
+                                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                                    'vix':                self._cached_vix,
+                                    'consecutive_losses': 0,
+                                    'trades_done_today':  0,
+                                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                                }
+                                _gw_pg_res = await _gw_pg.validate_strategy_signal(_fake_sig_pg, f'GAP_{strategy_chosen[:4]}', _gw_pg_ctx)
+                                if not _gw_pg_res['approved']:
+                                    logger.info(f"PAPER GAP [{strategy_chosen}]: AI blocked — {_gw_pg_res['reasoning']}")
+                                    await self._broadcast_message(
+                                        f"🤖 PAPER GAP [{strategy_chosen}]: AI blocked {opt_direction} — {_gw_pg_res['reasoning']}",
+                                        "paper_trade",
+                                    )
+                                    _paper_gap_ai_ok = False
+                                else:
+                                    logger.info(f"PAPER GAP [{strategy_chosen}]: AI approved conf={_gw_pg_res['confidence']:.0f}%")
+                        except Exception as _ai_pg_err:
+                            logger.warning(f"PAPER GAP [{strategy_chosen}]: AI check failed ({_ai_pg_err}), proceeding")
+                    if _paper_gap_ai_ok:
+                        note = (
+                            f"📊 PAPER GAP [{strategy_chosen}]: "
+                            f"{gap.gap_pct:+.2f}%  {gap_info_dict.get('category','?')} gap — "
+                            f"would enter {opt_direction}  confidence={confidence}%"
+                        )
+                        await self._broadcast_message(note, "paper_trade")
+                        logger.info(
+                            f"PAPER GAP [{strategy_chosen}]: Would enter {opt_direction} "
+                            f"gap={gap.gap_pct:+.2f}% — paper mode"
+                        )
+                        # Use today's open price as paper entry (we'd enter at market open)
+                        _gap_px = gap.open_price or context.get("current_price", 0.0)
+                        self.paper_trader.paper_buy(
+                            index_name=self._active_index.name,
+                            index_price=_gap_px,
+                            option_type=opt_direction,
+                            strategy=f"GAP_{strategy_chosen[:4]}",   # GAP_FADE / GAP_CONT
+                            quantity=self._active_index.lot_size,
+                        )
+                        self._index_gap_traded[self._active_index.name] = True
+                        # Record today's direction so ORB won't trade against it
+                        self._index_day_direction[self._active_index.name] = opt_direction
+                    else:
+                        self._index_gap_traded[self._active_index.name] = True
                     return
 
                 # Live order
@@ -2640,20 +2906,50 @@ class TradingBot:
                     logger.info(f"Gap [{strategy_chosen}] trade blocked: {reason}")
                     return
 
-                signal_live = self.analyzer.analyze()
-                if not signal_live:
+                # Use gap.open_price (fetched by GapDetector from the correct per-index
+                # ^yahoo_symbol) to avoid cross-index contamination where signal_live.current_price
+                # might carry NIFTY's price (~23800) into a SENSEX strike calculation (~77000).
+                _spot = gap.open_price if gap.open_price > 0 else 0
+                _sr   = getattr(self._active_index, 'strike_range', None)
+                if _spot <= 0 or (_sr and not (_sr[0] <= _spot <= _sr[1])):
+                    logger.error(
+                        f"Gap [{self._active_index.name}]: spot price {_spot:.0f} invalid or "
+                        f"outside strike_range {_sr} — aborting to prevent wrong strike"
+                    )
                     return
-                current_price  = signal_live.current_price
                 strike_interval = self._active_index.strike_interval
-                atm_strike      = round(current_price / strike_interval) * strike_interval
+                atm_strike      = round(_spot / strike_interval) * strike_interval
 
                 from browser.dhan import OptionType
                 opt = OptionType.CE if opt_direction == "CE" else OptionType.PE
                 qty = int(self._active_index.lot_size * getattr(cfg, "quantity_multiplier", 0.5))
                 qty = max(qty, self._active_index.lot_size)  # floor at one lot
 
+                # ── RSI extreme block: CONTINUATION PE/CE at crash/rally extremes ──
+                # GAP FADE (CE after gap-down, PE after gap-up) is intentionally counter-trend
+                # so RSI extreme is acceptable. CONTINUATION chases the move — dangerous.
+                if _gap_live_sig:
+                    _gap_rsi = getattr(_gap_live_sig, 'rsi', 50)
+                    _is_continuation = (strategy_chosen == "CONTINUATION")
+                    if _is_continuation and opt_direction == "PE" and _gap_rsi < 25:
+                        msg = (f"GAP [{strategy_chosen}]: Skipping PE — RSI {_gap_rsi:.1f} < 25 "
+                               f"extreme oversold, chasing crash too late")
+                        logger.info(msg)
+                        await self._broadcast_message(msg, "alert")
+                        self._index_gap_traded[self._active_index.name] = True
+                        self._save_daily_state()
+                        return
+                    if _is_continuation and opt_direction == "CE" and _gap_rsi > 75:
+                        msg = (f"GAP [{strategy_chosen}]: Skipping CE — RSI {_gap_rsi:.1f} > 75 "
+                               f"extreme overbought, chasing rally too late")
+                        logger.info(msg)
+                        await self._broadcast_message(msg, "alert")
+                        self._index_gap_traded[self._active_index.name] = True
+                        self._save_daily_state()
+                        return
+
                 # ── AI Gateway (PROMPT 1): final validation before any order ─────
-                if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                if settings.ai.enabled and settings.ai.use_ai_signal_validation and _gap_live_sig:
                     from bot.ai_gateway import get_ai_gateway
                     _gw = get_ai_gateway()
                     _ds  = self.order_manager._daily_stats if self.order_manager else None
@@ -2665,7 +2961,7 @@ class TradingBot:
                         'trades_done_today':  getattr(_ds, 'total_trades', 0),
                         'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
                     }
-                    _gw_res = await _gw.validate_strategy_signal(signal_live, 'GAP', _gw_ctx)
+                    _gw_res = await _gw.validate_strategy_signal(_gap_live_sig, 'GAP', _gw_ctx)
                     if not _gw_res['approved']:
                         logger.info(f"GAP: AI gateway blocked — {_gw_res['reasoning']}")
                         await self._broadcast_message(
@@ -2706,6 +3002,9 @@ class TradingBot:
                     if self._index_orb_triggered.get(_idx) != _today_d:
                         self._index_orb_triggered[_idx] = _today_d
                         logger.info(f"GAP trade marked ORB slot used for {_idx}")
+                    # Lock day direction so ORB/TREND can't trade opposite side
+                    self._index_day_direction[_idx] = opt_direction
+                    logger.info(f"GAP [{_idx}]: day direction locked to {opt_direction}")
                     msg = (
                         f"🚀 **Gap Trade [{strategy_chosen}] Executed**\n"
                         f"  Category: {gap_info_dict.get('category','?')}\n"
@@ -2734,9 +3033,12 @@ class TradingBot:
                     self._index_gap_traded[_idx_f] = True
                     self._save_daily_state()
                     logger.warning(f"Gap [{_idx_f}]: order failed — marked done for today to prevent restart duplicates")
+                    _safe_err = (result.message
+                        .replace('_', r'\_').replace('*', r'\*')
+                        .replace('[', r'\[').replace('`', r'\`'))
                     await self._send_telegram_alert(
                         f"⚠️ Gap trade for {_idx_f} failed — retries stopped for today.\n"
-                        f"Error: {result.message}\n"
+                        f"Error: {_safe_err}\n"
                         f"Check DH-905 IP whitelist or DH-901 token expiry.",
                         "system"
                     )
@@ -2752,25 +3054,55 @@ class TradingBot:
                         f"would wait for ORB confirmation before entering {opt_type}."
                     )
                     await self._broadcast_message(note, "paper_trade")
+                    self._index_gap_traded[self._active_index.name] = True
                 else:
+                    # ── AI validation in paper mode ──────────────────────
+                    _paper_gap_leg_ai_ok = True
+                    if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                        try:
+                            from bot.ai_gateway import get_ai_gateway
+                            _gw_pgl = get_ai_gateway()
+                            _sig_pgl = self.analyzer.analyze()
+                            if _sig_pgl:
+                                _gw_pgl_ctx = {
+                                    'option_type':        opt_type,
+                                    'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                                    'vix':                self._cached_vix,
+                                    'consecutive_losses': 0,
+                                    'trades_done_today':  0,
+                                    'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                                }
+                                _gw_pgl_res = await _gw_pgl.validate_strategy_signal(_sig_pgl, 'GAP', _gw_pgl_ctx)
+                                if not _gw_pgl_res['approved']:
+                                    logger.info(f"PAPER GAP (legacy): AI blocked — {_gw_pgl_res['reasoning']}")
+                                    await self._broadcast_message(
+                                        f"🤖 PAPER GAP: AI blocked {opt_type} — {_gw_pgl_res['reasoning']}",
+                                        "paper_trade",
+                                    )
+                                    _paper_gap_leg_ai_ok = False
+                                else:
+                                    logger.info(f"PAPER GAP (legacy): AI approved conf={_gw_pgl_res['confidence']:.0f}%")
+                        except Exception as _ai_pgl_err:
+                            logger.warning(f"PAPER GAP (legacy): AI check failed ({_ai_pgl_err}), proceeding")
                     _gap_px = gap.open_price or 0.0
-                    logger.info(
-                        f"PAPER GAP: Would enter {opt_type} on strong {gap.gap_type.value} "
-                        f"gap {gap.gap_pct:+.2f}% — paper mode, no order placed"
-                    )
-                    await self._broadcast_message(
-                        f"📋 PAPER GAP: Would enter {opt_type} | {gap.gap_type.value} "
-                        f"gap {gap.gap_pct:+.2f}% | open {_gap_px:,.0f} — paper mode",
-                        "paper_trade",
-                    )
-                    self.paper_trader.paper_buy(
-                        index_name=self._active_index.name,
-                        index_price=_gap_px,
-                        option_type=opt_type,
-                        strategy="GAP",
-                        quantity=self._active_index.lot_size,
-                    )
-                self._index_gap_traded[self._active_index.name] = True
+                    if _paper_gap_leg_ai_ok:
+                        logger.info(
+                            f"PAPER GAP: Would enter {opt_type} on strong {gap.gap_type.value} "
+                            f"gap {gap.gap_pct:+.2f}% — paper mode, no order placed"
+                        )
+                        await self._broadcast_message(
+                            f"📋 PAPER GAP: Would enter {opt_type} | {gap.gap_type.value} "
+                            f"gap {gap.gap_pct:+.2f}% | open {_gap_px:,.0f} — paper mode",
+                            "paper_trade",
+                        )
+                        self.paper_trader.paper_buy(
+                            index_name=self._active_index.name,
+                            index_price=_gap_px,
+                            option_type=opt_type,
+                            strategy="GAP",
+                            quantity=self._active_index.lot_size,
+                        )
+                    self._index_gap_traded[self._active_index.name] = True
                 return
 
             # Moderate gap — just alert; ORB loop will confirm
@@ -2791,14 +3123,18 @@ class TradingBot:
                 logger.info(f"Gap trade blocked: {reason}")
                 return
 
-            from bot.trend_analyzer import TrendAnalyzer
-            signal = self.analyzer.analyze()
-            if not signal:
+            # Use gap.open_price (correct per-index symbol) to prevent NIFTY price leaking
+            # into SENSEX strike calculation.
+            _spot_leg = gap.open_price if gap.open_price > 0 else 0
+            _sr_leg   = getattr(self._active_index, 'strike_range', None)
+            if _spot_leg <= 0 or (_sr_leg and not (_sr_leg[0] <= _spot_leg <= _sr_leg[1])):
+                logger.error(
+                    f"Gap (legacy) [{self._active_index.name}]: spot price {_spot_leg:.0f} invalid "
+                    f"or outside strike_range {_sr_leg} — aborting to prevent wrong strike"
+                )
                 return
-
-            current_price   = signal.current_price
             strike_interval = self._active_index.strike_interval
-            atm_strike      = round(current_price / strike_interval) * strike_interval
+            atm_strike      = round(_spot_leg / strike_interval) * strike_interval
 
             from browser.dhan import OptionType
             from config import settings as cfg
@@ -2875,9 +3211,12 @@ class TradingBot:
                 self._index_gap_traded[_idx_f] = True
                 self._save_daily_state()
                 logger.warning(f"Gap [{_idx_f}]: order failed — marked done for today to prevent restart duplicates")
+                _safe_err_leg = (result.message
+                    .replace('_', r'\_').replace('*', r'\*')
+                    .replace('[', r'\[').replace('`', r'\`'))
                 await self._send_telegram_alert(
                     f"⚠️ Gap trade for {_idx_f} failed — retries stopped for today.\n"
-                    f"Error: {result.message}\n"
+                    f"Error: {_safe_err_leg}\n"
                     f"Check DH-905 IP whitelist or DH-901 token expiry.",
                     "system"
                 )
@@ -2892,14 +3231,21 @@ class TradingBot:
             logger.debug(f"ORB [{self._active_index.name}]: already triggered today — skipping")
             self._filter_blocks["ORB_daily_limit"] = self._filter_blocks.get("ORB_daily_limit", 0) + 1
             return
-        # ── Same-day direction lock ───────────────────────────────────────────
-        # If TREND or GAP already fired CE today, block ORB from entering PE (and vice versa).
-        # Prevents the bot from trading both sides on the same index in one day.
+        # ── Early direction-lock guard (paper & live) ─────────────────────────
+        # If day direction is locked AND the ORB slot is already consumed (e.g.
+        # GAP trade took it), skip the expensive analyze() call entirely.
+        # Counter-direction blocking when slot is still available is handled by
+        # Guard 3b (after analyze()) so same-direction ORB is not unfairly blocked.
         _idx_name_orb = self._active_index.name
         _today_dir = self._index_day_direction.get(_idx_name_orb, "")
-        if _today_dir:
-            # We'll check after the signal is available — store for use below
-            pass
+        if _today_dir and self._index_orb_triggered.get(_idx_name_orb) == datetime.now().date():
+            # Slot consumed + direction known → nothing ORB can add here
+            logger.debug(
+                f"ORB [{_idx_name_orb}]: skipping — direction locked to {_today_dir} "
+                f"and ORB slot already consumed today"
+            )
+            self._filter_blocks["ORB_direction_lock"] = self._filter_blocks.get("ORB_direction_lock", 0) + 1
+            return
         try:
             orb_signal = self.orb.analyze()
             if not orb_signal:
@@ -3035,31 +3381,45 @@ class TradingBot:
                 self._filter_blocks["ORB_direction_lock"] = self._filter_blocks.get("ORB_direction_lock", 0) + 1
                 return
 
-            # ── Guard 4: RSI quality filter (plan step 5) ───────────────────────────
-            # CE: block when RSI ≥75 — market is already overbought, not a clean breakout
-            # PE: block when RSI ≤25 — market is already oversold, not a clean breakdown
-            # Triggers between 25–75 are healthy momentum, not extreme; allow entry.
+            # ── Guard 4: RSI quality filter ─────────────────────────────────────────
+            # Uses TRADING_PE_MIN_RSI_ENTRY and TRADING_CE_MAX_RSI_ENTRY (same as
+            # _execute_auto_trade) so all strategies apply identical RSI bounds.
             _rsi = self._last_signal.rsi if self._last_signal else 50
-            if option_type == "CE" and _rsi >= 75:
+            _pe_rsi_floor_orb = float(getattr(settings.trading, 'pe_min_rsi_entry', 35))
+            _ce_rsi_ceil_orb  = float(getattr(settings.trading, 'ce_max_rsi_entry', 70))
+            if option_type == "CE" and _rsi >= _ce_rsi_ceil_orb:
                 logger.info(
-                    f"ORB: Skipping LONG — RSI {_rsi:.1f} overbought (≥75, plan filter)"
+                    f"ORB: Skipping LONG — RSI {_rsi:.1f} overbought (≥{_ce_rsi_ceil_orb:.0f})"
                 )
                 await self._broadcast_message(
-                    f"ORB: CE signal skipped — RSI {_rsi:.1f} ≥75 (overbought, stale breakout)",
+                    f"ORB: CE signal skipped — RSI {_rsi:.1f} ≥{_ce_rsi_ceil_orb:.0f} (overbought)",
                     "alert"
                 )
                 self._filter_blocks["ORB_RSI"] = self._filter_blocks.get("ORB_RSI", 0) + 1
                 return
-            if option_type == "PE" and _rsi <= 25:
-                logger.info(
-                    f"ORB: Skipping SHORT — RSI {_rsi:.1f} oversold (≤25, plan filter)"
-                )
-                await self._broadcast_message(
-                    f"ORB: PE signal skipped — RSI {_rsi:.1f} ≤25 (oversold, exhausted breakdown)",
-                    "alert"
-                )
-                self._filter_blocks["ORB_RSI"] = self._filter_blocks.get("ORB_RSI", 0) + 1
-                return
+            if option_type == "PE" and _rsi <= _pe_rsi_floor_orb:
+                # On strongly trending crash days the RSI stays depressed all session.
+                # Allow the trade if the ORB breakout is high-conviction (≥85%) and
+                # the regime confirms a downtrend — in that case use a tighter floor of 20.
+                _regime_now = getattr(self, "_cached_regime", None)
+                _is_trending_down = _regime_now and "TRENDING DOWN" in str(_regime_now.regime.value)
+                _relaxed_floor = 20.0
+                if orb_signal.strength >= 85 and _is_trending_down and _rsi > _relaxed_floor:
+                    logger.info(
+                        f"ORB: Allowing SHORT despite RSI {_rsi:.1f} — "
+                        f"high-conviction breakout ({orb_signal.strength:.0f}%) in TRENDING DOWN regime "
+                        f"(relaxed RSI floor: {_relaxed_floor})"
+                    )
+                else:
+                    logger.info(
+                        f"ORB: Skipping SHORT — RSI {_rsi:.1f} oversold (≤{_pe_rsi_floor_orb:.0f})"
+                    )
+                    await self._broadcast_message(
+                        f"ORB: PE signal skipped — RSI {_rsi:.1f} ≤{_pe_rsi_floor_orb:.0f} (oversold, exhausted breakdown)",
+                        "alert"
+                    )
+                    self._filter_blocks["ORB_RSI"] = self._filter_blocks.get("ORB_RSI", 0) + 1
+                    return
 
             # ── Guard 5: 15m timeframe must agree with ORB direction ─────────────
             try:
@@ -3091,25 +3451,54 @@ class TradingBot:
 
             # Paper mode: log signal but skip order placement
             if not self._auto_trade:
-                logger.info(
-                    f"[SIGNAL] ORB [{self._active_index.name}]: passed all filters → "
-                    f"PAPER BUY {option_type} | strength={orb_signal.strength:.0f}% "
-                    f"dir={orb_signal.direction} rsi={_rsi:.1f}"
-                )
-                await self._broadcast_message(
-                    f"📋 PAPER ORB: Would buy {option_type} | strength {orb_signal.strength:.0f}% "
-                    f"| range {self.orb._range_low:,.0f}–{self.orb._range_high:,.0f} (paper mode)",
-                    "paper_trade"
-                )
-                self.paper_trader.paper_buy(
-                    index_name=self._active_index.name,
-                    index_price=self._last_signal.current_price if self._last_signal else 0.0,
-                    option_type=option_type,
-                    strategy="ORB",
-                    quantity=self._active_index.lot_size,
-                )
-                self._index_orb_triggered[self._active_index.name] = datetime.now().date()
-                self._save_daily_state()
+                # ── AI validation in paper mode ──────────────────────
+                _paper_orb_ai_ok = True
+                if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                    try:
+                        from bot.ai_gateway import get_ai_gateway
+                        _gw_po = get_ai_gateway()
+                        _sig_po = self._last_signal or self.analyzer.analyze()
+                        if _sig_po:
+                            _gw_po_ctx = {
+                                'option_type':        option_type,
+                                'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                                'vix':                self._cached_vix,
+                                'consecutive_losses': 0,
+                                'trades_done_today':  0,
+                                'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                            }
+                            _gw_po_res = await _gw_po.validate_strategy_signal(_sig_po, 'ORB', _gw_po_ctx)
+                            if not _gw_po_res['approved']:
+                                logger.info(f"PAPER ORB [{self._active_index.name}]: AI blocked — {_gw_po_res['reasoning']}")
+                                await self._broadcast_message(
+                                    f"🤖 PAPER ORB: AI blocked {option_type} — {_gw_po_res['reasoning']}",
+                                    "paper_trade",
+                                )
+                                _paper_orb_ai_ok = False
+                            else:
+                                logger.info(f"PAPER ORB [{self._active_index.name}]: AI approved conf={_gw_po_res['confidence']:.0f}%")
+                    except Exception as _ai_po_err:
+                        logger.warning(f"PAPER ORB: AI check failed ({_ai_po_err}), proceeding")
+                if _paper_orb_ai_ok:
+                    logger.info(
+                        f"[SIGNAL] ORB [{self._active_index.name}]: passed all filters → "
+                        f"PAPER BUY {option_type} | strength={orb_signal.strength:.0f}% "
+                        f"dir={orb_signal.direction} rsi={_rsi:.1f}"
+                    )
+                    await self._broadcast_message(
+                        f"📋 PAPER ORB: Would buy {option_type} | strength {orb_signal.strength:.0f}% "
+                        f"| range {self.orb._range_low:,.0f}–{self.orb._range_high:,.0f} (paper mode)",
+                        "paper_trade"
+                    )
+                    self.paper_trader.paper_buy(
+                        index_name=self._active_index.name,
+                        index_price=self._last_signal.current_price if self._last_signal else 0.0,
+                        option_type=option_type,
+                        strategy="ORB",
+                        quantity=self._active_index.lot_size,
+                    )
+                    self._index_orb_triggered[self._active_index.name] = datetime.now().date()
+                    self._save_daily_state()
                 return
 
             # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
@@ -3155,6 +3544,9 @@ class TradingBot:
 
             if order_ok:
                 self._index_orb_triggered[self._active_index.name] = datetime.now().date()
+                # Lock day direction so TREND/VWAP can't trade opposite side today
+                self._index_day_direction[self._active_index.name] = option_type
+                logger.info(f"ORB [{self._active_index.name}]: day direction locked to {option_type}")
                 self._save_daily_state()
 
         except Exception as e:
@@ -3256,28 +3648,77 @@ class TradingBot:
 
             option_type = "CE" if vwap_signal.direction == "LONG" else "PE"
 
+            # ── RSI extreme block: VWAP ───────────────────────────────────────
+            # Uses TRADING_PE_MIN_RSI_ENTRY / TRADING_CE_MAX_RSI_ENTRY for consistency.
+            _vwap_rsi = vwap_signal.rsi
+            _pe_rsi_floor_vwap = float(getattr(settings.trading, 'pe_min_rsi_entry', 35))
+            _ce_rsi_ceil_vwap  = float(getattr(settings.trading, 'ce_max_rsi_entry', 70))
+            if option_type == "PE" and _vwap_rsi < _pe_rsi_floor_vwap:
+                msg = (f"VWAP [{self._active_index.name}]: Skipping PE — RSI {_vwap_rsi:.1f} < {_pe_rsi_floor_vwap:.0f} "
+                       f"oversold, PE entry blocked")
+                logger.info(msg)
+                await self._broadcast_message(msg, "alert")
+                self._filter_blocks["VWAP_RSI_extreme"] = self._filter_blocks.get("VWAP_RSI_extreme", 0) + 1
+                return
+            if option_type == "CE" and _vwap_rsi > _ce_rsi_ceil_vwap:
+                msg = (f"VWAP [{self._active_index.name}]: Skipping CE — RSI {_vwap_rsi:.1f} > {_ce_rsi_ceil_vwap:.0f} "
+                       f"overbought, CE entry blocked")
+                logger.info(msg)
+                await self._broadcast_message(msg, "alert")
+                self._filter_blocks["VWAP_RSI_extreme"] = self._filter_blocks.get("VWAP_RSI_extreme", 0) + 1
+                return
+
             # Paper mode: log signal but skip order placement
             if not self._auto_trade:
-                logger.info(
-                    f"[SIGNAL] VWAP [{self._active_index.name}]: passed all filters → "
-                    f"PAPER BUY {option_type} | dev={vwap_signal.deviation_pct:+.2f}% "
-                    f"rsi={vwap_signal.rsi:.1f} strength={vwap_signal.strength:.0f}%"
-                )
-                await self._broadcast_message(
-                    f"📋 PAPER VWAP: Would buy {option_type} | deviation {vwap_signal.deviation_pct:+.2f}% "
-                    f"| price {vwap_signal.current_price:,.0f} VWAP {vwap_signal.vwap:,.2f} "
-                    f"| RSI {vwap_signal.rsi:.1f} strength {vwap_signal.strength:.0f}% (paper mode)",
-                    "paper_trade"
-                )
-                self.paper_trader.paper_buy(
-                    index_name=self._active_index.name,
-                    index_price=vwap_signal.current_price,
-                    option_type=option_type,
-                    strategy="VWAP",
-                    quantity=self._active_index.lot_size,
-                )
-                self._index_vwap_triggered[self._active_index.name] = datetime.now().date()
-                self._save_daily_state()
+                # ── AI validation in paper mode ──────────────────────
+                _paper_vwap_ai_ok = True
+                if settings.ai.enabled and settings.ai.use_ai_signal_validation:
+                    try:
+                        from bot.ai_gateway import get_ai_gateway
+                        _gw_pv = get_ai_gateway()
+                        _sig_pv = self._last_signal or self.analyzer.analyze()
+                        if _sig_pv:
+                            _gw_pv_ctx = {
+                                'option_type':        option_type,
+                                'regime':             (self._cached_regime.regime.value if self._cached_regime else 'UNKNOWN'),
+                                'vix':                self._cached_vix,
+                                'consecutive_losses': 0,
+                                'trades_done_today':  0,
+                                'max_trades_per_day': getattr(settings.trading, 'max_trades_per_day', 5),
+                            }
+                            _gw_pv_res = await _gw_pv.validate_strategy_signal(_sig_pv, 'VWAP', _gw_pv_ctx)
+                            if not _gw_pv_res['approved']:
+                                logger.info(f"PAPER VWAP [{self._active_index.name}]: AI blocked — {_gw_pv_res['reasoning']}")
+                                await self._broadcast_message(
+                                    f"🤖 PAPER VWAP: AI blocked {option_type} — {_gw_pv_res['reasoning']}",
+                                    "paper_trade",
+                                )
+                                _paper_vwap_ai_ok = False
+                            else:
+                                logger.info(f"PAPER VWAP [{self._active_index.name}]: AI approved conf={_gw_pv_res['confidence']:.0f}%")
+                    except Exception as _ai_pv_err:
+                        logger.warning(f"PAPER VWAP: AI check failed ({_ai_pv_err}), proceeding")
+                if _paper_vwap_ai_ok:
+                    logger.info(
+                        f"[SIGNAL] VWAP [{self._active_index.name}]: passed all filters → "
+                        f"PAPER BUY {option_type} | dev={vwap_signal.deviation_pct:+.2f}% "
+                        f"rsi={vwap_signal.rsi:.1f} strength={vwap_signal.strength:.0f}%"
+                    )
+                    await self._broadcast_message(
+                        f"📋 PAPER VWAP: Would buy {option_type} | deviation {vwap_signal.deviation_pct:+.2f}% "
+                        f"| price {vwap_signal.current_price:,.0f} VWAP {vwap_signal.vwap:,.2f} "
+                        f"| RSI {vwap_signal.rsi:.1f} strength {vwap_signal.strength:.0f}% (paper mode)",
+                        "paper_trade"
+                    )
+                    self.paper_trader.paper_buy(
+                        index_name=self._active_index.name,
+                        index_price=vwap_signal.current_price,
+                        option_type=option_type,
+                        strategy="VWAP",
+                        quantity=self._active_index.lot_size,
+                    )
+                    self._index_vwap_triggered[self._active_index.name] = datetime.now().date()
+                    self._save_daily_state()
                 return
 
             # ── AI Gateway (PROMPT 1): live-trade validation only ─────────────
@@ -3357,6 +3798,14 @@ class TradingBot:
         """
         cfg = settings.eod
         if not cfg.enabled:
+            return
+
+        # ── Paper-mode guard ─────────────────────────────────────────────────
+        # EOD is 0/2 in paper data (both small losses, direction conflicted with
+        # intraday momentum). Disable in paper mode until we have ≥10 live samples
+        # to validate the pattern is reliable.
+        if not self._auto_trade:
+            logger.debug("EOD: skipped in paper mode — strategy not yet validated (<10 live samples)")
             return
 
         _today = datetime.now().date()
@@ -3757,12 +4206,15 @@ class TradingBot:
             synthetic_ltp = round(current_price * 0.002, 2)
             self.late_day_strat.register_position(signal, synthetic_ltp)
             from bot.index_config import NIFTY as _NIFTY_CFG
+            from math import floor as _floor
+            # Apply position_size_multiplier so paper qty matches live qty exactly
+            _paper_ld_qty = max(1, _floor(_NIFTY_CFG.lot_size * cfg.position_size_multiplier))
             self.paper_trader.paper_buy(
                 index_name  = "NIFTY",
                 index_price = current_price,
                 option_type = signal.direction,
                 strategy    = "LATE_DAY",
-                quantity    = _NIFTY_CFG.lot_size,
+                quantity    = _paper_ld_qty,
             )
             return
 
@@ -3771,9 +4223,13 @@ class TradingBot:
             return
 
         from math import floor
+        from bot.index_config import NIFTY as _NIFTY_CFG
         qty_multiplier = cfg.position_size_multiplier
-        base_qty       = settings.trading.default_quantity
-        trade_qty      = max(1, floor(base_qty * qty_multiplier))
+        # Always derive from NIFTY lot_size — LATE_DAY is a NIFTY-only strategy.
+        # Using settings.trading.default_quantity caused wrong qty when the user
+        # ran 'set qty N' for other indices, or when the .env default differed.
+        base_qty  = _NIFTY_CFG.lot_size
+        trade_qty = max(1, floor(base_qty * qty_multiplier))
 
         if not self._last_signal:
             _s = self.analyzer.analyze()
@@ -3957,7 +4413,7 @@ class TradingBot:
         """Execute automatic trade based on signal with deep research"""
         if not self.order_manager:
             return
-        
+
         # Determine option type from trend
         if signal.trend == Trend.BULLISH:
             option_type = "CE"
@@ -3965,6 +4421,89 @@ class TradingBot:
             option_type = "PE"
         else:
             return  # Don't trade on neutral
+
+        # ── Minimum signal strength filter ───────────────────────────────────
+        # Paper data (33 trades): TIME_STOP exits (55% of all trades, avg +2.5%)
+        # were concentrated in the 60–68% strength band.  Winning trades (avg
+        # +28%) all had strength ≥ 70%.  Raising the floor eliminates dead-weight
+        # entries that hold a slot without contributing meaningful P&L.
+        _min_strength = float(getattr(settings.trading, 'min_signal_strength', 70.0))
+        if signal.strength < _min_strength:
+            msg = (
+                f"Auto-trade blocked — signal strength {signal.strength:.0f}% < {_min_strength:.0f}% minimum "
+                f"(paper data: sub-{_min_strength:.0f} signals mostly TIME_STOP exits, avg +2.5%)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["strength_floor"] = self._filter_blocks.get("strength_floor", 0) + 1
+            return
+
+        # ── Opening-noise time gate ─────────────────────────────────────────
+        # Paper data: 9:15–9:50 AM entries included a SL_HIT at -100% and several
+        # TIME_STOPs.  Best winners all entered after 10:00 AM once the opening
+        # auction dust settled.  Block the first 45 minutes of the session.
+        from zoneinfo import ZoneInfo as _ZI_at
+        if datetime.now(_ZI_at("Asia/Kolkata")).hour < 10:
+            msg = (
+                f"Auto-trade blocked — before 10:00 IST "
+                f"(opening noise filter; paper data: 9:15-9:50 entries had SL-HIT + TIME_STOPs)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["opening_noise"] = self._filter_blocks.get("opening_noise", 0) + 1
+            return
+
+        # ── RSI extreme-zone filter ───────────────────────────────────────────
+        # RSI < 40 when buying PE = market already oversold → high bounce risk
+        # RSI > 65 when buying CE = market already overbought → pullback risk
+        # These are the most common cause of correct-direction but losing trades.
+        _rsi_now = getattr(signal, 'rsi', 50)
+        _pe_rsi_floor = float(getattr(settings.trading, 'pe_min_rsi_entry', 40))
+        _ce_rsi_ceil  = float(getattr(settings.trading, 'ce_max_rsi_entry', 65))
+        if option_type == "PE" and _rsi_now < _pe_rsi_floor:
+            msg = (
+                f"Auto PE blocked — RSI {_rsi_now:.1f} < {_pe_rsi_floor:.0f} "
+                f"(market already oversold, high bounce risk)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["RSI_extreme"] = self._filter_blocks.get("RSI_extreme", 0) + 1
+            return
+        if option_type == "CE" and _rsi_now > _ce_rsi_ceil:
+            msg = (
+                f"Auto CE blocked — RSI {_rsi_now:.1f} > {_ce_rsi_ceil:.0f} "
+                f"(market already overbought, pullback risk)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["RSI_extreme"] = self._filter_blocks.get("RSI_extreme", 0) + 1
+            return
+
+        # ── Regime-direction guard ────────────────────────────────────────────
+        # Block CE entries on TRENDING DOWN days and PE on TRENDING UP days.
+        # A "BULLISH" 5-min signal on a day-long bearish trend is often a short
+        # bounce that gets sold — the regime tells us the bigger-picture context.
+        _regime_val = (
+            self._cached_regime.regime.value if self._cached_regime else "UNKNOWN"
+        )
+        if _regime_val == "TRENDING DOWN" and option_type == "CE":
+            msg = (
+                f"Auto CE blocked — regime is TRENDING DOWN "
+                f"(price may be bouncing in a downtrend, not reversing)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["regime_direction"] = self._filter_blocks.get("regime_direction", 0) + 1
+            return
+        if _regime_val == "TRENDING UP" and option_type == "PE":
+            msg = (
+                f"Auto PE blocked — regime is TRENDING UP "
+                f"(price may be pulling back in an uptrend, not reversing)"
+            )
+            logger.info(msg)
+            await self._broadcast_message(msg, "alert")
+            self._filter_blocks["regime_direction"] = self._filter_blocks.get("regime_direction", 0) + 1
+            return
 
         # ── Local AI signal validation (PROMPT 1) ────────────────────────────
         # Calls the locally-hosted LLM (Ollama / LM Studio) to validate confluence,
@@ -3982,7 +4521,7 @@ class TradingBot:
                         if self._cached_regime else "UNKNOWN"
                     ),
                     "vix":                self._cached_vix,
-                    "consecutive_losses": getattr(_daily_stats, "consecutive_losses", 0),
+                    "consecutive_losses": getattr(self.order_manager, "_consecutive_losses", 0),
                     "trades_done_today":  getattr(_daily_stats, "total_trades", 0),
                     "max_trades_per_day": getattr(settings.trading, "max_trades_per_day", 5),
                     # Include macro sentiment from PROMPT 2 (advisory context)
@@ -4164,11 +4703,47 @@ class TradingBot:
             logger.warning(f"[LocalAI] Risk assessment skipped due to error: {_p4_exc}")
 
         # Execute with deep research
+        # ── VIX-based quantity scaling ─────────────────────────────────────────────
+        # At extreme VIX, option premiums are inflated and moves are violent.
+        # Reduce size to limit capital at risk on any single trade.
+        #   VIX > 25 → 1 lot only  (minimum exposure)
+        #   VIX > 20 → halve lots  (half exposure)
+        #   VIX ≤ 20 → full lots   (normal)
+        _vix_now      = self._cached_vix
+        _vix_high     = float(getattr(settings.trading, 'vix_high_threshold', 20.0))
+        _vix_extreme  = float(getattr(settings.trading, 'vix_extreme_threshold', 25.0))
+        _base_qty     = self.order_manager.get_active_quantity()  # = index lot_size
+        _lot_size     = self._active_index.lot_size
+        if _vix_now > _vix_extreme:
+            _scaled_qty = _lot_size   # 1 lot regardless of how many lots base is
+            logger.warning(
+                f"VIX EXTREME {_vix_now:.1f} > {_vix_extreme:.0f} — "
+                f"capping at 1 lot ({_scaled_qty} units)"
+            )
+            await self._broadcast_message(
+                f"⚠️ VIX {_vix_now:.1f} (EXTREME) — position size capped at 1 lot ({_scaled_qty} units)",
+                "alert"
+            )
+        elif _vix_now > _vix_high:
+            _lots        = max(1, _base_qty // _lot_size)          # how many lots normally
+            _halved_lots = max(1, _lots // 2)                      # halved, minimum 1
+            _scaled_qty  = _halved_lots * _lot_size
+            logger.info(
+                f"VIX HIGH {_vix_now:.1f} > {_vix_high:.0f} — "
+                f"halving from {_base_qty} → {_scaled_qty} units ({_halved_lots} lot(s))"
+            )
+            await self._broadcast_message(
+                f"⚠️ VIX {_vix_now:.1f} (HIGH) — quantity halved: {_base_qty} → {_scaled_qty} units",
+                "alert"
+            )
+        else:
+            _scaled_qty = None   # pass None = use default (full lot)
+
         await self._execute_option_with_research(
             signal=signal,
             option_type=option_type,
             requested_strike="ATM",
-            quantity=None,
+            quantity=_scaled_qty,
             source="Auto"
         )
     
@@ -4324,6 +4899,9 @@ class TradingBot:
             elif action == "validate":
                 return await self._handle_validate_command(parts)
             
+            elif action == "forceclose":
+                return await self._handle_force_close(parts)
+
             else:
                 return f"Unknown command: {action}. Type 'help' for available commands."
                 
@@ -4467,6 +5045,58 @@ class TradingBot:
         
         return result.message
     
+    async def _handle_force_close(self, parts: List[str]) -> str:
+        """
+        Force-mark one or all positions as CLOSED in bot memory without placing
+        a broker SELL order. Use when the broker lookup is broken (e.g. wrong
+        index after a switch) and you've already closed the position manually
+        on the broker app.
+
+        Usage:
+          forceclose all            - mark all open positions as closed
+          forceclose <trade_id>     - mark a specific trade as closed
+          forceclose <symbol>       - e.g.  forceclose NIFTY22550PE
+        """
+        if not self.order_manager:
+            return "Order manager not initialized"
+
+        positions = {
+            tid: t for tid, t in self.order_manager._positions.items()
+            if t.status == "OPEN"
+        }
+        if not positions:
+            return "No open positions to force-close."
+
+        target_arg = parts[1].upper() if len(parts) > 1 else "all"
+        closed = []
+
+        for tid, trade in list(positions.items()):
+            if target_arg == "ALL" or tid.upper() == target_arg or target_arg in trade.symbol.upper():
+                trade.status = "CLOSED"
+                # Best-effort P&L: use last known price if available
+                try:
+                    ltp = await self.kite.get_instrument_price(trade.symbol) or 0.0
+                except Exception:
+                    ltp = 0.0
+                if ltp > 0 and trade.price > 0:
+                    pnl = (ltp - trade.price) * trade.quantity
+                    trade.pnl = (trade.pnl or 0.0) + pnl
+                    self.order_manager._daily_pnl += pnl
+                    self.order_manager._save_daily_pnl()
+                closed.append(f"{tid} ({trade.symbol})")
+                logger.warning(
+                    f"[forceclose] {tid} {trade.symbol} marked CLOSED in bot memory "
+                    f"(broker order NOT placed — close manually on broker app if not done)"
+                )
+
+        if not closed:
+            return f"No open position matched '{target_arg}'. Open positions: {', '.join(positions.keys())}"
+
+        msg = f"Force-closed {len(closed)} position(s) in bot memory: {', '.join(closed)}\n⚠️ Verify these are also closed on your broker app!"
+        await self._broadcast_message(msg, "alert")
+        await self._send_telegram_alert(msg, "trade_error")
+        return msg
+
     async def _handle_close_all(self) -> str:
         """Handle close all command"""
         if not self.order_manager:

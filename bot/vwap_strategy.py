@@ -302,11 +302,23 @@ class VWAPStrategy:
     def _fetch_intraday(self) -> Optional[pd.DataFrame]:
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
-            data = ticker.history(period="1d", interval="5m")
+            # Use 2d so yfinance has enough candles early in the session; filter to today after.
+            data = ticker.history(period="2d", interval="5m")
+            if data is not None and not data.empty:
+                try:
+                    from zoneinfo import ZoneInfo as _ZI
+                    _ist2 = _ZI("Asia/Kolkata")
+                    _today_str = datetime.now(_ist2).strftime("%Y-%m-%d")
+                    _idx_ist = data.index.tz_convert(_ist2) if data.index.tz is not None else data.index
+                    _mask = _idx_ist.strftime("%Y-%m-%d") == _today_str
+                    if _mask.any():
+                        data = data[_mask]
+                except Exception:
+                    pass  # fall back to full 2d data if tz filtering fails
             if data is None or data.empty:
                 logger.warning(
                     f"VWAP [{self._index.display_name}]: _fetch_intraday returned empty "
-                    f"(symbol={self._index.yahoo_symbol}, period=1d, interval=5m)"
+                    f"(symbol={self._index.yahoo_symbol}, period=2d, interval=5m)"
                 )
                 return None
             # Log row count + latest candle timestamp in IST

@@ -65,11 +65,32 @@ class TelegramCommandHandler:
     # Public API
     # ------------------------------------------------------------------
 
+    async def _clear_conflicting_sessions(self) -> None:
+        """
+        Call deleteWebhook and drain any pending getUpdates conflicts.
+        Telegram 409 happens when a stale process is still polling.
+        Calling deleteWebhook with drop_pending_updates=True forcibly
+        terminates all other long-poll connections.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{self._base_url}/deleteWebhook",
+                    json={"drop_pending_updates": True},
+                )
+            logger.debug("TelegramCommandHandler: cleared webhook/conflict sessions")
+        except Exception as exc:
+            logger.debug(f"TelegramCommandHandler: deleteWebhook skipped ({exc})")
+
     async def start_polling(self) -> None:
         """Start the long-poll loop (run as asyncio.create_task)."""
         if not self._enabled:
             logger.info("TelegramCommandHandler: disabled (token/chat_id not configured)")
             return
+
+        # Clear any stale webhook or conflicting getUpdates session (409 guard)
+        await self._clear_conflicting_sessions()
+        await asyncio.sleep(1)   # brief pause to let Telegram propagate the disconnect
 
         self._running = True
         logger.info("TelegramCommandHandler: polling started")
@@ -93,6 +114,9 @@ class TelegramCommandHandler:
                 if self._error_count >= self._MAX_ERRORS:
                     logger.error("TelegramCommandHandler: too many errors, stopping poll loop")
                     break
+                # On 409 Conflict, forcibly clear the competing session
+                if "409" in str(exc):
+                    await self._clear_conflicting_sessions()
                 await asyncio.sleep(self._RETRY_SLEEP)
 
         logger.info("TelegramCommandHandler: polling stopped")

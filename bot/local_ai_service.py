@@ -249,6 +249,60 @@ class LocalAIService:
                 reasoning="AI disabled — proceeding with bot's own filters",
             )
 
+        # ── Hard pre-checks: deterministic rules that bypass the LLM entirely ──
+        # These fire BEFORE calling the LLM — saves latency and avoids relying
+        # on a 3B model to correctly apply hard constraints from a long prompt.
+        _vix      = market_context.get("vix", 0.0)
+        _losses   = market_context.get("consecutive_losses", 0)
+        _opt      = market_context.get("option_type", "")
+        _strategy = market_context.get("strategy", "").upper()
+        _hour     = datetime.now().hour
+        _minute   = datetime.now().minute
+        _time_str = datetime.now().strftime("%H:%M")
+
+        # GAP can enter from 9:20 (needs early entry to capture the opening gap).
+        # All other strategies wait until 9:30 (market direction established).
+        _gap_start_minute  = 20   # GAP: allowed from 9:20
+        _other_start_minute = 30  # TREND/ORB/VWAP: allowed from 9:30
+        _is_gap = "GAP" in _strategy
+
+        _rsi_now = getattr(signal, 'rsi', None)
+
+        _hard_skip = None
+        if _vix > 25 and _opt in ("CE", "PE"):
+            _hard_skip = f"VIX {_vix:.1f} > 25 — naked option buying too expensive at extreme volatility"
+        elif _losses >= 2:
+            _hard_skip = f"{_losses} consecutive losses — mandatory pause before next entry"
+        # RSI extreme-crash block: when RSI < 25 on PE entry the market has already
+        # collapsed — premium is IV-inflated and a bounce will stop you out immediately.
+        # Exception: GAP FADE (buying CE after gap-down) intentionally enters when RSI is low.
+        # For PE entries in crash, RSI<25 blocks regardless of strategy.
+        elif _opt == "PE" and _rsi_now is not None and _rsi_now < 25:
+            _hard_skip = (
+                f"RSI {_rsi_now:.1f} < 25 — extreme oversold, PE entered at crash bottom. "
+                f"Premium IV-inflated, bounce will hit SL. Wait for RSI to recover above 30."
+            )
+        elif _opt == "CE" and _rsi_now is not None and _rsi_now > 75:
+            _hard_skip = (
+                f"RSI {_rsi_now:.1f} > 75 — extreme overbought, CE entered at rally peak. "
+                f"Premium IV-inflated, pullback will hit SL. Wait for RSI to cool below 70."
+            )
+        elif _hour >= 14:
+            _hard_skip = f"Time {_time_str} IST past 14:00 — theta decay too fast for new entries"
+        elif _hour == 9 and _minute < _gap_start_minute:
+            _hard_skip = f"Time {_time_str} IST — opening noise window (before 9:20), skip"
+        elif _hour == 9 and _minute < _other_start_minute and not _is_gap:
+            _hard_skip = f"Time {_time_str} IST — {_strategy or 'non-GAP'} waits until 9:30 for market direction"
+
+        if _hard_skip:
+            logger.info(f"[LocalAI] Hard-SKIP (no LLM call): {_hard_skip}")
+            return AIValidationResult(
+                suggested_action="SKIP",
+                confidence=5,
+                reasoning=_hard_skip,
+                fallback=False,
+            )
+
         prompt = self._build_validation_prompt(signal, market_context)
 
         t0 = asyncio.get_event_loop().time()
@@ -556,67 +610,44 @@ class LocalAIService:
         # Estimated R:R from ATR (1 ATR SL, 2 ATR target → 1:2)
         if atr > 0 and signal.current_price > 0:
             atr_pct = atr / signal.current_price * 100
-            rr_note = f"ATR={atr:.1f} ({atr_pct:.2f}% of spot) → estimated SL ~{atr_pct:.1f}%, target ~{atr_pct*2:.1f}% (1:2 R:R)"
+            rr_note = f"ATR={atr:.1f} ({atr_pct:.2f}% of spot)"
         else:
-            rr_note = "ATR unavailable — R:R cannot be estimated"
+            rr_note = "ATR unavailable"
 
-        prompt = f"""You are an expert Indian options trader reviewing a NIFTY/BANKNIFTY intraday signal.
+        # Count confluence before sending to LLM (so prompt is shorter)
+        _conf = 0
+        if option_type == "CE":
+            if ema9 > ema21 > 0: _conf += 1
+            if macd_hist > 0: _conf += 1
+            if vwap > 0 and signal.current_price > vwap: _conf += 1
+            if supert_dir == "UP": _conf += 1
+        else:
+            if ema9 < ema21 and ema21 > 0: _conf += 1
+            if macd_hist < 0: _conf += 1
+            if vwap > 0 and signal.current_price < vwap: _conf += 1
+            if supert_dir == "DOWN": _conf += 1
 
-## CURRENT SIGNAL
-- Direction  : {signal.trend.value} → BUY {option_type}
-- Strength   : {signal.strength:.0f}%
-- Index Price: ₹{signal.current_price:,.2f}
-- Time       : {time_str}
-- Recommendation: {signal.recommendation}
+        # Compact prompt — llama3.2 (3B) performs better on short structured prompts
+        prompt = f"""You are an expert Indian F&O intraday trader. Decide whether to EXECUTE or SKIP this trade.
 
-## TECHNICAL INDICATORS
-- EMA Alignment    : {ema_alignment}
-- MACD Histogram   : {macd_label} ({macd_hist:+.4f})
-- RSI (14)         : {signal.rsi:.1f} — {rsi_label}
-- Stoch RSI        : {stoch_rsi:.1f}
-- VWAP Position    : {vwap_position}
-- Bollinger Bands  : {boll_label}
-- Supertrend Dir   : {supert_dir}
-- SMA 20           : {signal.sma_short:.2f}
-- SMA 50           : {signal.sma_long:.2f}
+SIGNAL: BUY {option_type} | Strength {signal.strength:.0f}% | RSI {signal.rsi:.1f} | {time_str}
+CONFLUENCE: {_conf}/4 indicators agree ({ema_alignment}, MACD {macd_label}, {vwap_position}, Supertrend {supert_dir})
+CONTEXT: VIX {vix:.1f} | Regime {regime} | Losses today {consecutive_losses} | {trades_done_today}/{max_trades} trades used | {rr_note}
+MACRO: {macro_sentiment} ({macro_conditions})
 
-## RISK CONTEXT
-- {rr_note}
-- India VIX        : {vix:.1f} {"(HIGH >20 — expensive premiums)" if vix > 20 else "(normal)"}
-- Consecutive losses this session: {consecutive_losses}
-- Trades done today: {trades_done_today} / {max_trades} allowed
-- Market regime    : {regime}
-- Macro sentiment  : {macro_sentiment} ({macro_conditions} conditions — from session-level AI assessment)
+RULES — SKIP if ANY apply:
+- Confluence < 2 → SKIP (not enough indicators agree)
+- Signal strength < 55% → SKIP
+- VIX > 20 AND confluence < 3 → SKIP (high volatility needs strong signal)
+- Regime RANGING and signal strength < 65% → SKIP
 
-## CRITICAL RULES (non-negotiable)
-1. NEVER enter between 9:15–9:20 IST (opening noise — already enforced by bot)
-2. AVOID 11:30–12:30 IST (lunch — low volume, wide spreads)
-3. AVOID after 14:00 IST (theta decay accelerates, thin liquidity)
-4. R:R must be at least 1:2 (risk ₹1 to make ₹2)
-5. REDUCE confidence by 15 pts if consecutive_losses >= 2 (loss-fatigue)
-6. STRONG BUY requires confluence >= 3 (at least 3 of 4 indicators agree)
-7. HOLD/SKIP if confluence < 2
-8. HIGH VIX (>25) favours short premium plays — bias toward SKIP for naked option buying
+EXECUTE if ALL apply:
+- Confluence >= 3
+- Signal strength >= 60%
+- Time between 9:20 and 13:30
 
-## YOUR TASK
-Evaluate the signal. Count the confluence:
-  +1 if EMA9 > EMA21 (for CE) or EMA9 < EMA21 (for PE)
-  +1 if MACD histogram confirms direction
-  +1 if price is above/below VWAP correctly
-  +1 if Supertrend direction confirms
-
-Respond ONLY with valid JSON (no markdown, no backticks, no extra text):
-{{
-  "recommendation": "<STRONG BUY CE|BUY CE|BUY PE|STRONG BUY PE|HOLD|SKIP>",
-  "confidence": <0-100>,
-  "reasoning": "<one sentence explaining the key factor>",
-  "confluence_count": <0-4>,
-  "market_sentiment": "<BULLISH|BEARISH|NEUTRAL>",
-  "risks": ["<risk 1>", "<risk 2>"],
-  "opportunities": ["<opportunity 1>"],
-  "time_suitability": <true|false>,
-  "suggested_action": "<EXECUTE|SKIP|WAIT>"
-}}"""
+Reply with ONLY this JSON (no markdown):
+{{"suggested_action": "EXECUTE" or "SKIP" or "WAIT", "confidence": 0-100, "confluence_count": {_conf}, "reasoning": "one sentence", "market_sentiment": "BULLISH" or "BEARISH" or "NEUTRAL", "risks": ["risk1"], "opportunities": ["opp1"], "time_suitability": true or false, "recommendation": "BUY {option_type}" or "SKIP"}}"""
 
         return prompt
 

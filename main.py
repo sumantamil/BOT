@@ -56,12 +56,23 @@ def run_server():
     logger.info("Starting NIFTY Trading Bot Web Server...")
     logger.info(f"Open http://{settings.web.host}:{settings.web.port} in your browser")
 
-    # ── Ollama health check ────────────────────────────────────────────────
-    # If AI is enabled, verify the local LLM server is reachable before the
-    # bot starts; warn (but don't exit) if it isn't so paper-trading still works.
+    # ── Ollama health check + auto-start ──────────────────────────────────
+    # If AI is enabled, verify the local LLM server is reachable.  If not,
+    # automatically launch `ollama serve` in the background and wait up to
+    # 15 s for it to become ready before continuing.
     if settings.ai.enabled:
         import httpx as _httpx
-        try:
+        import subprocess as _subprocess
+        import time as _time
+
+        def _ollama_ready(timeout: float = 5.0) -> bool:
+            try:
+                _r = _httpx.get(f"{settings.ai.base_url}/api/tags", timeout=timeout)
+                return _r.status_code == 200
+            except Exception:
+                return False
+
+        if _ollama_ready():
             _r = _httpx.get(f"{settings.ai.base_url}/api/tags", timeout=5)
             _models = [m.get("name", "") for m in _r.json().get("models", [])]
             _model_found = any(settings.ai.model in m for m in _models)
@@ -76,13 +87,45 @@ def run_server():
                     f"  Available: {_models}\n"
                     f"  Download with: ollama pull {settings.ai.model}"
                 )
-        except Exception as _ollama_err:
-            logger.warning(
-                f"[LocalAI] Ollama not reachable at {settings.ai.base_url} — "
-                f"AI validation will fall back to EXECUTE on every signal.\n"
-                f"  Start the server with: ollama serve\n"
-                f"  Error: {_ollama_err}"
-            )
+        else:
+            logger.info("[LocalAI] Ollama not running — starting it automatically...")
+            try:
+                _subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=_subprocess.DEVNULL,
+                    stderr=_subprocess.DEVNULL,
+                    creationflags=_subprocess.CREATE_NO_WINDOW if hasattr(_subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+                # Wait up to 15 s for Ollama to become ready
+                _deadline = _time.time() + 15
+                while _time.time() < _deadline:
+                    _time.sleep(1)
+                    if _ollama_ready(timeout=2.0):
+                        _r = _httpx.get(f"{settings.ai.base_url}/api/tags", timeout=5)
+                        _models = [m.get("name", "") for m in _r.json().get("models", [])]
+                        _model_found = any(settings.ai.model in m for m in _models)
+                        if _model_found:
+                            logger.info(
+                                f"[LocalAI] Ollama started \u2714  model={settings.ai.model}  "
+                                f"({len(_models)} model(s) available)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[LocalAI] Ollama started but model '{settings.ai.model}' not found.\n"
+                                f"  Available: {_models}\n"
+                                f"  Download with: ollama pull {settings.ai.model}"
+                            )
+                        break
+                else:
+                    logger.warning(
+                        "[LocalAI] Ollama did not respond within 15 s — "
+                        "AI validation will fall back to EXECUTE on every signal."
+                    )
+            except FileNotFoundError:
+                logger.warning(
+                    "[LocalAI] 'ollama' command not found — AI validation disabled.\n"
+                    "  Install from: https://ollama.com/"
+                )
 
     def _open_browser():
         try:

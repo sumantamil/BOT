@@ -167,14 +167,30 @@ class DhanBroker:
         if self._ip_block_alerted:
             return
         self._ip_block_alerted = True
+
+        # Try to fetch the current public IP so the alert is actionable
+        public_ip = "unknown"
+        try:
+            import urllib.request
+            with urllib.request.urlopen("https://api.ipify.org", timeout=5) as _r:
+                public_ip = _r.read().decode().strip()
+        except Exception:
+            try:
+                import urllib.request
+                with urllib.request.urlopen("https://ifconfig.me/ip", timeout=5) as _r:
+                    public_ip = _r.read().decode().strip()
+            except Exception:
+                pass
+
         msg = (
             "🚨 *DH-905 INVALID IP — TRADING BLOCKED!*\n"
             "All orders are failing with DH-905 (Invalid IP).\n\n"
+            f"Your current public IP: `{public_ip}`\n\n"
             "Fix now:\n"
             "1. Go to https://developer.dhanhq.co\n"
-            "2. Click your App → Edit → add your current IP\n"
-            "3. Also check https://web.dhan.co → DhanHQ Trading APIs → Manage Token → IP Whitelist\n"
-            "4. Restart the bot after whitelisting.\n\n"
+            f"2. App → Edit → add `{public_ip}` to IP whitelist\n"
+            "3. Also: https://web.dhan.co → DhanHQ Trading APIs → Manage Token → IP Whitelist\n"
+            "4. Restart the bot after saving.\n\n"
             "⚠️ Auto-trading is PAUSED until IP is whitelisted."
         )
         if callable(self._token_expired_cb):
@@ -508,6 +524,15 @@ class DhanBroker:
 
         sec_id = self._get_security_id(index.name, strike, option_type.value, expiry_date)
         if not sec_id:
+            # Cache miss — force a fresh download and retry once before giving up.
+            logger.warning(
+                f"Dhan: security_id not found for {index.name} {strike} {option_type.value} "
+                f"expiry {expiry_date} — forcing instrument master refresh and retrying"
+            )
+            self._instruments_loaded_date = None   # invalidate cache
+            await self._ensure_instruments_loaded()
+            sec_id = self._get_security_id(index.name, strike, option_type.value, expiry_date)
+        if not sec_id:
             msg = (f"Dhan: Could not find security_id for {index.name} {strike} "
                    f"{option_type.value} expiry {expiry_date} — "
                    f"instrument master may need refresh")
@@ -562,8 +587,15 @@ class DhanBroker:
                 msg = f"Dhan order failed: {response}"
 
                 if _err_code == "DH-905":
+                    _pub_ip = "unknown"
+                    try:
+                        import urllib.request as _ur
+                        with _ur.urlopen("https://api.ipify.org", timeout=4) as _r:
+                            _pub_ip = _r.read().decode().strip()
+                    except Exception:
+                        pass
                     msg += (
-                        " | DH-905 Invalid IP: whitelist your current public IP in "
+                        f" | DH-905 Invalid IP (your IP: {_pub_ip}): whitelist it in "
                         "developer.dhanhq.co (App -> Edit -> IP) and web.dhan.co "
                         "(DhanHQ Trading APIs -> Manage Token -> IP Whitelist), then restart the bot."
                     )
@@ -983,13 +1015,9 @@ class DhanBroker:
         trigger_price = round(entry_price * (1 - stop_loss_pct / 100), 1)
         limit_price   = round(trigger_price * 0.98, 1)
         dhan_exchange = _EXCHANGE_BSE_FO if "BSE" in exchange.upper() else _EXCHANGE_NSE_FNO
-        # Forever Orders on BSE_FNO (SENSEX/BANKEX) require MARGIN.
-        # For NSE_FNO INTRADAY options, Dhan Forever Orders use INTRADAY product —
-        # the order triggers intraday and is scoped to the same session.
-        if dhan_exchange == _EXCHANGE_BSE_FO:
-            product = _PRODUCT_MARGIN
-        else:
-            product = _PRODUCT_INTRADAY
+        # Dhan Forever Order API only accepts MARGIN for F&O segments (both NSE_FNO and BSE_FO).
+        # INTRADAY is valid for regular orders but is rejected by place_forever → DH-905.
+        product = _PRODUCT_MARGIN
 
         try:
             resp = await asyncio.to_thread(

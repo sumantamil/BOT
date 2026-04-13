@@ -53,11 +53,15 @@ class AIValidationGateway:
             }
         
         try:
+            # Forward strategy name so local_ai_service can apply strategy-specific time rules
+            market_context = dict(market_context, strategy=strategy_name)
             # Call PROMPT 1: Signal validation
             ai_result = await self.ai_service.validate_signal(signal, market_context)
             
             # Map AI response to gateway response
-            approved = ai_result.suggested_action != "SKIP"
+            # WAIT and SKIP both block the trade — only EXECUTE proceeds.
+            # Previously WAIT was treated as approved (bug: trade went through anyway).
+            approved = ai_result.suggested_action == "EXECUTE"
             boosted = getattr(signal, 'strength', 70)
             
             if ai_result.suggested_action == "EXECUTE":

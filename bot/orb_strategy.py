@@ -263,11 +263,24 @@ class ORBStrategy:
     def _fetch_intraday(self) -> pd.DataFrame:
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
-            data = ticker.history(period="1d", interval="5m")
+            # Use 2d period so yfinance always has enough candles even early in the session.
+            # Filter to today's date afterwards so ORB range stays intraday-only.
+            data = ticker.history(period="2d", interval="5m")
+            if not data.empty:
+                try:
+                    from zoneinfo import ZoneInfo
+                    _ist = ZoneInfo("Asia/Kolkata")
+                    _today_str = datetime.now(_ist).strftime("%Y-%m-%d")
+                    _idx_ist = data.index.tz_convert(_ist) if data.index.tz is not None else data.index
+                    _today_mask = _idx_ist.strftime("%Y-%m-%d") == _today_str
+                    if _today_mask.any():
+                        data = data[_today_mask]
+                except Exception:
+                    pass  # fall back to full 2d data if tz filtering fails
             if data.empty:
                 logger.warning(
                     f"ORB [{self._index.display_name}]: _fetch_intraday returned empty "
-                    f"(symbol={self._index.yahoo_symbol}, period=1d, interval=5m)"
+                    f"(symbol={self._index.yahoo_symbol}, period=2d, interval=5m)"
                 )
                 return pd.DataFrame()
             # Log row count + latest candle timestamp in IST

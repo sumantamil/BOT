@@ -64,12 +64,12 @@ class MarketRegimeDetector:
     def analyze(self) -> Optional[RegimeAnalysis]:
         try:
             ticker = yf.Ticker(self._index.yahoo_symbol)
-            data = ticker.history(period="3mo", interval="1d")
+            data = ticker.history(period="4mo", interval="1d")
         except Exception as e:
             logger.error(f"Regime detection data fetch failed: {e}")
             return None
 
-        if data.empty or len(data) < 60:
+        if data.empty or len(data) < 50:
             return None
 
         adx = self._calculate_adx(data)

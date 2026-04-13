@@ -162,14 +162,38 @@ class TrendAnalyzer:
         return data['Close'].ewm(span=period, adjust=False).mean()
     
     def calculate_vwap(self, data: pd.DataFrame) -> pd.Series:
-        """Calculate Volume Weighted Average Price"""
+        """Calculate intraday VWAP — resets at the start of each trading day.
+        When data spans multiple days (e.g. 2d period), cumsum() without a
+        daily reset produces a multi-day average that lags far behind price.
+        Fixing: filter to today's rows before cumsum so VWAP = today's 9:15 reset.
+        """
         typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-        if 'Volume' in data.columns and data['Volume'].sum() > 0:
-            vwap = (typical_price * data['Volume']).cumsum() / data['Volume'].cumsum()
-        else:
-            # Fallback to typical price if volume data unavailable
-            vwap = typical_price.rolling(window=20).mean()
-        return vwap
+        if 'Volume' not in data.columns or data['Volume'].sum() == 0:
+            return typical_price.rolling(window=20).mean()
+
+        # Identify today's rows
+        try:
+            from datetime import date as _date
+            _today = datetime.now().date()
+            _today_mask = pd.Series(
+                [(ts.date() == _today if hasattr(ts, 'date') else False)
+                 for ts in data.index],
+                index=data.index,
+            )
+            if _today_mask.sum() >= 5:          # enough today candles
+                today_tp  = typical_price[_today_mask]
+                today_vol = data['Volume'][_today_mask]
+                today_vwap = (today_tp * today_vol).cumsum() / today_vol.cumsum()
+                # Reindex back to full frame — prior-day rows get NaN, filled with
+                # yesterday's close so downstream code doesn't get NaN comparisons.
+                full_vwap = today_vwap.reindex(data.index)
+                full_vwap = full_vwap.fillna(method='bfill').fillna(method='ffill')
+                return full_vwap
+        except Exception:
+            pass  # fall through to cumsum fallback
+
+        # Fallback: standard cumsum (multi-day if period > 1d)
+        return (typical_price * data['Volume']).cumsum() / data['Volume'].cumsum()
     
     def calculate_bollinger_bands(self, data: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
         """
@@ -218,26 +242,27 @@ class TrendAnalyzer:
             atr_pct = atr_value
         
         # Adaptive thresholds based on volatility
-        if atr_pct > 2.0:  # Very high volatility (>2%)
-            return 50  # Aggressive - many opportunities
+        # IMPORTANT: High ATR (VIX 25+) does NOT mean lower threshold.
+        # More volatility = MORE noise = need HIGHER quality signal to avoid fakeouts.
+        # Old logic (high ATR → 50% threshold) was letting in every whipsaw signal on crash days.
+        if atr_pct > 2.0:  # Very high volatility (>2%) — crash/panic day
+            return 65  # RAISED from 50: need strong signal to trade in a panic
         elif atr_pct > 1.5:  # High volatility (1.5-2%)
-            return 55  # More aggressive
+            return 63  # RAISED from 55
         elif atr_pct > 1.0:  # Moderate volatility (1-1.5%)
-            return 60  # Balanced
+            return 62  # Balanced
         elif atr_pct > 0.5:  # Low volatility (0.5-1%)
             return 65  # Conservative+
         else:  # Very low volatility (<0.5%) OR spot_price unavailable
             # Fall back to absolute ATR value.
             # Indian F&O index typical 5m ATR ranges:
             #   BANKNIFTY: 50-100 pts | SENSEX: 60-100 pts | NIFTY: 15-30 pts
-            # The old thresholds (>100→65, else→70) caused BANKNIFTY/SENSEX
-            # (ATR 60-80) to always return 70 — too restrictive for strong-trend days.
             if atr_value > 300:
-                return 50
+                return 65  # RAISED from 50
             elif atr_value > 220:
-                return 55
+                return 65  # RAISED from 55
             elif atr_value > 150:
-                return 60
+                return 64  # RAISED from 60
             elif atr_value > 80:
                 return 63
             elif atr_value > 50:

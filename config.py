@@ -75,10 +75,14 @@ class TradingConfig(BaseSettings):
     # max_loss_per_trade = 5% of capital  (20% SL on ₹6,500 NIFTY lot ≈ ₹1,300 — well within limit)
     # max_daily_loss    = 10% of capital  (~3 SL hits before bot halts for the day)
     max_loss_per_trade: float = Field(default=2250.0, description="Max loss per trade in INR (5%% of ₹45k capital)")
+    max_profit_per_trade: float = Field(default=0.0, description="Arms trailing stop once P&L reaches this INR amount (0 = disabled). Does NOT close immediately — use hard_profit_target_inr for that.")
+    hard_profit_target_inr: float = Field(default=0.0, description="Close trade IMMEDIATELY when P&L reaches this INR amount (0 = disabled). Like max_loss_per_trade but for profit — books gains before reversals.")
     max_daily_loss: float = Field(default=6000.0, description="Max daily loss in INR (~13%% of ₹45k capital)")
     stop_loss_percentage: float = Field(default=20.0, description="Stop loss percentage")
     target_percentage: float = Field(default=50.0, description="Target profit percentage")
-    
+    pe_min_rsi_entry: float = Field(default=40.0, description="Block PE auto-entry when RSI < this value (market already oversold, bounce risk)")
+    ce_max_rsi_entry: float = Field(default=65.0, description="Block CE auto-entry when RSI > this value (market already overbought, pullback risk)")
+    min_signal_strength: float = Field(default=70.0, description="Minimum signal strength %% to allow a trade (paper data: sub-70 trades mostly TIME_STOP exits at +2.5%)")
     # Trailing stop loss
     use_trailing_stop_loss: bool = Field(default=True, description="Enable trailing stop loss")
     trailing_stop_percentage: float = Field(default=12.0, description="Trailing stop loss percentage (distance from highest price)")
@@ -115,6 +119,11 @@ class TradingConfig(BaseSettings):
     take_profit_tier_2_quantity_percent: float = Field(default=50.0, description="Percentage of remaining position to exit at tier 2")
     # After both tiers hit, use a tighter trail to protect the final runner.
     tight_trail_after_tier2_pct: float = Field(default=5.0, description="Trailing stop %% used after BOTH tiers hit (default 5%% vs 12%% normal)")
+    # Mid-run profit protection: tighten the trail once peak P&L crosses a threshold.
+    # e.g. once the trade has locked ₹800+ peak profit, drop trail from 12% → 6%
+    # so a ₹1500 profit doesn't bleed back to ₹800 before the trail fires.
+    trail_tighten_at_inr: float = Field(default=800.0, description="Tighten trail when peak P&L crosses this INR (0=disabled)")
+    trail_tighten_pct: float = Field(default=6.0, description="Trail %% to use once peak P&L exceeds trail_tighten_at_inr")
 
     # Hard time exit: close all positions entered BEFORE this hour once clock reaches it.
     # Prevents theta decay eating intraday gains in the illiquid 13:00–14:30 window.
@@ -132,6 +141,8 @@ class TradingConfig(BaseSettings):
     # Sweet spot for option BUYING: VIX 12–20. Above 20 = premiums too expensive.
     vix_filter_enabled: bool = Field(default=True, description="Skip new auto-entries when India VIX > vix_max")
     vix_max: float = Field(default=20.0, description="Max India VIX for entry — above this premiums are too costly for buyers")
+    vix_high_threshold: float = Field(default=20.0, description="VIX above this → halve position size (high volatility surcharge)")
+    vix_extreme_threshold: float = Field(default=25.0, description="VIX above this → minimum 1 lot only (extreme volatility)")
 
     # IV Percentile filter: blocks entries when strike-level IV is historically expensive.
     # Percentile is computed from a rolling 30-day ATM IV history stored in .iv_history.json.
@@ -664,6 +675,7 @@ DHAN_ACCESS_TOKEN=your_dhan_permanent_access_token
 TRADING_DEFAULT_QUANTITY=65
 TRADING_MAX_POSITIONS=2
 TRADING_MAX_LOSS_PER_TRADE=2250
+TRADING_MAX_PROFIT_PER_TRADE=500          # close immediately at ₹500 profit (0 = disabled)
 TRADING_MAX_DAILY_LOSS=4500
 TRADING_STOP_LOSS_PERCENTAGE=20
 TRADING_TARGET_PERCENTAGE=30
@@ -700,6 +712,8 @@ TRADING_TAKE_PROFIT_TIER_1_QUANTITY_PERCENT=50
 TRADING_TAKE_PROFIT_TIER_2_PERCENT=60
 TRADING_TAKE_PROFIT_TIER_2_QUANTITY_PERCENT=50
 TRADING_TIGHT_TRAIL_AFTER_TIER2_PCT=5    # trail tightens to 5% after both targets hit
+TRADING_TRAIL_TIGHTEN_AT_INR=800         # tighten trail once peak P&L crosses ₹800
+TRADING_TRAIL_TIGHTEN_PCT=6              # trail % to use once above threshold (6% vs 12% normal)
 
 # Hard time exit: close pre-13:00 positions at 13:00 IST to avoid theta decay
 TRADING_HARD_TIME_EXIT_HOUR=13           # set 0 to disable

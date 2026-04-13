@@ -44,6 +44,7 @@ class TradeRecord:
     gtt_id: Optional[int] = None  # Kite GTT stop-loss order ID (exchange-level safety net)
     lot_size: int = 1               # index lot size at entry — used for partial-exit calc
     source: str = "Manual"          # GAP | ORB | VWAP | Auto | EOD | Rule | Manual
+    index_name: str = ""            # index name at entry (NIFTY/BANKNIFTY/SENSEX) — used for close
     vix_at_entry: float = 0.0       # India VIX at time of entry (0 = not captured / manual trade)
     slippage: float = 0.0           # fill_price − pre_order_ltp in ₹; positive = paid more than expected
     # Greeks & IV at entry — populated by iv_monitor after each successful entry
@@ -52,6 +53,7 @@ class TradeRecord:
     delta_at_entry: float = 0.0         # Option delta (CE: 0–1, PE: -1–0)
     theta_daily_at_entry: float = 0.0   # Daily theta in ₹ per unit at entry (negative)
     vega_at_entry: float = 0.0          # Vega: ₹ change per 1% IV move per unit
+    profit_protection: bool = False     # True after failed close at profit — trail tightens to 3%
 
 
 @dataclass
@@ -112,11 +114,28 @@ class OrderManager:
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self._pnl_file = os.path.join(_base, ".daily_pnl.json")
         self._daily_pnl = self._load_daily_pnl()
+
+        # Persist open positions to disk so restarts can reload and monitor them.
+        # File: <workspace>/.open_positions.json
+        self._positions_file = os.path.join(_base, ".open_positions.json")
+        self._load_positions()
     
     def set_active_index(self, index_config: IndexConfig):
         """Set the active trading index (NIFTY, BANKNIFTY, SENSEX)"""
         self._active_index = index_config
+        # Sync default_quantity to the new index's lot_size so that the 'set qty'
+        # command and any path that reads default_quantity stays aligned with the
+        # active index (prevents BANKNIFTY/SENSEX trades using the NIFTY default of 65).
+        settings.trading.default_quantity = index_config.lot_size
         logger.info(f"📊 OrderManager switched to {index_config.display_name} (lot_size: {index_config.lot_size})")
+
+    def get_active_quantity(self) -> int:
+        """Get the trading quantity for the current index.
+        Returns settings.trading.default_quantity so that 'set qty N' overrides
+        are respected. The value is kept in sync with the current index's lot_size
+        by set_active_index(), so it always starts at the correct lot size.
+        """
+        return settings.trading.default_quantity
     
     def get_active_quantity(self) -> int:
         """Get the trading quantity for the current index (uses lot size)"""
@@ -129,27 +148,130 @@ class OrderManager:
         return f"TRD_{datetime.now().strftime('%Y%m%d')}_{self._trade_counter:04d}"
     
     def _load_daily_pnl(self) -> float:
-        """Load today's realized P&L from disk (survives bot restarts)."""
+        """Load today's realized P&L, consecutive losses, and trade count from disk."""
         try:
             if os.path.exists(self._pnl_file):
                 with open(self._pnl_file, "r") as f:
                     data = json.load(f)
                 if data.get("date") == date.today().isoformat():
                     pnl = float(data.get("pnl", 0.0))
-                    if pnl != 0.0:
-                        logger.info(f"Loaded persisted daily P&L: ₹{pnl:,.2f}")
+                    # Restore consecutive losses so a restart doesn't reset protection
+                    self._consecutive_losses = int(data.get("consecutive_losses", 0))
+                    # Restore daily trade count so the per-day cap survives restart
+                    self._daily_stats.total_trades = int(data.get("total_trades", 0))
+                    self._daily_stats.winning_trades = int(data.get("winning_trades", 0))
+                    self._daily_stats.losing_trades = int(data.get("losing_trades", 0))
+                    if pnl != 0.0 or self._consecutive_losses > 0:
+                        logger.info(
+                            f"Loaded persisted daily state: P&L=₹{pnl:,.2f} "
+                            f"consec_losses={self._consecutive_losses} "
+                            f"trades={self._daily_stats.total_trades}"
+                        )
                     return pnl
         except Exception as e:
             logger.debug(f"Could not load daily P&L file: {e}")
         return 0.0
 
     def _save_daily_pnl(self):
-        """Persist today's realized P&L to disk."""
+        """Persist today's realized P&L, consecutive losses, and trade count to disk."""
         try:
             with open(self._pnl_file, "w") as f:
-                json.dump({"date": date.today().isoformat(), "pnl": self._daily_pnl}, f)
+                json.dump({
+                    "date":               date.today().isoformat(),
+                    "pnl":                self._daily_pnl,
+                    "consecutive_losses": self._consecutive_losses,
+                    "total_trades":       self._daily_stats.total_trades,
+                    "winning_trades":     self._daily_stats.winning_trades,
+                    "losing_trades":      self._daily_stats.losing_trades,
+                }, f)
         except Exception as e:
             logger.debug(f"Could not save daily P&L file: {e}")
+
+    def _save_positions(self):
+        """Persist all open positions to disk so restarts can reload and monitor them."""
+        try:
+            data = {}
+            for tid, t in self._positions.items():
+                if t.status != "OPEN":
+                    continue
+                data[tid] = {
+                    "trade_id":               t.trade_id,
+                    "symbol":                 t.symbol,
+                    "option_type":            t.option_type.value if hasattr(t.option_type, "value") else str(t.option_type),
+                    "strike":                 t.strike,
+                    "order_type":             t.order_type.value if hasattr(t.order_type, "value") else str(t.order_type),
+                    "quantity":               t.quantity,
+                    "price":                  t.price,
+                    "timestamp":              t.timestamp.isoformat(),
+                    "status":                 t.status,
+                    "highest_price":          t.highest_price,
+                    "tier1_exited":           t.tier1_exited,
+                    "tier2_exited":           t.tier2_exited,
+                    "gtt_id":                 t.gtt_id,
+                    "lot_size":               t.lot_size,
+                    "source":                 t.source,
+                    "index_name":             t.index_name,
+                    "vix_at_entry":           t.vix_at_entry,
+                    "slippage":               t.slippage,
+                    "iv_pct_at_entry":        t.iv_pct_at_entry,
+                    "iv_percentile_at_entry": t.iv_percentile_at_entry,
+                    "delta_at_entry":         t.delta_at_entry,
+                    "theta_daily_at_entry":   t.theta_daily_at_entry,
+                    "vega_at_entry":          t.vega_at_entry,
+                    "profit_protection":      getattr(t, "profit_protection", False),
+                }
+            with open(self._positions_file, "w") as f:
+                json.dump({"date": date.today().isoformat(), "positions": data}, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save positions to disk: {e}")
+
+    def _load_positions(self):
+        """Reload today's open positions from disk on startup."""
+        try:
+            if not os.path.exists(self._positions_file):
+                return
+            with open(self._positions_file, "r") as f:
+                saved = json.load(f)
+            if saved.get("date") != date.today().isoformat():
+                logger.info("Positions file is from a previous day — skipping reload")
+                return
+            loaded = 0
+            for tid, d in saved.get("positions", {}).items():
+                t = TradeRecord(
+                    trade_id=d["trade_id"],
+                    symbol=d["symbol"],
+                    option_type=OptionType[d["option_type"]],
+                    strike=int(d["strike"]),
+                    order_type=OrderType[d["order_type"]],
+                    quantity=int(d["quantity"]),
+                    price=float(d["price"]),
+                    timestamp=datetime.fromisoformat(d["timestamp"]),
+                    status=d.get("status", "OPEN"),
+                    highest_price=float(d.get("highest_price", 0.0)),
+                    tier1_exited=bool(d.get("tier1_exited", False)),
+                    tier2_exited=bool(d.get("tier2_exited", False)),
+                    gtt_id=d.get("gtt_id"),
+                    lot_size=int(d.get("lot_size", 1)),
+                    source=d.get("source", "Manual"),
+                    index_name=d.get("index_name", ""),
+                    vix_at_entry=float(d.get("vix_at_entry", 0.0)),
+                    slippage=float(d.get("slippage", 0.0)),
+                    iv_pct_at_entry=float(d.get("iv_pct_at_entry", 0.0)),
+                    iv_percentile_at_entry=float(d.get("iv_percentile_at_entry", 0.0)),
+                    delta_at_entry=float(d.get("delta_at_entry", 0.0)),
+                    theta_daily_at_entry=float(d.get("theta_daily_at_entry", 0.0)),
+                    vega_at_entry=float(d.get("vega_at_entry", 0.0)),
+                    profit_protection=bool(d.get("profit_protection", False)),
+                )
+                if t.status == "OPEN":
+                    self._positions[tid] = t
+                    _hkey = (t.option_type.value, t.strike)
+                    self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + t.quantity
+                    loaded += 1
+            if loaded:
+                logger.info(f"Reloaded {loaded} open position(s) from disk after restart")
+        except Exception as e:
+            logger.warning(f"Could not load positions from disk: {e}")
 
     def _reset_daily_stats_if_needed(self):
         """Reset daily stats if it's a new day"""
@@ -391,6 +513,7 @@ class OrderManager:
                 timestamp=datetime.now(),
                 status="OPEN",
                 lot_size=self._active_index.lot_size,
+                index_name=self._active_index.name,
             )
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
@@ -398,6 +521,8 @@ class OrderManager:
             # Track held qty for over-sell guard
             _hkey = (option_type.value, strike)
             self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + quantity
+            self._save_daily_pnl()  # persist trade count so restart doesn't reset daily limit
+            self._save_positions()  # persist position so restart can resume SL/target monitoring
             logger.info(f"Trade recorded: {trade.trade_id} | fill=₹{option_ltp:.2f}")
 
             # Place GTT exchange-level stop-loss on the option premium (survives bot crash/restart)
@@ -528,6 +653,7 @@ class OrderManager:
                 status="OPEN",
                 lot_size=self._active_index.lot_size,
                 source=source,
+                index_name=self._active_index.name,
             )
             self._positions[trade.trade_id] = trade
             self._daily_stats.total_trades += 1
@@ -535,6 +661,7 @@ class OrderManager:
             # Track held qty for over-sell guard
             _hkey = (opt_type.value, strike)
             self._held_qty[_hkey] = self._held_qty.get(_hkey, 0) + quantity
+            self._save_daily_pnl()  # persist trade count so restart doesn't reset daily limit
             # Wait 2s for the order to settle in the broker's book before querying.
             # This ensures the trailing-stop / SL calculations use the real fill price,
             # not a stale LTP snapshot that may differ by 0.5–2 points.
@@ -587,6 +714,7 @@ class OrderManager:
                     trade.gtt_id = gtt_id
                 except Exception as e:
                     logger.warning(f"GTT placement after manual order failed: {e}")
+            self._save_positions()  # persist final trade record (with fill price + gtt_id)
 
         return result
     
@@ -626,19 +754,68 @@ class OrderManager:
 
         qty_to_close = partial_qty if partial_qty and partial_qty < target.quantity else target.quantity
 
-        # Always try to parse index from Dhan dash-format symbol
-        # (e.g. "NIFTY-Mar2026-23250-CE") so we don't depend on the broker's
-        # _active_index which may have been switched by the UI since entry.
+        # Resolve the index the position was OPENED under — never use _active_index
+        # because the user may have switched index via UI after entry.
         effective_strike = target.strike
         index_override = None
-        m = re.match(r'^([A-Za-z]+)-\w+-(\d+)-(CE|PE)$', target.symbol, re.IGNORECASE)
-        if m:
-            if effective_strike == 0:
-                effective_strike = int(m.group(2))
-            try:
-                index_override = get_index(m.group(1).upper())
-            except Exception:
-                logger.debug(f"close_position: unknown index '{m.group(1)}' — using active index")
+
+        # 1) Prefer the stamped index_name on the trade record (most reliable)
+        if target.index_name:
+            index_override = get_index(target.index_name)
+
+        # 2) Fallback: parse Dhan dash-format  e.g. "NIFTY-Mar2026-23250-CE"
+        if index_override is None:
+            m = re.match(r'^([A-Za-z]+)-\w+-(\d+)-(CE|PE)$', target.symbol, re.IGNORECASE)
+            if m:
+                if effective_strike == 0:
+                    effective_strike = int(m.group(2))
+                try:
+                    index_override = get_index(m.group(1).upper())
+                except Exception:
+                    logger.debug(f"close_position: unknown index '{m.group(1)}' — using active index")
+
+        # 3) Fallback: parse compact format  e.g. "NIFTY22550PE"
+        if index_override is None:
+            m2 = re.match(r'^([A-Za-z]+)\d+(CE|PE)$', target.symbol, re.IGNORECASE)
+            if m2:
+                try:
+                    index_override = get_index(m2.group(1).upper())
+                except Exception:
+                    logger.debug(f"close_position: unknown index prefix '{m2.group(1)}' — using active index")
+
+        # ── Broker-side short-prevention guard ────────────────────────────────
+        # Verify the broker actually holds this position before sending the SELL.
+        # If _positions was reloaded from disk after a restart, the broker position
+        # must exist. If it doesn't (e.g. expired, already closed externally),
+        # block the order to prevent creating a naked short at the broker.
+        _opt_val = target.option_type.value if hasattr(target.option_type, "value") else str(target.option_type)
+        try:
+            broker_positions = await self.kite.get_kite_positions()
+            broker_qty = 0
+            for _p in broker_positions.get("day", []):
+                _sym = _p.get("tradingsymbol", "")
+                if str(effective_strike) in _sym and _opt_val in _sym:
+                    broker_qty = int(_p.get("quantity") or 0)
+                    break
+            if broker_qty <= 0:
+                logger.error(
+                    f"close_position BLOCKED: broker shows 0 qty for {_opt_val} {effective_strike} "
+                    f"— aborting SELL to prevent naked short. Removing stale position {target.trade_id}."
+                )
+                if target.trade_id in self._positions:
+                    del self._positions[target.trade_id]
+                _hk = (_opt_val, effective_strike)
+                self._held_qty[_hk] = 0
+                self._save_positions()
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    message=f"Blocked: broker holds no {_opt_val} {effective_strike} — naked short prevented",
+                    timestamp=datetime.now(),
+                )
+        except Exception as _e:
+            logger.warning(f"close_position: broker position check failed ({_e}) — proceeding with SELL")
+        # ─────────────────────────────────────────────────────────────────────
 
         result = await self.kite.place_order(
             option_type=target.option_type,
@@ -709,6 +886,7 @@ class OrderManager:
             else:
                 # Partial exit — reduce remaining quantity
                 target.quantity -= qty_to_close
+            self._save_positions()  # persist updated state after close
 
         return result
 
@@ -799,15 +977,20 @@ class OrderManager:
                 trade.highest_price = current
 
             pnl_pct = ((current - entry) / entry) * 100
+            pnl_inr = (current - entry) * trade.quantity
 
             # ── Trailing stop-loss ─────────────────────────────────────────────
-            # Arms only after the position reaches `trailing_stop_activation_pct`
-            # profit.  Before that the fixed SL is the only guard, so a normal
-            # intraday fluctuation never mis-fires the trail on a tiny tick up.
-            # Once armed, the trail follows the peak and exits on any pullback
-            # beyond `trailing_stop_percentage` — capturing the maximum run.
-            _activation_pct = getattr(self.config, 'trailing_stop_activation_pct', 10.0)
-            _trail_armed = trade.highest_price >= entry * (1 + _activation_pct / 100)
+            # Arms when EITHER condition is met (whichever comes first):
+            #   1. Position profit % reaches `trailing_stop_activation_pct`
+            #   2. Absolute P&L reaches `max_profit_per_trade` INR (e.g. ₹500)
+            # This way ₹500 profit is never given back — the trail follows prices
+            # higher and only exits on a pullback, capturing the full run.
+            _activation_pct    = getattr(self.config, 'trailing_stop_activation_pct', 10.0)
+            _profit_inr_target = getattr(self.config, 'max_profit_per_trade', 0.0)
+            _trail_armed = (
+                trade.highest_price >= entry * (1 + _activation_pct / 100)
+                or (_profit_inr_target > 0 and pnl_inr >= _profit_inr_target)
+            )
             if self.config.use_trailing_stop_loss and _trail_armed:
                 if self.config.use_trailing_stop_amount:
                     # ₹ amount is total-P&L basis → convert to per-unit
@@ -815,14 +998,22 @@ class OrderManager:
                     qty = max(trade.quantity, 1)
                     trail_sl = trade.highest_price - (self.config.trailing_stop_amount / qty)
                 else:
-                    # After BOTH profit tiers hit, tighten the trail on the final
-                    # runner — default tight trail = 5% vs 12% normal distance.
-                    # This locks nearly all remaining gains once the big move is done.
-                    _trail_pct = (
-                        getattr(self.config, 'tight_trail_after_tier2_pct', 5.0)
-                        if getattr(trade, 'tier2_exited', False)
-                        else self.config.trailing_stop_percentage
-                    )
+                    # Trail percentage tightens in stages (tightest wins):
+                    #  profit_protection ON (failed close at profit): 3% — emergency lock
+                    #  Stage 3 (tier2 exited): 5%  — nearly all gains locked
+                    #  Stage 2 (peak P&L > threshold, e.g. ₹800): 6% — mid-run lock
+                    #  Stage 1 (normal): 12% — wide trail to let trade breathe
+                    _peak_pnl_inr = (trade.highest_price - entry) * trade.quantity
+                    _tighten_at   = getattr(self.config, 'trail_tighten_at_inr', 800.0)
+                    _tighten_pct  = getattr(self.config, 'trail_tighten_pct', 6.0)
+                    if getattr(trade, 'profit_protection', False):
+                        _trail_pct = 3.0  # emergency: close failed at profit, lock very tight
+                    elif getattr(trade, 'tier2_exited', False):
+                        _trail_pct = getattr(self.config, 'tight_trail_after_tier2_pct', 5.0)
+                    elif _tighten_at > 0 and _peak_pnl_inr >= _tighten_at:
+                        _trail_pct = _tighten_pct
+                    else:
+                        _trail_pct = self.config.trailing_stop_percentage
                     trail_sl = trade.highest_price * (1 - _trail_pct / 100)
                 if current <= trail_sl:
                     locked_pct = ((trade.highest_price - entry) / entry) * 100
@@ -871,8 +1062,20 @@ class OrderManager:
                     actions_needed.append(trade_id)
                     continue
 
+            # ── Hard profit target (absolute ₹ amount) ─────────────────────
+            # Mirror of max_loss_per_trade — closes IMMEDIATELY when P&L hits
+            # the threshold, before any reversal can eat the gain.
+            # Prevents the "hit ₹1500 then come back to zero" pattern.
+            _hard_profit = getattr(self.config, 'hard_profit_target_inr', 0.0)
+            if _hard_profit > 0 and pnl_inr >= _hard_profit:
+                logger.info(
+                    f"HARD PROFIT TARGET reached for {trade.symbol}: "
+                    f"₹{pnl_inr:.0f} >= ₹{_hard_profit:.0f} — booking immediately"
+                )
+                actions_needed.append(trade_id)
+                continue  # don't check trail/SL — locking in profit now
+
             # ── Max loss per trade (absolute ₹ amount) ────────────────────────
-            pnl_inr = (current - entry) * trade.quantity
             if (
                 self.config.max_loss_per_trade > 0
                 and pnl_inr <= -self.config.max_loss_per_trade
@@ -889,7 +1092,7 @@ class OrderManager:
                 logger.warning(f"STOP-LOSS triggered for {trade.symbol}: {pnl_pct:.1f}%")
                 actions_needed.append(trade_id)
 
-            # ── Fixed target ──────────────────────────────────────────────────
+            # ── Fixed target (%%) ─────────────────────────────────────────────
             elif pnl_pct >= self.config.target_percentage:
                 logger.info(f"TARGET reached for {trade.symbol}: {pnl_pct:.1f}%")
                 actions_needed.append(trade_id)
