@@ -163,4 +163,37 @@ Additional fixes applied March 19 2026:
   - VIX_MAX raised 20→25 (was blocking entries on volatile crash days)
   - EOD paper mode fixed (was skipping analysis entirely when auto_trade=false)
 
+────────────────────────────────────────────────────────────────────────────────
+STEP 14 — Filter Tuning After Crash-Day Silence  ✅ DONE (April 13 2026)
+────────────────────────────────────────────────────────────────────────────────
+
+Problem: High-volatility crash day (market -2%+, RSI 18–23) generated 0 trades.
+  - SENSEX ORB SHORT was confirmed 3× (88% strength, vol✓) — blocked by RSI ≤ 35
+  - BANKNIFTY signals were 64–67% bearish all day — blocked by strength < 70%
+  - Signals were correctly directional; filters were too tight for crash regime
+
+Root cause:
+  The RSI "oversold bounce risk" filter was designed to stop chasing noise.
+  On crash days, RSI stays depressed all session — it is no longer bounce risk
+  but a trend-continuation signal. The flat 70% strength floor didn't account
+  for the fact that crash-day signals have compressed scores (fast moves, fewer
+  confirming candles).
+
+Changes applied:
+  1. [bot/engine.py] ORB RSI floor relaxed on high-conviction trending days
+     — If ORB strength ≥ 85% AND regime = TRENDING DOWN → RSI floor drops to 20
+     — Standard ≤ 35 block still applies on normal/ranging days
+  2. [config.py + .env] min_signal_strength now configurable (was hardcoded to 70)
+     — TRADING_MIN_SIGNAL_STRENGTH=65 (lowered from 70)
+     — Both paper TREND filter and auto-trade strength gate now read this setting
+  3. [bot/engine.py] Strength threshold uses settings.trading.min_signal_strength
+     — No more hardcoded 70 — can be tuned from .env without code changes
+
+Expected outcome:
+  - Similar crash-day setups → SENSEX ORB SHORT fires when RSI > 20 + strength ≥ 85%
+  - BANKNIFTY 65–69% signals allowed through on strong trend days
+  - Opening noise filter (< 10:00) and all other guards remain unchanged
+
+Validation date: 2026-04-14 (observe live behaviour next trading session)
+
 ================================================================================

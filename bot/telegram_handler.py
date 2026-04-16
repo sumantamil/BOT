@@ -386,7 +386,7 @@ class TelegramCommandHandler:
                 f"Total: ₹{total:+,.2f}"
             )
         else:
-            msg = "No broker connected — use /paper\_summary for paper P&L"
+            msg = "No broker connected — use /paper_summary for paper P&L"
         await self._send(msg)
 
     async def _cmd_today(self, _args: list) -> None:

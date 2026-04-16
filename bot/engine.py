@@ -1055,15 +1055,40 @@ class TradingBot:
                         logger.debug(f"AI sentiment refresh skipped: {_sent_exc}")
 
                 # Gap-open window flag (shared across all index iterations below)
-                # Starts at 9:20 (not 9:15) — the first 5 minutes after open have maximum
+                # Default starts at 9:20 — the first 5 minutes after open have maximum
                 # uncertainty: market-makers adjusting, algos rebalancing, shakeout moves.
-                # Data (3 weeks): entries at 9:15 had worse fills and more wrong-direction
-                # outcomes vs entries at 9:20+ when initial direction is clearer.
-                # Extended to 11:00 AM so a bot restart after 9:30 still catches the gap.
+                # EXCEPTION: if today has a strong gap (≥0.8% BREAKAWAY / RUNAWAY /
+                # EXHAUSTION), allow gap detection from 9:17 so we don't miss the
+                # opening momentum. Weak or no gaps still wait until 9:20.
+                _early_gap_ok = False
+                try:
+                    if (now_ts.weekday() <= 4
+                            and now_ts.hour == 9
+                            and 17 <= now_ts.minute < 20
+                            and hasattr(self, '_gap_detector')):
+                        # Trigger a quick analyze() to populate cache if not done yet,
+                        # then check if the gap is strong enough for early entry
+                        _early_result = self._gap_detector.analyze()
+                        _rich_gap = self._gap_detector.get_gap_info()
+                        if _rich_gap and _rich_gap.category.value in ("BREAKAWAY", "RUNAWAY", "EXHAUSTION"):
+                            _early_gap_ok = True
+                            logger.debug(
+                                f"Early gap window (9:17+): {_rich_gap.category.value} "
+                                f"{_rich_gap.gap_pct:+.2f}% — gap detection allowed before 9:20"
+                            )
+                        else:
+                            _cat = _rich_gap.category.value if _rich_gap else "no data"
+                            logger.debug(
+                                f"Early gap window skipped: gap category={_cat} "
+                                f"(need BREAKAWAY/RUNAWAY/EXHAUSTION for 9:17 entry)"
+                            )
+                except Exception:
+                    pass
                 is_near_open = (
                     now_ts.weekday() <= 4  # Mon–Fri
                     and (
-                        (now_ts.hour == 9 and now_ts.minute >= 20)  # 9:20–9:59 (skip first 5 min)
+                        _early_gap_ok                                # 9:17–9:19 strong gap only
+                        or (now_ts.hour == 9 and now_ts.minute >= 20)  # 9:20–9:59 (skip first 5 min)
                         or now_ts.hour == 10                         # 10:00–10:59
                     )
                 )
